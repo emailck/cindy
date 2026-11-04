@@ -1,0 +1,53 @@
+{
+  "name": "@cindy/remote-agent-host",
+  "version": "0.0.0",
+  "private": true,
+  "description": "Portable Node remote Agent host; authentication, provider routes and harness creation are injected by the embedding client.",
+  "type": "module",
+  "main": "./src/index.ts",
+  "types": "./src/index.ts",
+  "exports": {
+    ".": "./src/index.ts",
+    "./limits": "./src/limits.ts",
+    "./constants": "./src/constants.ts",
+    "./eventLog": "./src/eventLog.ts",
+    "./startupTiming": "./src/startupTiming.ts",
+    "./managedSkillDigest": "./src/managedSkillDigest.ts",
+    "./wire": "./src/wire.ts",
+    "./host/runHost": "./src/host/runHost.ts",
+    "./host/tunnel": "./src/host/tunnel.ts",
+    "./host/linkActivity": "./src/host/linkActivity.ts",
+    "./host/sessionIdentity": "./src/host/sessionIdentity.ts",
+    "./host/guestIsolation": "./src/host/guestIsolation.ts",
+    "./host/guestUsage": "./src/host/guestUsage.ts",
+    "./host/groupRelay": "./src/host/groupRelay.ts",
+    "./host/execServerShortcut": "./src/host/execServerShortcut.ts",
+    "./host/execServerStartupBatch": "./src/host/execServerStartupBatch.ts",
+    "./controller/runClient": "./src/controller/runClient.ts",
+    "./controller/poller": "./src/controller/poller.ts",
+    "./executor/workspace": "./src/executor/workspace.ts"
+  },
+  "scripts": {
+    "build": "tsc --noEmit",
+    "test": "vitest run"
+  },
+  "author": {
+    "name": "XD Inc.",
+    "email": "feedback@cindy.app"
+  },
+  "license": "Apache-2.0",
+  "dependencies": {
+    "@cindy/device-link": "workspace:*",
+    "@cindy/maker-core": "workspace:*",
+    "@cindy/maker-shared": "workspace:*",
+    "@cindy/maker-scheduler": "workspace:*",
+    "diff": "^8.0.4",
+    "ws": "^8.18.3"
+  },
+  "devDependencies": {
+    "@types/node": "*",
+    "@types/ws": "^8.18.1",
+    "typescript": "^5.7.0",
+    "vitest": "^3.2.4"
+  }
+}

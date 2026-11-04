@@ -161,7 +161,10 @@ describe.skipIf(!available)('remote agent with a real Claude Code', () => {
         logout: async () => {},
         getAuthEnv: async () => ({ ANTHROPIC_API_KEY: 'fake-test-key' }),
       },
-      runtimeConfig: { endpoint: proxyEndpoint },
+      // This deterministic model fixture scripts eager MCP calls, not ToolSearch.
+      // Native deferred discovery otherwise hides cindy_exec and the fake model
+      // returns text before exercising the credential-confirmation timeout.
+      runtimeConfig: { endpoint: proxyEndpoint, behaviorFlags: { ENABLE_TOOL_SEARCH: 'false' } },
       binaryPath: CLAUDE,
       logger: noopLogger,
     };

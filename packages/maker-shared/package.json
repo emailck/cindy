@@ -120,7 +120,12 @@
     "./remote-desktop-mobile": "./src/remote-desktop/mobileHtml.ts",
     "./remote-desktop-scripts": "./src/remote-desktop/viewerScripts.ts",
     "./teammate-todo": "./src/teammateTodo.ts",
-    "./teammate-status": "./src/teammateStatus.ts"
+    "./teammate-status": "./src/teammateStatus.ts",
+    "./destructive-guard": "./src/destructiveGuard.ts",
+    "./channel-tool-policy": "./src/channelToolPolicy.ts",
+    "./model-usage-delta": "./src/modelUsageDelta.ts",
+    "./usage-limit": "./src/usageLimit.ts",
+    "./usage-limit-recovery": "./src/usageLimitRecovery.ts"
   },
   "scripts": {
     "build": "tsc --noEmit",

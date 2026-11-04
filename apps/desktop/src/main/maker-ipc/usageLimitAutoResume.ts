@@ -16,7 +16,8 @@
 
 import type { AutoResumeInfo } from '../../shared/agentInputQueue.js';
 import { USAGE_LIMIT_RESET_AUTO_RESUME_REASON } from '../../shared/agentInputQueue.js';
-import { classifyTurnOverload, classifyTurnUsageLimit } from '../goal-host/usageLimit.js';
+import { isAccountUsageLimitError } from '@cindy/maker-shared/usage-limit';
+export { isAccountUsageLimitError } from '@cindy/maker-shared/usage-limit';
 import type { InterruptedTurnErrorSignals } from './interruptedTurnAutoResume.js';
 
 /** 重置后再等一会儿：上游各窗口的重置有秒级偏差，过早会再撞一次。 */
@@ -51,11 +52,6 @@ export interface UsageLimitAutoResumeDeps {
     info: AutoResumeInfo,
   ): Promise<UsageLimitContinueOutcome>;
   log(message: string, fields?: Record<string, unknown>): void;
-}
-
-/** 是否为账号额度用尽（不含上游容量过载：那由中断自愈按秒级退避处理）。 */
-export function isAccountUsageLimitError(signals: InterruptedTurnErrorSignals): boolean {
-  return classifyTurnUsageLimit(signals) && !classifyTurnOverload(signals);
 }
 
 export class UsageLimitAutoResume {

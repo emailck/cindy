@@ -1,6 +1,7 @@
 export { parseModelDisplayPricing, type ModelDisplayPricing, type ModelDisplayPricingSummary, type SummaryQuote } from './modelDisplayPricing.js';
 export { providerProtocolCandidates, type ProviderProtocolCandidate } from './providerProtocolProbe.js';
 export { remoteInvocationModels } from './remoteModels.js';
+export { normalizeClaudeCatalogModelId, resolveClaudeSdkModelId } from './claudeModelIdentity.js';
 /**
  * @cindy/model-providers — 模型供应商目录 + 路由抽象（纯逻辑，零 Electron / maker-core 运行时依赖）。
  *

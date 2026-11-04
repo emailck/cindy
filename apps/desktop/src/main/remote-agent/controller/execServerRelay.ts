@@ -28,7 +28,8 @@ import type { ExecutorAction, ExecutorGateDecision } from '../executor/gate';
 import { resolveExecutorShell } from '../executor/shell';
 import type { ExecutorAgentProjection, ExecutorWorkspace } from '../executor/workspace';
 
-export const EXEC_SERVER_WS_PATH = '/ws/exec-server';
+import { EXEC_SERVER_WS_PATH } from '@cindy/remote-agent-host/constants';
+export { EXEC_SERVER_WS_PATH } from '@cindy/remote-agent-host/constants';
 /** exec-server 单行(一条 JSON-RPC 消息)上限：大文件读写的 base64 也在这里面。 */
 const MAX_LINE_CHARS = 48 * 1024 * 1024;
 /** 单帧数据上限，留出 JSON 包装余量。 */

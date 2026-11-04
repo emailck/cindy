@@ -74,6 +74,7 @@
     "@cindy/orca-workflow": "workspace:*",
     "@cindy/plugin-protocol": "workspace:*",
     "@cindy/remote-file-service": "workspace:*",
+    "@cindy/remote-agent-host": "workspace:*",
     "@cindy/responses-anthropic-bridge": "workspace:*",
     "@cindy/responses-chat-bridge": "workspace:*",
     "@cindy/slack-hook-protocol": "workspace:*",

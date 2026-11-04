@@ -1,4 +1,4 @@
-import { pickModelMetadata } from '@cindy/model-providers';
+import { pickModelMetadata, normalizeClaudeCatalogModelId as normalizeModelId, resolveClaudeSdkModelId } from '@cindy/model-providers';
 /**
  * model-discovery/anthropic —— Anthropic(Claude.ai 订阅)模型清单的动态发现。
  * ---------------------------------------------------------------------------
@@ -108,10 +108,6 @@ function generationCanApply(generation: number, models: CatalogModel[]): boolean
  * sourcesForModel 的精确匹配整体 miss,顶栏误报「已断开」并禁发。口径与
  * claude-gateway-config / usageFormat 的既有归一化一致。
  */
-function normalizeModelId(raw: string): string {
-  return raw.replace(/\[[^\]]*\]$/, '').replace(/-20\d{6}$/, '');
-}
-
 /** 已记录过的目录未登记 / 无法解析的 SDK 简称条目,避免每个会话 init 重复打日志。 */
 const unresolvedAliasLogged = new Set<string>();
 
@@ -129,16 +125,7 @@ const unresolvedAliasLogged = new Set<string>();
 function resolveSdkModelId(value: string, description: unknown): string | null {
   const normalized = normalizeModelId(value);
   if (normalized.startsWith('claude')) return normalized;
-  const alias = normalized.toLowerCase();
-  const match =
-    typeof description === 'string'
-      ? /^(?:Claude\s+)?([A-Za-z]+)\s+(\d+)(?:\.(\d+))?(?![\w.])/.exec(description.trim())
-      : null;
-  const family = match?.[1]?.toLowerCase();
-  const id =
-    match && family && (alias === 'default' || alias === family)
-      ? `claude-${family}-${match[2]}${match[3] !== undefined ? `-${match[3]}` : ''}`
-      : null;
+  const id = resolveClaudeSdkModelId(value, description);
   const known = id !== null && getCindyAnthropicModelName(id) !== null;
   if (known) return id;
   const logKey = `${value}\u0000${String(description)}`;

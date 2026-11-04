@@ -55,6 +55,12 @@
 | `apps/claude-code-bin`、`apps/codex-bin`、`apps/ripgrep-bin`、`apps/pi-bin` | 随桌面端分发的预编译 CLI 二进制（按平台分目录）。不是构建包、不进 git 历史；版本由 `tools/<kind>/latest.json` pin，`pnpm install` postinstall 按需下载 |
 | `apps/android-platform-tools-bin`                            | Android platform-tools（adb 等）二进制，当前仅 win32-x64，用于连接安卓设备                                                                                                                                                                                                                                                      |
 
+### CLI 远程 Agent 提供端
+
+`apps/cindy-host` 是不启动 Electron 的 Node 提供端，复用官方认证与 Device Link；当前实现范围为同账号 Claude Code，项目工具通过反向隧道回到桌面执行。构建、登录和运行见 [CLI 使用说明](../../apps/cindy-host/README.md)，验收状态见 [CLI 开发进度](../cindy-cli-progress.md)。它不同于 SSH 工作区，也不同于用于评测的 `apps/cindy-headless`。
+
+`packages/remote-agent-host` 保存 Desktop 与 CLI 共用的远程宿主、事件流和反向隧道；认证、供应商策略与存储由宿主注入。Desktop 原 remote-agent 路径保留兼容导出，既有行为测试仍从 Desktop 入口验证。
+
 ## packages/
 
 「主要使用方」按各 `package.json` 的 workspace 依赖核对；mobile 只直接依赖其中

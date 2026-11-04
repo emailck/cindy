@@ -2,16 +2,12 @@ import { createHash, randomUUID } from 'node:crypto';
 import fs from 'node:fs/promises';
 import path from 'node:path';
 import type { GeneratedImageEventData } from '@cindy/maker-core';
+import type { GeneratedImageUpstream } from '@cindy/remote-agent-host';
+export type { GeneratedImageUpstream } from '@cindy/remote-agent-host';
 import { withCrossProcessLock } from '../device-link/crossProcessLock';
 import { readBoundedFileNoFollow } from '../utils/readBoundedFile';
 
 /** Only recovery metadata lives here. Image bytes always live in cindy-media. */
-export interface GeneratedImageUpstream {
-  agentDeviceId: string;
-  sessionId: string;
-  relay: string;
-}
-
 export interface GeneratedImageCleanup {
   version: 1;
   scope: string;

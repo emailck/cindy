@@ -336,6 +336,24 @@ export default {
   workspaces: [
     requiredUnitWorkspace('cindy-headless', 'apps/cindy-headless'),
     {
+      ...requiredUnitWorkspace('@cindy/host', 'apps/cindy-host'),
+      tiers: {
+        unit: {
+          status: 'required',
+          command: unitVitestCommand(),
+          exclude: ['**/*.integration.test.ts'],
+        },
+        integration: {
+          status: 'manual',
+          reason: 'Remote provider runtime tests start real loopback tunnels and the production host.',
+          execution: 'exclusive',
+          coverage: 'allowlist',
+          command: vitestBin('run', '--pool=forks', '--maxWorkers=1'),
+          include: ['src/runtime/runtime.integration.test.ts'],
+        },
+      },
+    },
+    {
       name: 'desktop',
       cwd: 'apps/desktop',
       status: 'required',
@@ -572,6 +590,8 @@ export default {
       },
     },
     noCollectableWorkspace('project-context', 'packages/project-context'),
+    noCollectableWorkspace('@cindy/remote-agent-host', 'packages/remote-agent-host',
+      'Portable implementations are exercised through Desktop remote-agent behavioral tests and compatibility exports; no duplicate package-local tests.'),
     requiredUnitWorkspace('@cindy/remote-file-service', 'packages/remote-file-service'),
     requiredUnitWorkspace('@cindy/voice-input-core', 'packages/voice-input-core'),
     requiredUnitWorkspace('@cindy/wechat-ilink', 'packages/wechat-ilink'),

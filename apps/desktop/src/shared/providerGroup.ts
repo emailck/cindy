@@ -31,7 +31,8 @@ export const PROVIDER_GROUP_MAX_WEIGHT = 100;
  */
 export const PROVIDER_GROUP_STORAGE_MEMBER_CAP = 512;
 
-export const PROVIDER_GROUP_LOCAL_MEMBER_KEY = 'local';
+import { PROVIDER_GROUP_LOCAL_MEMBER_KEY } from '@cindy/remote-agent-host/constants';
+export { PROVIDER_GROUP_LOCAL_MEMBER_KEY } from '@cindy/remote-agent-host/constants';
 
 export interface ProviderGroupMember {
   /** 稳定键：`local` / `device:<deviceId>:<providerId>` / `share:<shareId>:<providerId>`。 */
