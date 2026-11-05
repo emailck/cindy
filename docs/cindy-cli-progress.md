@@ -204,3 +204,27 @@ ChatGPT/Claude 两账号实际生成、续期和容器运行仍待联调，不�
 真实双账号联调补充：用户已确认 ChatGPT 官方登录分享可用。修复了 CLI 注入的
 stdio cindy_memory 与桌面 HTTP MCP 隧道合并时的启动失败；原生 API/OAuth 回归均已
 覆盖桌面携带 cindy_memory 的场景。Claude 官方账号实际生成和容器验收仍未完成。
+
+
+### 分享的订阅剩余额度
+
+CLI 接入现有 provider-share:insights:v1，只返回获准的订阅窗口，不扩展 relay 合同。
+原生 Codex 查询 account/rateLimits/read，Claude 使用原生 get_usage 控制请求；不调用
+模型、不读取 Claude 订阅凭证。2026-11-05 用户裁决默认开放额度，share quota off/on
+按账号与供应商保存，关闭后的在途回包失效；用量明细仍不开放。API 供应商或读取失败
+明确不可用，不按 token 用量推算剩余额度。纯额度/可见性单测 6 项通过，单文件 811ms。
+
+验证补充：CLI 定向跨账号 wire 测试通过（仅选中准入/额度用例）；构建通过。
+测试提供端重启后，真实 ChatGPT 账号已返回 ready 的 5 小时与每周剩余额度。
+Claude 解析用例通过，但原生 Claude 账号额度查询尚未实测。未运行 Desktop 全量检查。
+
+
+### 分享用量明细补齐
+
+按用户要求，CLI 用量明细也默认开放；share usage off/on 与额度权限独立保存。
+沿用现有 insights 协议，includeUsage=false 时不读历史，展开后才从共享账本投影
+当前分享成员的日期、模型、轮次、输入/输出/缓存 token 和已有 SDK 金额；不返回
+设备键、账号凭证、已删除成员或其他分享。只覆盖 CLI 已记录的分享用量，不伪造
+分享者本人或账号在其他应用中的总用量。未知金额保持未知。行数与帧大小双重限界，
+截断明确返回 coverageStart；撤权与关闭后重开均使在途结果失效。
+额度/明细定向单测 9 项通过，单文件 2.73 秒；未运行 Desktop 全量检查。

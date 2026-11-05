@@ -1,3 +1,4 @@
+import { codexQuota, emptyQuota } from '../share-quota';
 import { readFile } from 'node:fs/promises';
 import { homedir } from 'node:os';
 import { createCodexShareBridge, readNativeCodexConfig } from './codex-share';
@@ -48,6 +49,13 @@ export async function createCodexProvider(dataDir: string, logger: Logger, env: 
   const catalog = BUNDLED_CATALOG.providers.find(provider => provider.id === 'openai');
   return {
     kind: 'codex' as const, id, agent: nativeCodexAgent(agent, () => { const guest = makeAgent(); guestAgents.add(guest); return { guest, release: async () => { guestAgents.delete(guest); await guest.dispose(); } }; }), modelIds: new Set(models.map(model => model.id)),
+    readQuota: async () => {
+      if (initialAuth.authSource !== 'oauth') return emptyQuota('unsupported');
+      await readTokens();
+      const response = await agent.readAccountRateLimits();
+      await readTokens();
+      return codexQuota(response);
+    },
     isAuthenticated: async () => (await auth.getState()).authenticated,
     sharing: {
       supported: true,

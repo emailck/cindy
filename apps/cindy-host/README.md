@@ -158,6 +158,35 @@ file is copied into a guest home. Provider groups and re-sharing remain unsuppor
 For Docker build, initialization, persistent volumes and `docker exec` approval,
 see [Docker 部署与审批](DOCKER.zh-CN.md).
 
+## Shared subscription remaining quota
+
+Native ChatGPT and Claude subscription providers expose their account-wide remaining
+session/weekly quota through Desktop's existing share details and weekly quota indicator.
+CLI quota and usage-history sharing both default **on**; each preference is saved
+separately for each Cindy account and provider. Explicitly turning it off survives restart. These commands use
+the running host's private management socket:
+
+```sh
+cindy-host share quota
+cindy-host share quota off
+cindy-host share quota on
+cindy-host share usage
+cindy-host share usage off
+cindy-host share usage on
+```
+
+The first command inspects the current setting and quota. Queries use native Codex
+account/rateLimits/read or Claude get_usage, never a model prompt. Access is checked
+before and after querying, and results are not queued for replay after revocation.
+Quota responses contain only remaining percentages and reset times. Usage history
+is read only when the recipient expands the details and shows current share members
+by day/model with input, output, cache tokens and turns. SDK-reported costs are shown
+when available; absent costs remain unknown. This is the CLI share ledger, not the
+subscription account's complete usage in other applications. Credentials, login
+identity, device IDs and reset credits are excluded. API providers report quota unavailable
+rather than estimating a subscription balance from token usage. Reads share a short
+30-second cache, while disabling visibility invalidates in-flight results immediately.
+
 ## Headless Linux without a keyring
 
 Explicitly choose private local files when OS keyring encryption is not required:

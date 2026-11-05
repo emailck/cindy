@@ -1,3 +1,4 @@
+import { createShareQuota, SHARE_INSIGHTS_CHANNEL, emptyQuota } from '../share-quota';
 import { createProviderShareUsageStore } from '@cindy/remote-agent-host/providerShareUsageStore';
 import { createShareManager } from '../share-manager';
 import { startShareControl } from '../share-control';
@@ -30,7 +31,7 @@ export interface CliHostOptions {
   createWebSocket?: DeviceLinkClientOptions['createWebSocket'];
   loadConfig?: () => Promise<HostCommandContext['config']>;
 }
-const channels = [REMOTE_AGENT_CHANNEL, 'maker:provider:list', 'maker:list-available-agents', 'maker:get-capabilities', 'maker:agent:status'];
+const channels = [SHARE_INSIGHTS_CHANNEL, REMOTE_AGENT_CHANNEL, 'maker:provider:list', 'maker:list-available-agents', 'maker:get-capabilities', 'maker:agent:status'];
 const allowlistHash = createHash('sha256').update([...channels].sort().join('\n')).digest('hex');
 
 /** Relay-only same-account provider. All project tools run through the shared host's reverse tunnel. */
@@ -61,6 +62,12 @@ export async function createCliHost(context: HostCommandContext, options: CliHos
   let shareTimer: ReturnType<typeof setInterval> | undefined;
   const authorized = (peer: string) => current() && enabled && authenticated && accountReady
     && (!isScopedPeer(peer) || shareManager?.access(peer)?.providerId === provider.id);
+  const quota = await createShareQuota({ dataDir: context.dataDir, scope: storageScope, providerId: provider.id,
+    usage: peer => shareManager?.usage(peer) ?? Promise.reject(new Error('Share usage unavailable')),
+    read: () => provider.readQuota?.() ?? Promise.resolve(emptyQuota('unsupported')), current,
+    access: peer => authorized(peer) ? shareManager?.quotaAccess(peer) ?? null : null }).catch(async () => {
+      await provider.dispose(); throw new Error('Share quota preferences could not be loaded.');
+    });
   const host = createRemoteAgentHost({
     runsRoot: path.join(context.dataDir, 'accounts', createHash('sha256').update(storageScope).digest('hex'), 'remote-agent'),
     captureOwner: () => owner,
@@ -147,6 +154,15 @@ export async function createCliHost(context: HostCommandContext, options: CliHos
       const args = payload.args ?? [];
       let value: unknown;
       switch (payload.channel) {
+        case SHARE_INSIGHTS_CHANNEL: {
+          if (args.length !== 1) throw new Error('Invalid quota request');
+          const insight = await quota.insights(peer, args[0]);
+          // Never put private insights in the generic retry/completion cache.
+          if (authorized(peer) && insight.isCurrent()) {
+            try { client.sendInvokeResult(peer, frame.id, { ok: true, result: insight.result }); } catch { /* Caller retries with fresh authorization. */ }
+          }
+          return;
+        }
         case REMOTE_AGENT_CHANNEL:
           if (!admitted.has(peer)) {
             reply(peer, frame.id, { ok: false, error: { code: 'ACCESS_REVOKED', message: 'Open a control link before remote execution.' } });
@@ -276,6 +292,7 @@ export async function createCliHost(context: HostCommandContext, options: CliHos
           },
         });
         stopControl = await startShareControl(context.dataDir, async command => {
+          if (command.action === 'quota' || command.action === 'usage') return quota.manage(command.id, command.action);
           if (['link', 'approve', 'resume'].includes(command.action)) await provider.sharing!.prepare();
           return shareManager!.execute(command);
         });

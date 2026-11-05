@@ -3,13 +3,14 @@ import { chmod, lstat, unlink } from 'node:fs/promises';
 import path from 'node:path';
 import { HostCliError } from './config';
 
-export type ShareCommand = { action: 'link' | 'list' | 'approve' | 'reject' | 'pause' | 'resume' | 'remove'; id?: string; code?: string };
+export type ShareCommand = { action: 'usage' | 'quota' | 'link' | 'list' | 'approve' | 'reject' | 'pause' | 'resume' | 'remove'; id?: string; code?: string };
 export function parseShareCommand(args: string[]): ShareCommand {
   const [action = 'list', id, code] = args;
+  if ((action === 'quota' || action === 'usage') && (args.length === 1 || (args.length === 2 && (id === 'on' || id === 'off')))) return { action, id };
   if ((action === 'link' || action === 'list') && args.length <= 1) return { action };
   if (action === 'approve' && args.length === 3 && id && /^\d{4}$/.test(code)) return { action, id, code };
   if (['reject', 'pause', 'resume', 'remove'].includes(action) && args.length === 2 && id) return { action: action as ShareCommand['action'], id };
-  throw new HostCliError('INVALID_ARGUMENT', 'Use share link|list, share approve REQUEST_ID PAIRING_CODE, or share reject|pause|resume|remove ID.');
+  throw new HostCliError('INVALID_ARGUMENT', 'Use share quota|usage [on|off], share link|list, share approve REQUEST_ID PAIRING_CODE, or share reject|pause|resume|remove ID.');
 }
 const socketPath = (dataDir: string) => path.join(dataDir, 'share-control.sock');
 

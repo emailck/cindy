@@ -1,3 +1,4 @@
+import { SHARE_INSIGHTS_CHANNEL } from '../share-quota';
 import { spawn } from 'node:child_process';
 import net from 'node:net';
 import { createServer } from 'node:http';
@@ -69,6 +70,7 @@ async function harness(startSession?: (options: StartSessionOptions) => Promise<
   const auth = { getToken: vi.fn(async () => 'token'), captureOwner: () => owner, storageScope: () => 'global:account', refresh: vi.fn(async () => true) };
   const provider = { kind, sharing: sharing ? { supported: true, prepare: async () => {}, bind: async () => null } : undefined, dispose: vi.fn(async () => {}), id: 'anthropic', modelIds: new Set(['claude-test-1']), isAuthenticated: async () => true,
     view: (enabled: boolean) => ({ id: 'anthropic', connected: true, remoteInvocationEnabled: enabled, models: { [kind]: [{ id: 'claude-test-1', name: 'Test model', contextWindow: 128000, efforts: ['low'], defaultEffort: 'low' }] } }),
+    readQuota: vi.fn(async () => ({ state: 'ready', updatedAt: Date.now(), windows: [{ kind: 'week', label: null, remainingPercent: 72, resetsAt: Date.now() + 86400000, windowMinutes: 10080 }], balance: null })),
     agent: { capabilities: { availableModels: [] }, startSession: startSession ?? vi.fn(), forkSdkSession: vi.fn() },
   } as unknown as Awaited<ReturnType<typeof createClaudeProvider>>;
   const dataDir = path.join(os.tmpdir(), `cindy-host-test-${randomUUID()}`);
@@ -102,13 +104,23 @@ describe('Node provider host', () => {
     const h = await harness(undefined, 'codex', true);
     try {
       const socket = h.sockets[0];
-      const guestInvoke = (id: string, channel: string) => socket.push({ v: PROTOCOL_VERSION, kind: 'invoke', id, src: 'guest-device', dst: 'host',
-        providerShare: { shareId, source: { role: 'guest', memberId }, target: { role: 'host' } }, payload: { channel, args: [] } });
+      const guestInvoke = (id: string, channel: string, args: unknown[] = []) => socket.push({ v: PROTOCOL_VERSION, kind: 'invoke', id, src: 'guest-device', dst: 'host',
+        providerShare: { shareId, source: { role: 'guest', memberId }, target: { role: 'host' } }, payload: { channel, args } });
       guestInvoke('unapproved', 'maker:provider:list'); await vi.advanceTimersByTimeAsync(0);
       expect(socket.result('unapproved')).toMatchObject({ ok: false });
       await runShareControl(h.dataDir, ['approve', requestId, '1234']);
       guestInvoke('approved', 'maker:provider:list'); await vi.advanceTimersByTimeAsync(0);
       expect(socket.result('approved')).toMatchObject({ ok: true });
+      guestInvoke('quota', SHARE_INSIGHTS_CHANNEL, [{ version: 1, includeUsage: false }]); await vi.advanceTimersByTimeAsync(0);
+      expect(socket.result('quota')).toMatchObject({ ok: true, result: { version: 1, capabilities: { quota: true, usage: true }, quota: { accounts: [{ windows: [{ remainingPercent: 72 }] }] } } });
+      guestInvoke('history', SHARE_INSIGHTS_CHANNEL, [{ version: 1, includeUsage: true }]); await vi.advanceTimersByTimeAsync(0);
+      expect(socket.result('history')).toMatchObject({ ok: true, result: { status: { usage: 'ready' }, usage: { parties: [{ displayName: 'Guest', isYou: true, days: [] }] } } });
+      await runShareControl(h.dataDir, ['usage', 'off']);
+      guestInvoke('history-off', SHARE_INSIGHTS_CHANNEL, [{ version: 1, includeUsage: true }]); await vi.advanceTimersByTimeAsync(0);
+      expect(socket.result('history-off')).toMatchObject({ ok: true, result: { capabilities: { quota: true, usage: false }, usage: null } });
+      await runShareControl(h.dataDir, ['quota', 'off']);
+      guestInvoke('quota-off', SHARE_INSIGHTS_CHANNEL, [{ version: 1, includeUsage: false }]); await vi.advanceTimersByTimeAsync(0);
+      expect(socket.result('quota-off')).toMatchObject({ ok: true, result: { status: { quota: 'disabled' }, quota: null } });
       guestInvoke('private', 'local-db:sessions:list'); await vi.advanceTimersByTimeAsync(0);
       expect(socket.result('private')).toMatchObject({ ok: false, error: { code: 'CHANNEL_NOT_ALLOWED' } });
       await runShareControl(h.dataDir, ['pause', memberId]);

@@ -43,6 +43,8 @@ Commands:
   login [options]                    Official Cindy authentication
   logout                            Sign out and revoke stored authentication
   serve                             Run the authenticated provider in foreground
+  share usage [on|off]             Inspect or change guest usage-history visibility
+  share quota [on|off]             Inspect subscription quota or allow guests to view it
   share link|list                   Manage shares through the running host
   share approve REQUEST_ID CODE     Approve after checking identity and pairing code
   share reject REQUEST_ID           Reject a pending request

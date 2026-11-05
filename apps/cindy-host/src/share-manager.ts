@@ -1,3 +1,4 @@
+import { readShareUsage } from './share-usage';
 import type { ProviderShareUsageStore } from '@cindy/remote-agent-host/providerShareUsageStore';
 import { createHash } from 'node:crypto';
 import { buildProviderShareLink, checkProviderShareGuestAccess, createProviderShareApi, parseProviderSharePeer,
@@ -105,5 +106,16 @@ export function createShareManager(options: {
     await refresh(true);
     return { ok: true };
   }
-  return { access, refresh, execute };
+  return { access, refresh, execute, async usage(peer: string) {
+    const grant = access(peer);
+    const share = grant && shares.find(s => s.shareId === grant.shareId);
+    if (!grant || !share || !options.ledger) throw new Error('Share usage unavailable');
+    return readShareUsage(options.ledger, share, grant.memberId, options.providerId);
+  }, quotaAccess(peer: string) {
+    const grant = access(peer);
+    if (!grant) return null;
+    const share = shares.find(s => s.shareId === grant.shareId);
+    // History contains every current member; any roster change invalidates an in-flight reply.
+    return share ? JSON.stringify([grant, share.members, mutationEpoch]) : null;
+  } };
 }

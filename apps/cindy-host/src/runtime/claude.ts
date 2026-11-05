@@ -1,3 +1,5 @@
+import { readClaudeQuota } from './claude-quota';
+import { emptyQuota } from '../share-quota';
 import { randomBytes } from 'node:crypto';
 import type { RemoteAgentHostDeps } from '@cindy/remote-agent-host';
 import { execFile } from 'node:child_process';
@@ -95,6 +97,7 @@ export async function createClaudeProvider(dataDir: string, logger: Logger, env:
   return {
     kind: 'claude-code' as const, id, agent, modelIds,
     sharing: settings.auth === 'native' ? createNativeClaudeSharing(id, modelIds, async () => (await auth.getState()).authenticated) : undefined,
+    readQuota: async () => settings.auth === 'native' ? readClaudeQuota(settings.binary, dataDir) : emptyQuota('unsupported'),
     dispose: async () => {},
     async isAuthenticated() { return (await auth.getState()).authenticated; },
     view(enabled: boolean) {
