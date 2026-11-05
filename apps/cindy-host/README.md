@@ -5,6 +5,8 @@ from the evaluation-only `cindy-headless`; it does not launch Electron or use Do
 The implementation plan and current acceptance evidence live in
 [the CLI plan](../../docs/cindy-cli-plan.md).
 
+For Ubuntu VPS deployment, see [Linux 部署指南（中文）](DEPLOY.linux.zh-CN.md).
+
 ## Build and inspect
 
 From the repository root after installing workspace dependencies:
@@ -45,7 +47,7 @@ terminal, with input hidden. Examples:
 
 ```sh
 node apps/cindy-host/dist/cli.cjs --data-dir /var/lib/cindy-host login --email you@example.com
-node apps/cindy-host/dist/cli.cjs --data-dir /var/lib/cindy-host login --social github
+node apps/cindy-host/dist/cli.cjs --data-dir /var/lib/cindy-host login --social google
 node apps/cindy-host/dist/cli.cjs --data-dir /var/lib/cindy-host login --org your-organization
 node apps/cindy-host/dist/cli.cjs --data-dir /var/lib/cindy-host logout
 ```

@@ -94,3 +94,16 @@ model-providers 类型检查通过；最终 diff --check 通过。构建仅有�
 4. 验证真实断线重连、CLI重启后同一任务历史恢复及账号撤销；当前自动化不能替代这些实机结论。
 
 开发验收结束时尚未提交或推送。随后用户明确授权将本轮改动提交并推送到自己的 fork 的 feature/cli-provider-host 分支；提交带 DCO 签名，推送结果以 Git 远端核验为准。没有部署或 Docker 改动。后续工作从本台账继续，不重新复制另一套 Harness 或协议。
+## 2026-11-05：真实 Google 登录验收
+
+用户在浏览器完成官方 Google 授权后，CLI 轮询成功收到登录结果，输出 authenticated=true、region=global，并正常退出（exit 0）。随后在独立 CLI 进程执行 status，savedAuthentication=true，确认本次登录凭证已持久保存；该只读状态不代表已完成 refresh/relay 或模型验证。
+
+此前通过聊天链接尝试出现 client_state 已被占用。使用无个人数据的独立授权尝试验证，先 poll 再 authorize 仍返回正常302，因此不能归因于轮询先行。最终通过本地文本提供未预请求的全新链接后成功；链接预访问/重复访问是候选原因，未取得证据确认具体来源。
+
+本轮没有将邮箱、账号ID、令牌、设备ID或个人数据目录写入仓库。远程调用仍未开启；跨进程刷新、真实两机连接、目标 Linux 凭证库和 Claude 供应商认证继续待验收。
+
+## 2026-11-05：Linux VPS 部署说明
+
+新增[Ubuntu VPS 部署指南](../apps/cindy-host/DEPLOY.linux.zh-CN.md)，README 已链接并将第三方登录示例改为实际支持的 Google。指南覆盖版本校验、安装构建、固定 Claude runtime、专用用户 D-Bus/Secret Service、两套认证、tmux 运行与更新备份。没有新增无人值守部署脚本或明文凭证回退。
+
+15 个 Bash 命令块经 bash -n 语法检查通过，文档检查 10 项通过；没有执行 Linux 安装命令，目标 VPS 与重启恢复仍待实测。指南明确 tmux 持续会话不是开机自动解锁/自启保证。本次说明和真实 Google 登录记录整理后，用户已明确授权提交并推送至 feature/cli-provider-host；远端结果以 Git 核验为准。
