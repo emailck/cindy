@@ -19,7 +19,10 @@
     "@cindy/model-providers": "workspace:*",
     "@cindy/remote-agent-host": "workspace:*",
     "@napi-rs/keyring": "2.1.2",
-    "ws": "^8.18.0"
+    "ws": "^8.18.0",
+    "@cindy/anthropic-compat-proxy": "workspace:*",
+    "better-sqlite3": "12.11.1",
+    "sharp": "0.35.3"
   },
   "devDependencies": {
     "@types/node": "^22.0.0",

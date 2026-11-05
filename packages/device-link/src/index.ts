@@ -83,3 +83,6 @@ export * from "./machineStatus.js";
 export * from "./pluginPages.js";
 
 export { wireAsyncInboundDispatch } from './asyncInboundDispatch.js';
+
+export { checkProviderShareGuestAccess } from './providerShareAccess.js';
+export type { ProviderShareGuestDenial, ProviderShareGuestAccess } from './providerShareAccess.js';

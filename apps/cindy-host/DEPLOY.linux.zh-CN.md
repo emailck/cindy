@@ -2,7 +2,7 @@
 
 本文面向 Ubuntu 22.04 / 24.04、glibc、x86_64 或 ARM64 VPS。目标是让桌面 Cindy
 使用 VPS 上的 Claude Code，文件与命令工具仍回到发起任务的桌面执行。
-当前支持同账号、Claude Code 或 Codex（每个进程选择一种）与 relay 通道；不包含 Docker、跨账号分享或无人值守部署。
+当前支持同账号、Claude Code 或 Codex（每个进程选择一种）与 relay 通道；Docker 与 Codex Responses API 跨账号分享见 [Docker 部署与审批](DOCKER.zh-CN.md)；本页的密钥环方案不保证无人值守部署。
 
 **验证边界**：仓库已完成 Windows 上的构建、CLI 检查与自动化测试，并完成一次真实
 Global Google 登录及跨进程凭证存在性检查。本轮另已验证 Linux 构建、文件凭证登录及 Windows Desktop 到 Linux Codex API 的

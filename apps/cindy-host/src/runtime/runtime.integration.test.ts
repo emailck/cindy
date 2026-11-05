@@ -1,9 +1,16 @@
+import { spawn } from 'node:child_process';
+import net from 'node:net';
+import { createServer } from 'node:http';
+import { createCodexShareBridge } from './codex-share';
+import { runShareControl, startShareControl } from '../share-control';
 /**
  * Test value: createCliHost uses the production DeviceLinkClient/RemoteAgentHost to return discovery
  * for authorized peers before link admission, gate execution, revoke access, and recover rejected relay credentials.
  * Rule: CLI-005/006; protocol and remote adaptation rules require no unadmitted execution.
  * Gap: Desktop host tests do not exercise this new Node host's wiring or token recovery.
  * Minimal failure: provider:list before link-open; live config disable; WS upgrade rejection.
+ * Sharing extends this existing integration tier with real local sockets/native guest
+ * processes and fake upstreams; unit parser tests alone cannot verify those boundaries.
  * Tier: integration (real shared host/tunnel and filesystem lifecycle; fake relay/engine, no accounts).
  * Measured time: single-worker standalone 16.72s wall / 320ms tests; the shared Maker module
  * graph takes 15.47s collection on this machine, so this real tunnel case stays integration tier.
@@ -13,13 +20,13 @@ import os from 'node:os';
 import path from 'node:path';
 import { mkdir, readFile, rm, writeFile } from 'node:fs/promises';
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { encodeReliableFrames, DEVICE_LINK_CAPABILITY_RELIABLE_TRANSPORT, PROTOCOL_VERSION, REMOTE_AGENT_CHANNEL, type Envelope, type WsLike, type RemoteAgentStreamItem, type RemoteAgentPollResult } from '@cindy/device-link';
+import { PROVIDER_SHARE_RELAY_CAPABILITY, encodeReliableFrames, DEVICE_LINK_CAPABILITY_RELIABLE_TRANSPORT, PROTOCOL_VERSION, REMOTE_AGENT_CHANNEL, type Envelope, type WsLike, type RemoteAgentStreamItem, type RemoteAgentPollResult } from '@cindy/device-link';
 import type { StartSessionOptions, AgentSessionHandle } from '@cindy/maker-core';
 import { HOST_ENDPOINTS } from '../config';
 import { createCliHost } from './index';
 import { mapCodexModels, createNativeCodexAuth, createCodexProvider } from './codex';
 import type { CodexModelListItem } from '@cindy/maker-core';
-import { quietRuntimeLogger, mapClaudeModels, type createClaudeProvider } from './claude';
+import { quietRuntimeLogger, mapClaudeModels, createNativeClaudeSharing, type createClaudeProvider } from './claude';
 
 class Socket implements WsLike {
   sent: Envelope[] = [];
@@ -37,7 +44,7 @@ class Socket implements WsLike {
   push(frame: Envelope) { this.emit('message', { toString: () => JSON.stringify(frame) }); }
   ack() {
     this.emit('open');
-    this.push({ v: PROTOCOL_VERSION, kind: 'hello-ack', payload: { serverProtocolVersion: PROTOCOL_VERSION, deviceId: 'host', userId: 'owner' } });
+    this.push({ v: PROTOCOL_VERSION, kind: 'hello-ack', payload: { serverProtocolVersion: PROTOCOL_VERSION, deviceId: 'host', userId: 'owner', capabilities: [PROVIDER_SHARE_RELAY_CAPABILITY] } });
   }
   request(kind: Envelope['kind'], id: string, payload: unknown, src = 'desktop') { this.push({ v: PROTOCOL_VERSION, kind, id, src, payload }); }
   result(id: string) { return this.sent.findLast(frame => frame.kind === 'invoke-result' && frame.id === id)?.payload; }
@@ -53,18 +60,19 @@ class Socket implements WsLike {
 
 afterEach(() => { vi.useRealTimers(); });
 
-async function harness(startSession?: (options: StartSessionOptions) => Promise<AgentSessionHandle>, kind: 'claude-code' | 'codex' = 'claude-code') {
+async function harness(startSession?: (options: StartSessionOptions) => Promise<AgentSessionHandle>, kind: 'claude-code' | 'codex' = 'claude-code', sharing = false) {
   vi.useFakeTimers();
   let owner: string | null = 'account:incarnation-1';
   const config = { remoteAccessEnabled: true, permissionMode: 'full-access' as const, deviceName: 'test-host' };
   const sockets: Socket[] = [];
   const output = vi.fn();
   const auth = { getToken: vi.fn(async () => 'token'), captureOwner: () => owner, storageScope: () => 'global:account', refresh: vi.fn(async () => true) };
-  const provider = { kind, dispose: vi.fn(async () => {}), id: 'anthropic', modelIds: new Set(['claude-test-1']), isAuthenticated: async () => true,
+  const provider = { kind, sharing: sharing ? { supported: true, prepare: async () => {}, bind: async () => null } : undefined, dispose: vi.fn(async () => {}), id: 'anthropic', modelIds: new Set(['claude-test-1']), isAuthenticated: async () => true,
     view: (enabled: boolean) => ({ id: 'anthropic', connected: true, remoteInvocationEnabled: enabled, models: { [kind]: [{ id: 'claude-test-1', name: 'Test model', contextWindow: 128000, efforts: ['low'], defaultEffort: 'low' }] } }),
     agent: { capabilities: { availableModels: [] }, startSession: startSession ?? vi.fn(), forkSdkSession: vi.fn() },
   } as unknown as Awaited<ReturnType<typeof createClaudeProvider>>;
   const dataDir = path.join(os.tmpdir(), `cindy-host-test-${randomUUID()}`);
+  if (sharing) await mkdir(dataDir, { recursive: true, mode: 0o700 });
   const host = await createCliHost({ dataDir, region: 'global', endpoints: HOST_ENDPOINTS,
     config, output, error: vi.fn() }, { auth, createProvider: async () => provider, loadConfig: async () => config,
     createWebSocket: () => { const socket = new Socket(); sockets.push(socket); return socket; } });
@@ -77,6 +85,139 @@ async function harness(startSession?: (options: StartSessionOptions) => Promise<
 }
 
 describe('Node provider host', () => {
+  // Actual scoped wire frames, official API parser and local management socket:
+  // a link applicant cannot read a catalog until approval and loses access on pause.
+  it('authorizes cross-account discovery only after local approval and rejects unrelated channels', async () => {
+    const shareId = randomUUID(); const memberId = randomUUID(); const requestId = randomUUID();
+    let active = false; let paused = false;
+    const person = { displayName: 'Guest', avatarUrl: null, region: 'global' };
+    const timestamp = new Date().toISOString();
+    vi.stubGlobal('fetch', vi.fn(async (url: string) => {
+      if (url.endsWith('/approve')) { active = true; return new Response(JSON.stringify({ shareId, memberId })); }
+      if (url.endsWith('/pause')) { paused = true; return new Response(JSON.stringify({ memberId, status: 'paused' })); }
+      return new Response(JSON.stringify({ shares: [{ shareId, providerId: 'anthropic', providerLabel: 'Test provider', hostDeviceId: 'host', createdAt: timestamp,
+        requests: active ? [] : [{ ...person, requestId, pairingCode: '1234', createdAt: timestamp, expiresAt: new Date(Date.now() + 300000).toISOString() }],
+        members: active ? [{ ...person, memberId, joinedAt: timestamp, status: paused ? 'paused' : 'active' }] : [] }] }));
+    }));
+    const h = await harness(undefined, 'codex', true);
+    try {
+      const socket = h.sockets[0];
+      const guestInvoke = (id: string, channel: string) => socket.push({ v: PROTOCOL_VERSION, kind: 'invoke', id, src: 'guest-device', dst: 'host',
+        providerShare: { shareId, source: { role: 'guest', memberId }, target: { role: 'host' } }, payload: { channel, args: [] } });
+      guestInvoke('unapproved', 'maker:provider:list'); await vi.advanceTimersByTimeAsync(0);
+      expect(socket.result('unapproved')).toMatchObject({ ok: false });
+      await runShareControl(h.dataDir, ['approve', requestId, '1234']);
+      guestInvoke('approved', 'maker:provider:list'); await vi.advanceTimersByTimeAsync(0);
+      expect(socket.result('approved')).toMatchObject({ ok: true });
+      guestInvoke('private', 'local-db:sessions:list'); await vi.advanceTimersByTimeAsync(0);
+      expect(socket.result('private')).toMatchObject({ ok: false, error: { code: 'CHANNEL_NOT_ALLOWED' } });
+      await runShareControl(h.dataDir, ['pause', memberId]);
+      guestInvoke('paused', 'maker:provider:list'); await vi.advanceTimersByTimeAsync(0);
+      expect(socket.result('paused')).toMatchObject({ ok: false });
+    } finally { await h.host.stop(); vi.unstubAllGlobals(); await rm(h.dataDir, { recursive: true, force: true }); }
+  });
+
+  // Local Docker exec management uses the running process, not a second auth refresh.
+  it('serves private local management commands and rejects malformed requests', async () => {
+    const dir = path.join(os.tmpdir(), `cindy-share-control-${randomUUID()}`);
+    await mkdir(dir, { mode: 0o700 });
+    const stop = await startShareControl(dir, async command => ({ action: command.action }));
+    try {
+      expect(await runShareControl(dir, ['list'])).toEqual({ action: 'list' });
+      await expect(runShareControl(dir, ['approve', 'request', 'bad'])).rejects.toThrow();
+    } finally { await stop(); await rm(dir, { recursive: true, force: true }); }
+  });
+
+  // Native config resolution + the same proxy component Desktop uses. Only fake
+  // credentials and a local HTTP endpoint are touched; no model inference or accounts.
+  it.skipIf(!process.env.CINDY_CODEX_TEST_BINARY)('confines shared API egress to the approved model and current member', async () => {
+    const dir = path.join(os.tmpdir(), `cindy-share-proxy-${randomUUID()}`);
+    await mkdir(dir, { mode: 0o700 });
+    let upstreamCalls = 0;
+    const server = createServer((req, res) => {
+      upstreamCalls++;
+      expect(req.headers.authorization).toBe('Bearer invalid-fake-share-key');
+      res.writeHead(200, { 'content-type': 'application/json' }); res.end('{}');
+    });
+    await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve));
+    const address = server.address() as { port: number };
+    vi.stubEnv('CINDY_FAKE_SHARE_API_KEY', 'invalid-fake-share-key');
+    await writeFile(path.join(dir, 'config.toml'), `features.plugins=false\nfeatures.remote_plugin=false\nmodel_provider="fixture"\n[model_providers.fixture]\nname="Fixture"\nbase_url="http://127.0.0.1:${address.port}/v1"\nwire_api="responses"\nenv_key="CINDY_FAKE_SHARE_API_KEY"\nrequires_openai_auth=false\n`);
+    vi.stubEnv('CODEX_HOME', dir);
+    vi.stubEnv('HOME', dir); vi.stubEnv('USERPROFILE', dir);
+    vi.stubEnv('OPENAI_API_KEY', ''); vi.stubEnv('CODEX_API_KEY', '');
+    let bridge: Awaited<ReturnType<typeof createCodexShareBridge>> | undefined;
+    try {
+      expect(await createNativeCodexAuth(process.env.CINDY_CODEX_TEST_BINARY!).getState()).toEqual({ authenticated: true, authSource: 'api-key' });
+      bridge = await createCodexShareBridge(process.env.CINDY_CODEX_TEST_BINARY!, new Set(['allowed-model']));
+      let current = true;
+      const binding = await bridge.bind({ kind: 'codex', providerId: 'cli-codex', hostSessionId: 'host-session', sessionId: 'guest-session', controller: 'fake-guest', isCurrent: () => current });
+      expect(binding).not.toBeNull();
+      const config = bridge.spawnConfig('host-session');
+      expect(JSON.stringify(config)).not.toContain('invalid-fake-share-key');
+      const base = JSON.parse(config.extraArgs.find(arg => arg.startsWith('model_providers.cindy_share.base_url='))!.split('=').slice(1).join('=')) as string;
+      const send = (model: string, token = binding!.routeToken) => fetch(base + '/responses', { method: 'POST', headers: { authorization: `Bearer ${token}`, 'content-type': 'application/json' }, body: JSON.stringify({ model, input: 'fake' }) });
+      expect((await send('wrong-model')).status).toBe(403);
+      expect((await send('allowed-model', 'wrong-token')).status).toBe(403);
+      expect((await send('allowed-model')).status).toBe(200);
+      current = false;
+      expect((await send('allowed-model')).status).toBe(403);
+      expect((await fetch(base + '/private')).status).toBe(403);
+      expect((await fetch(base + '/responses', { method: 'POST', headers: { authorization: `Bearer ${binding!.routeToken}` }, body: 'not-json' })).status).toBe(403);
+      expect(upstreamCalls).toBe(1);
+      binding!.release();
+    } finally {
+      await bridge?.dispose(); vi.unstubAllEnvs();
+      await new Promise<void>(resolve => server.close(() => resolve()));
+      await rm(dir, { recursive: true, force: true });
+    }
+  }, 30000);
+
+  // Subscription binding must reject other providers and stop authorizing after revocation.
+  it('bounds native Claude sharing to the current member and advertised models', async () => {
+    let loggedIn = true;
+    const sharing = createNativeClaudeSharing('anthropic', new Set(['allowed']), async () => loggedIn);
+    await sharing.prepare();
+    let current = true;
+    const input = { kind: 'claude-code' as const, providerId: 'anthropic', hostSessionId: 'host', sessionId: 'guest', controller: 'member', isCurrent: () => current };
+    expect(await sharing.bind({ ...input, providerId: 'other' })).toBeNull();
+    const binding = (await sharing.bind(input))!;
+    expect(await binding.allowsModel('allowed')).toBe(true);
+    expect(await binding.allowsModel('other')).toBe(false);
+    current = false;
+    expect(await binding.allowsModel('allowed')).toBe(false);
+    current = true; binding.release();
+    expect(await binding.allowsModel('allowed')).toBe(false);
+    loggedIn = false;
+    await expect(sharing.prepare()).rejects.toThrow('Native Claude login is unavailable');
+  });
+
+  // Official-login sharing must retain native OAuth while denying unbound/model-mismatched
+  // requests. Integration gap: API-key coverage cannot detect OAuth routing bypasses.
+  it.skipIf(!process.env.CINDY_CODEX_TEST_BINARY)('gates native ChatGPT sharing without persisting credentials', async () => {
+    const dir = path.join(os.tmpdir(), `cindy-oauth-share-${randomUUID()}`);
+    await mkdir(dir, { mode: 0o700 });
+    vi.stubEnv('CODEX_HOME', dir); vi.stubEnv('HOME', dir); vi.stubEnv('USERPROFILE', dir);
+    let bridge: Awaited<ReturnType<typeof createCodexShareBridge>> | undefined;
+    try {
+      bridge = await createCodexShareBridge(process.env.CINDY_CODEX_TEST_BINARY!, new Set(['allowed']), true);
+      let current = true;
+      const binding = await bridge.bind({ kind: 'codex', providerId: 'openai', hostSessionId: 'oauth-session', sessionId: 'guest', controller: 'guest', isCurrent: () => current });
+      const config = bridge.spawnConfig('oauth-session');
+      expect(config.extraArgs).toContain('model_providers.cindy_share.requires_openai_auth=true');
+      expect(config.extraArgs.some(arg => arg.startsWith('model_providers.cindy_share.env_key='))).toBe(false);
+      const base = JSON.parse(config.extraArgs.find(arg => arg.startsWith('model_providers.cindy_share.base_url='))!.split('=').slice(1).join('=')) as string;
+      const send = (model: string, token = binding!.routeToken) => fetch(base + '/responses', { method: 'POST', headers: { authorization: 'Bearer invalid-fake-oauth', 'x-cindy-share-route': token, 'content-type': 'application/json' }, body: JSON.stringify({ model }) });
+      expect((await send('allowed', 'wrong')).status).toBe(403);
+      expect((await send('wrong')).status).toBe(403);
+      current = false;
+      expect((await send('allowed')).status).toBe(403);
+      expect(() => bridge!.spawnConfig('oauth-session')).toThrow('Guest route unavailable');
+      await expect(readFile(path.join(dir, 'auth.json'))).rejects.toMatchObject({ code: 'ENOENT' });
+      binding!.release();
+    } finally { await bridge?.dispose(); vi.unstubAllEnvs(); await rm(dir, { recursive: true, force: true }); }
+  }, 30000);
+
   // Regression: returning the long-poll promise from onFrame stalled ordered
   // delivery/ACK for 10 seconds, delaying even provider discovery behind it.
   // Real reliable transport + shared host, virtual time; a second peer is unaffected.
@@ -129,6 +270,83 @@ describe('Node provider host', () => {
     } finally { releaseEvents(); await h.host.stop(); await rm(h.dataDir, { recursive: true, force: true }); }
   });
 
+  // Native guest process uses the shared core isolation and the CLI API bridge.
+  // A separate exec-server represents the recipient, with no real credentials/upstream.
+  // Regression: a tunneled cindy_memory URL must not merge with a host-injected stdio command.
+  // Previously the empty MCP list missed the real desktop thread/start configuration failure.
+  it.skipIf(!process.env.CINDY_CODEX_TEST_BINARY).each(['api-key', 'oauth'])('starts an isolated native %s guest without copying credentials', async authMode => {
+    const dir = path.join(os.tmpdir(), `cindy-guest-start-${randomUUID()}`);
+    const bodies: string[] = [];
+    const upstream = createServer((req, res) => {
+      let body = ''; req.on('data', chunk => { body += chunk.toString(); });
+      req.on('end', () => {
+        expect(req.headers.authorization).toBe(authMode === 'oauth' ? `Bearer ${fakeToken}` : 'Bearer invalid-fake-guest-key');
+        bodies.push(body);
+        const item = { type: 'message', id: 'msg-1', role: 'assistant', status: 'completed', content: [{ type: 'output_text', text: 'OK', annotations: [] }] };
+        const events = [
+          { type: 'response.created', response: { id: 'r1', status: 'in_progress', output: [] } },
+          { type: 'response.output_item.done', output_index: 0, item },
+          { type: 'response.completed', response: { id: 'r1', status: 'completed', output: [item], usage: { input_tokens: 1, output_tokens: 1, total_tokens: 2 } } },
+        ];
+        res.writeHead(200, { 'content-type': 'text/event-stream', connection: 'close' });
+        res.end(events.map(event => `event: ${event.type}\ndata: ${JSON.stringify(event)}\n\n`).join(''));
+      });
+    });
+    await new Promise<void>(resolve => upstream.listen(0, '127.0.0.1', resolve));
+    const endpoint = `http://127.0.0.1:${(upstream.address() as net.AddressInfo).port}/v1`;
+    const ownerHome = path.join(dir, 'owner'); const guestHome = path.join(dir, 'guest');
+    const workspace = path.join(dir, 'workspace');
+    await Promise.all([ownerHome, guestHome, workspace].map(folder => mkdir(folder, { recursive: true, mode: 0o700 })));
+    const fakeToken = `test.${Buffer.from(JSON.stringify({ exp: 4102444800, 'https://api.openai.com/auth': { chatgpt_account_id: 'fake-account', chatgpt_plan_type: 'pro' } })).toString('base64url')}.invalid`;
+    await writeFile(path.join(ownerHome, 'auth.json'), JSON.stringify(authMode === 'oauth' ? { auth_mode: 'chatgpt', tokens: { access_token: fakeToken, id_token: fakeToken, refresh_token: 'invalid-refresh', account_id: 'fake-account' }, last_refresh: new Date().toISOString() } : { OPENAI_API_KEY: 'invalid-fake-guest-key' }), { mode: 0o600 });
+    await writeFile(path.join(ownerHome, 'AGENTS.md'), 'OWNER_PRIVATE_CANARY');
+    await writeFile(path.join(ownerHome, 'config.toml'), `features.plugins=false\nfeatures.remote_plugin=false\nmodel_provider="fixture"\n[model_providers.fixture]\nname="Fixture"\nbase_url="${endpoint}"\nwire_api="responses"\nrequires_openai_auth=true\n`);
+    const portServer = net.createServer();
+    await new Promise<void>(resolve => portServer.listen(0, '127.0.0.1', resolve));
+    const port = (portServer.address() as net.AddressInfo).port;
+    await new Promise<void>(resolve => portServer.close(() => resolve()));
+    const binary = process.env.CINDY_CODEX_TEST_BINARY!;
+    const executor = spawn(binary, ['exec-server', '--listen', `ws://127.0.0.1:${port}`], { env: { ...process.env, CODEX_HOME: workspace, HOME: dir, USERPROFILE: dir, OPENAI_API_KEY: '', CODEX_API_KEY: '' }, stdio: 'ignore' });
+    vi.stubEnv('CODEX_HOME', ownerHome);
+    vi.stubEnv('HOME', dir); vi.stubEnv('USERPROFILE', dir);
+    vi.stubEnv('OPENAI_API_KEY', ''); vi.stubEnv('CODEX_API_KEY', '');
+    let provider: Awaited<ReturnType<typeof createCodexProvider>> | undefined;
+    let handle: AgentSessionHandle | undefined;
+    try {
+      await vi.waitFor(() => new Promise<void>((resolve, reject) => {
+        const socket = net.connect(port, '127.0.0.1');
+        socket.once('connect', () => { socket.destroy(); resolve(); }); socket.once('error', reject);
+      }));
+      provider = await createCodexProvider(dir, quietRuntimeLogger(), { CINDY_HOST_CODEX_BINARY: binary });
+      await provider.sharing.prepare();
+      const model = [...provider.modelIds][0];
+      const binding = await provider.sharing.bind({ kind: 'codex', providerId: provider.id, hostSessionId: 'guest-probe', sessionId: 'recipient-task', controller: 'fake-guest', isCurrent: () => true });
+      handle = await provider.agent.startSession({ sessionId: 'guest-probe', model, providerId: provider.id, workingDir: workspace,
+        permissionMode: 'bypassPermissions', deviceHosted: { workingDir: workspace, extraDirs: [], writableDirs: [], platform: 'linux', shell: 'bash', isGitRepo: false,
+          mirrorRoot: workspace, tunnelUrl: `http://127.0.0.1:${port}`, tunnelToken: 'fake', mcpServers: ['cindy_memory'], guest: true, guestHome,
+          guestProvider: { providerId: provider.id, modelIds: [model], routeToken: binding!.routeToken } } });
+      expect(handle.agentKind).toBe('codex');
+      if (authMode === 'api-key') {
+      const done = (async () => { for await (const event of handle!.events()) { if (event.type === 'error') throw new Error('Native guest turn failed'); if (event.type === 'done') return; } })();
+      await handle.send({ type: 'user', content: 'Only reply OK.' }, { throwOnStartFailure: true });
+      await done;
+      expect(bodies.length).toBeGreaterThan(0);
+      expect(bodies.join('')).not.toContain('OWNER_PRIVATE_CANARY');
+      }
+      // The native guest home must not receive the owner's credential file.
+      await expect(readFile(path.join(guestHome, 'codex', 'auth.json'), 'utf8')).rejects.toMatchObject({ code: 'ENOENT' });
+    } finally {
+      await handle?.close(); await provider?.dispose();
+      if (executor.exitCode === null && executor.signalCode === null) {
+        const exited = new Promise<void>(resolve => executor.once('close', () => resolve()));
+        executor.kill(); await exited;
+      }
+      vi.unstubAllEnvs();
+      await new Promise<void>(resolve => upstream.close(() => resolve()));
+      await rm(dir, { recursive: true, force: true });
+    }
+  }, 30000);
+
   // Native regression: two live API sessions previously requested provider-oauth
   // despite using the native API configuration, so session two tried to replace
   // an occupied app-server. No inference is sent; credentials and endpoint are fake.
@@ -139,8 +357,10 @@ describe('Node provider host', () => {
     await mkdir(home, { recursive: true, mode: 0o700 });
     await mkdir(workspace, { recursive: true });
     await writeFile(path.join(home, 'auth.json'), JSON.stringify({ OPENAI_API_KEY: 'invalid-fake-concurrency-key' }), { mode: 0o600 });
-    await writeFile(path.join(home, 'config.toml'), 'model_provider="fixture"\nmodel="gpt-5.4"\n[model_providers.fixture]\nname="Fixture"\nbase_url="http://127.0.0.1:1/v1"\nwire_api="responses"\nrequires_openai_auth=true\n[mcp_servers.cindy_memory]\ncommand="false"\nenabled=false\n');
+    await writeFile(path.join(home, 'config.toml'), 'features.plugins=false\nfeatures.remote_plugin=false\nmodel_provider="fixture"\nmodel="gpt-5.4"\n[model_providers.fixture]\nname="Fixture"\nbase_url="http://127.0.0.1:1/v1"\nwire_api="responses"\nrequires_openai_auth=true\n[mcp_servers.cindy_memory]\ncommand="false"\nenabled=false\n');
     vi.stubEnv('CODEX_HOME', home);
+    vi.stubEnv('HOME', dir); vi.stubEnv('USERPROFILE', dir);
+    vi.stubEnv('OPENAI_API_KEY', ''); vi.stubEnv('CODEX_API_KEY', '');
     let provider: Awaited<ReturnType<typeof createCodexProvider>> | undefined;
     const handles: AgentSessionHandle[] = [];
     try {

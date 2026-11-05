@@ -1,3 +1,5 @@
+import { randomBytes } from 'node:crypto';
+import type { RemoteAgentHostDeps } from '@cindy/remote-agent-host';
 import { execFile } from 'node:child_process';
 import { access, constants } from 'node:fs/promises';
 import path from 'node:path';
@@ -92,6 +94,7 @@ export async function createClaudeProvider(dataDir: string, logger: Logger, env:
   const modelIds = new Set(models.map(model => model.id));
   return {
     kind: 'claude-code' as const, id, agent, modelIds,
+    sharing: settings.auth === 'native' ? createNativeClaudeSharing(id, modelIds, async () => (await auth.getState()).authenticated) : undefined,
     dispose: async () => {},
     async isAuthenticated() { return (await auth.getState()).authenticated; },
     view(enabled: boolean) {
@@ -133,4 +136,19 @@ export function quietRuntimeLogger(): Logger {
   const noop = () => undefined;
   const logger: Logger = { trace: noop, debug: noop, info: noop, warn: noop, error: noop, fatal: noop, child: () => logger };
   return logger;
+}
+
+/** Native Claude owns credentials; this binding only carries member/model authority. */
+export function createNativeClaudeSharing(id: string, modelIds: ReadonlySet<string>, authenticated: () => Promise<boolean>) {
+  return {
+    supported: true,
+    async prepare() { if (!(await authenticated())) throw new Error('Native Claude login is unavailable.'); },
+    bind: async (input: Parameters<NonNullable<RemoteAgentHostDeps['bindGuestProviderRoute']>>[0]) => {
+      if (input.kind !== 'claude-code' || input.providerId !== id || !input.isCurrent()) return null;
+      let released = false;
+      return { routeToken: randomBytes(32).toString('hex'), modelIds: [...modelIds],
+        allowsModel: async (model: string) => !released && input.isCurrent() && modelIds.has(model),
+        release() { released = true; } };
+    },
+  };
 }

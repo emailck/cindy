@@ -85,7 +85,8 @@ Select one harness per host process. The default `CINDY_HOST_AGENT=claude-code`
 keeps existing deployments unchanged. `codex` uses the same-account remote host
 and the native Codex execution-environment tunnel; project commands/files stay
 on the requesting desktop. No new Device Link channel or relay protocol is used.
-Cross-account sharing is not enabled by this selection.
+Selecting a harness alone does not authorize other accounts. For native Responses API
+sharing, use the explicit link and approval commands described below.
 
 ```sh
 export CINDY_HOST_AGENT=codex
@@ -103,7 +104,7 @@ provider settings (including a Responses-compatible relay) and inherited credent
 environment are preserved. Use the same HOME/CODEX_HOME and environment as your
 working Codex CLI; verify that this executable reports success for `login status`.
 For an existing API setup, skip `login --device-auth`; do not replace it with ChatGPT login. Native Codex owns its credentials and refresh, using
-the process's normal HOME/CODEX_HOME. Cindy does not copy them into its own store.
+the process's normal HOME/CODEX_HOME. Cindy does not copy them into its own store; sharing reads access tokens in memory as described below.
 Remote provider IDs are used for discovery and admission only; native session start,
 fork and model changes do not inject them as credential routes, so concurrent
 sessions retain the same native configuration.
@@ -117,6 +118,45 @@ permission preservation and cleanup for both harnesses. Manual Windows Desktop t
 Linux Codex API invocation has also been exercised, including native relay configuration.
 This does not establish parity for every desktop feature: session-list/subscription
 endpoints remain unsupported, and initial payload upload can still be slow.
+
+## Share a native provider
+
+Keep `serve` running, then use a second shell with the same data directory:
+
+```sh
+cindy-host share link
+cindy-host share list
+cindy-host share approve REQUEST_ID PAIRING_CODE
+cindy-host share reject REQUEST_ID
+cindy-host share pause MEMBER_ID
+cindy-host share resume MEMBER_ID
+cindy-host share remove MEMBER_ID
+```
+
+The five-minute single-use invitation is returned only to the management terminal.
+The recipient applies in Desktop Cindy; the service announces the verified identity
+and request ID. Read the pairing code with `share list` in the private management
+terminal and check it with the recipient before approving.
+Management uses a private local Unix socket and the running process's authentication;
+it does not open a public control port or require another sign-in.
+
+This adapter shares the configured Codex Responses API route, including native
+`http_headers` and `env_http_headers`. Real credentials stay inside the host proxy.
+Each guest engine uses the existing core guest isolation and is disposed on close;
+the owner engine remains separate. Account/member/model checks apply before egress.
+The Desktop membership-generation and usage ledger is reused, including cleanup
+before a deleted/reapproved member can resume. `share list` includes usage totals.
+
+CLI sharing supports native Codex Responses API providers, native ChatGPT login,
+and native Claude subscription login. Claude stays inside the unmodified CLI and
+uses its own credential store; Cindy never reads or proxies its subscription tokens.
+ChatGPT guests use isolated ephemeral authentication and a session-bound loopback
+route. The host reads access tokens from native `CODEX_HOME/auth.json` in memory;
+native Codex performs refresh. Keyring-only Codex credentials are not supported by
+this adapter. Changing the ChatGPT account requires restarting the host. No credential
+file is copied into a guest home. Provider groups and re-sharing remain unsupported. Keep `keyring` or explicit `file` storage as appropriate.
+For Docker build, initialization, persistent volumes and `docker exec` approval,
+see [Docker 部署与审批](DOCKER.zh-CN.md).
 
 ## Headless Linux without a keyring
 
@@ -182,8 +222,9 @@ When composed without a runtime or protected authentication adapter, commands fa
 the machine is providing Agents. The executable wires the relay runtime and native
 credential store. Live acceptance still requires real same-account desktop discovery and execution
 with tools returning to the desktop for each selected harness.
-Cross-account sharing, provider groups, all Harnesses, SSH workspaces and direct
-WebRTC connectivity are not implied by this scaffold.
+Direct cross-account sharing is available for native Codex Responses API, ChatGPT
+login, and native Claude subscription login. Provider groups, re-sharing, other sharing adapters, SSH workspaces and
+direct WebRTC connectivity are not implied by this host.
 
 ```sh
 pnpm --filter @cindy/host typecheck

@@ -12,6 +12,7 @@
  * 窗口期内的新申请在本机只进管理页与提示点；那台电脑在同一窗口期关注本机的分享，由它弹审批窗。
  */
 import {
+  checkProviderShareGuestAccess,
   parseProviderSharePeer,
   type ProviderShareOwned,
   type ProviderShareRequestItem,
@@ -556,22 +557,13 @@ function checkGuestAccess(controller: string): GuestAccessCheck {
   const rt = runtime;
   if (!rt || rt.stopped || runtime !== rt) return { denied: 'host-not-running' };
   if (!current(rt)) return { denied: 'host-scope-stale' };
-  const peer = parseProviderSharePeer(controller);
-  if (!peer || peer.role !== 'guest') return { denied: 'not-guest-peer' };
-  const self = getDeviceId();
-  if (self && peer.deviceId === self) return { denied: 'self-device' };
-  const share = rt.shares.find((item) => item.shareId === peer.shareId);
-  if (!share) return { denied: rt.fetchedAt === 0 ? 'snapshot-not-loaded' : 'share-unknown' };
-  if (self && share.hostDeviceId !== self) return { denied: 'share-on-other-device' };
-  const member = share.members.find((item) => item.memberId === peer.memberId);
-  if (!member || member.status !== 'active') return { denied: 'member-not-active' };
-  if (rt.blockedMembers.has(JSON.stringify([share.shareId, member.memberId]))
-    || rt.events.memberReady?.({ shareId: share.shareId, memberId: member.memberId, joinedAt: member.joinedAt }) === false) {
-    return { denied: 'member-cleanup-pending' };
-  }
-  if (!readDeviceLinkSettings().remoteControlEnabled) return { denied: 'remote-control-off' };
-  if (!isRemoteProviderInvocationAllowed(share.providerId)) return { denied: 'provider-not-remote' };
-  return { access: { shareId: share.shareId, memberId: member.memberId, providerId: share.providerId } };
+  return checkProviderShareGuestAccess(controller, {
+    running: true, current: true, selfDeviceId: getDeviceId(), shares: rt.shares,
+    fetched: rt.fetchedAt !== 0, remoteControlEnabled: readDeviceLinkSettings().remoteControlEnabled,
+    providerAllowed: isRemoteProviderInvocationAllowed,
+    memberReady: (shareId, memberId, joinedAt) => !rt.blockedMembers.has(JSON.stringify([shareId, memberId]))
+      && rt.events.memberReady?.({ shareId, memberId, joinedAt }) !== false,
+  });
 }
 
 /**

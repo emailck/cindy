@@ -1,0 +1,16 @@
+services:
+  cindy-host:
+    image: cindy-host:local
+    build:
+      context: ../..
+      dockerfile: apps/cindy-host/Dockerfile
+    container_name: cindy-host
+    init: true
+    restart: unless-stopped
+    stop_grace_period: 30s
+    volumes:
+      - host-data:/var/lib/cindy-host
+      - codex-data:/var/lib/cindy-codex
+volumes:
+  host-data:
+  codex-data:

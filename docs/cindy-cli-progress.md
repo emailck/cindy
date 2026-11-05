@@ -165,3 +165,42 @@ Desktop 类型检查。用户完成 Windows Desktop 到 Linux Codex API 的真�
 供应商与模型可见、后续回复速度改善。对照日志中两次新任务的启动总时长约 99.7 秒
 与 32.7 秒，不是同负载基准；后一次仍有约 21.1 秒上传与 9.6 秒会话就绪等待。
 串行分块上传优化尚未实现，不宣称启动延迟已全部解决。
+
+## Codex API 跨账号分享与 Docker 管理
+
+新增 share link/list/approve/reject/pause/resume/remove，通过当前服务的私有 Unix socket
+管理，不与 serve 竞争认证锁。Docker 后台服务不依赖 stdin/TTY，使用 docker exec
+管理，日志只提示身份/请求 ID，配对码与邀请只返回管理终端。
+
+官方分享 REST 与链接格式直接复用 device-link；成员准入判据抽到 providerShareAccess，
+Desktop 与 CLI 同用。Desktop 的 providerShareUsageStore 下沉 remote-agent-host，
+原路径保持重导出；复用成员代次落盘、清理门与用量账本，不复制一套。原生 Codex
+访客使用 maker-core 既有隔离，每个访客运行独立引擎并在关闭时释放，模型出口复用
+anthropic-compat-proxy，与 Desktop 相同组件；真实 Key/原生认证头只在代理内存中，
+不写访客 auth.json。当前针对原生 Codex Responses API，订阅/Claude 分享、转分享
+和供应商组尚未接入，相关路径不放行。既有同账号行为保留。无新增跨端帧或 channel，
+Unix 管理通道仅限本机；自建 relay 无新合同。跨区是否可用继续由官方服务裁决。
+
+验证用假 REST 成员与真实 scoped wire 帧，覆盖批准前拒绝、批准后发现、其它频道拒绝、
+暂停后拒绝、本地移除后失败/迟到快照不能恢复授权。原生 Codex 0.159.2 与 0.166.0
+配合本地模拟 Responses 上游验证访客生成、说明/凭证隔离与模型/令牌/撤销门禁。
+Docker Compose 配置通过解析；本机磁盘空间不足以执行完整镜像构建，镜像内运行与
+官方两账号最终验收仍待执行。安装遇到 ENOSPC 已清理可重建包缓存，依赖检查恢复。
+
+
+### CLI 官方登录分享补齐（2026-11-05）
+
+已接入 ChatGPT 与 Claude 原生官方登录的跨账号分享。Claude 只提供准入绑定，
+由原生 CLI 自己读取、刷新凭证并直连；ChatGPT 使用既有 ephemeral 认证桥与受邀者
+独占代理，原生 Codex 负责刷新，访问令牌仅在内存中使用，不复制到访客目录。
+当前 ChatGPT 读取原生 auth.json，keyring-only 登录暂不支持；换账号需重启提供端。
+分享审批、撤销及同账号通道沿用原协议，无自建中转适配变更。
+
+验证：CLI typecheck 通过；5 文件 83 项测试通过（24.28 秒），包含真实 Codex 二进制
+配合假凭证的 OAuth 访客启动、凭证文件隔离、API 访客生成及 OAuth 路由拒绝测试。
+Claude 准入绑定测试覆盖模型范围、成员失效、release 与登出。没有使用真实官方账号，
+ChatGPT/Claude 两账号实际生成、续期和容器运行仍待联调，不作为生产验收完成。
+
+真实双账号联调补充：用户已确认 ChatGPT 官方登录分享可用。修复了 CLI 注入的
+stdio cindy_memory 与桌面 HTTP MCP 隧道合并时的启动失败；原生 API/OAuth 回归均已
+覆盖桌面携带 cindy_memory 的场景。Claude 官方账号实际生成和容器验收仍未完成。

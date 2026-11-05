@@ -1,3 +1,4 @@
+import { runShareControl } from './share-control';
 import { parseArgs } from 'node:util';
 import { HostCliError, HOST_ENDPOINTS, HOST_REGION, readConfig, resolveDataDirectory, updateConfig, type HostConfig } from './config';
 import { serveHost, withProfileLock, type HostLifecycle, type SignalSource } from './lifecycle';
@@ -42,6 +43,10 @@ Commands:
   login [options]                    Official Cindy authentication
   logout                            Sign out and revoke stored authentication
   serve                             Run the authenticated provider in foreground
+  share link|list                   Manage shares through the running host
+  share approve REQUEST_ID CODE     Approve after checking identity and pairing code
+  share reject REQUEST_ID           Reject a pending request
+  share pause|resume|remove MEMBER  Change an existing share
 
 Configuration keys: remoteAccessEnabled (true|false), permissionMode (full-access), deviceName.
 Data directory: --data-dir or CINDY_HOST_DATA_DIR; required outside Git workspaces.
@@ -74,9 +79,10 @@ export async function runCli(argv: string[], dependencies: CliDependencies = {})
       if (args.length) throw new HostCliError('INVALID_ARGUMENT', 'version accepts no arguments.');
       output(metadata.version); return 0;
     }
-    if (!['status', 'doctor', 'config', 'login', 'logout', 'serve'].includes(command)) throw new HostCliError('INVALID_ARGUMENT', 'Unknown command. Run cindy-host help.');
+    if (!['status', 'doctor', 'config', 'login', 'logout', 'serve', 'share'].includes(command)) throw new HostCliError('INVALID_ARGUMENT', 'Unknown command. Run cindy-host help.');
     const dataDir = await resolveDataDirectory(dataDirectory ?? (dependencies.env ?? process.env).CINDY_HOST_DATA_DIR);
     const context: HostCommandContext = { dataDir, region: HOST_REGION, endpoints: HOST_ENDPOINTS, config: (await readConfig(dataDir)).effective, output, error };
+    if (command === 'share') { output(JSON.stringify(await runShareControl(dataDir, args), null, 2)); return 0; }
     if (command === 'login' || command === 'logout') {
       if (!dependencies.authCommand) throw new HostCliError('AUTH_UNAVAILABLE', 'No protected authentication adapter is installed in this build.');
       return await withProfileLock(dataDir, signal => { context.signal = signal; return dependencies.authCommand!([command, ...args], context); }, { signals: dependencies.signals });

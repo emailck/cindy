@@ -1,8 +1,11 @@
+import { createProviderShareUsageStore } from '@cindy/remote-agent-host/providerShareUsageStore';
+import { createShareManager } from '../share-manager';
+import { startShareControl } from '../share-control';
 import path from 'node:path';
 import { createHash } from 'node:crypto';
 import WebSocket from 'ws';
 import { wireAsyncInboundDispatch, DeviceLinkClient, DEVICE_LINK_CAPABILITY_BACKGROUND_LINK_V1, REMOTE_AGENT_CHANNEL,
-  PROTOCOL_VERSION, isScopedPeer, type Envelope, type InvokePayload, type InvokeResultPayload,
+  PROTOCOL_VERSION, isScopedPeer, parseProviderSharePeer, PROVIDER_SHARE_RELAY_CAPABILITY, type Envelope, type InvokePayload, type InvokeResultPayload,
   type LinkOpenPayload, type DeviceLinkClientOptions } from '@cindy/device-link';
 import { createRemoteAgentHost, hostedStartOptions } from '@cindy/remote-agent-host';
 import type { HostCommandContext } from '../cli';
@@ -50,18 +53,24 @@ export async function createCliHost(context: HostCommandContext, options: CliHos
   let signal: AbortSignal | undefined;
   let resolveStopped!: () => void;
   const stoppedPromise = new Promise<void>(resolve => { resolveStopped = resolve; });
+  const ledger = createProviderShareUsageStore(path.join(context.dataDir, 'accounts', createHash('sha256').update(storageScope).digest('hex'), 'provider-share-usage.json'));
   const admitted = new Set<string>();
   const current = () => active && options.auth.captureOwner() === owner;
-  const authorized = (peer: string) => current() && enabled && authenticated && accountReady && !isScopedPeer(peer);
+  let shareManager: ReturnType<typeof createShareManager> | undefined;
+  let stopControl: (() => Promise<void>) | undefined;
+  let shareTimer: ReturnType<typeof setInterval> | undefined;
+  const authorized = (peer: string) => current() && enabled && authenticated && accountReady
+    && (!isScopedPeer(peer) || shareManager?.access(peer)?.providerId === provider.id);
   const host = createRemoteAgentHost({
     runsRoot: path.join(context.dataDir, 'accounts', createHash('sha256').update(storageScope).digest('hex'), 'remote-agent'),
     captureOwner: () => owner,
     isOwnerCurrent: candidate => candidate === owner && current(),
     isControllerAuthorized: authorized,
-    controllerTrust: () => 'owner',
+    controllerTrust: peer => isScopedPeer(peer) ? 'guest' : 'owner',
+    reshare: { canUse: () => false, allows: () => false, async sync() { throw new Error('[REMOTE_AGENT_RESHARE_NOT_ALLOWED] CLI reshare consent is unavailable.'); } },
     isAgentAvailable: kind => kind === provider.kind && authenticated,
     startHosted: async input => {
-      if (input.kind !== provider.kind || input.guest) throw new Error('[REMOTE_AGENT_UNSUPPORTED] Only same-account sessions for the selected harness are supported.');
+      if (input.kind !== provider.kind || (input.guest && !provider.sharing?.supported)) throw new Error('[REMOTE_AGENT_UNSUPPORTED] Only same-account sessions for the selected harness are supported.');
       // Full access is the host default; an explicit desktop policy always wins.
       const startOptions = hostedStartOptions(input);
       return provider.agent.startSession({ ...startOptions,
@@ -72,6 +81,13 @@ export async function createCliHost(context: HostCommandContext, options: CliHos
       if (kind !== provider.kind) throw new Error('[REMOTE_AGENT_UNSUPPORTED] Unsupported harness.');
       return provider.agent.forkSdkSession(input);
     },
+    recordGuestUsage: (controller, usage) => {
+      // A revoked run can still deliver its final usage; keep attribution to the
+      // admitted peer in this account-scoped host, not the new access snapshot.
+      const peer = parseProviderSharePeer(controller);
+      if (peer?.role === 'guest' && usage.providerId === provider.id) ledger.record(peer.shareId, peer.memberId, usage);
+    },
+    bindGuestProviderRoute: provider.sharing?.supported ? input => provider.sharing!.bind({ ...input, isCurrent: () => input.isCurrent() && authorized(input.controller) }) : undefined,
     providerAccess: {
       resolve: async (kind, model, id, controller) => authorized(controller) && kind === provider.kind
         && (!id || id === provider.id) && provider.modelIds.has(model) ? provider.id : null,
@@ -93,7 +109,7 @@ export async function createCliHost(context: HostCommandContext, options: CliHos
     },
     getHello: () => ({ deviceName: context.config.deviceName, platform: process.platform,
       appVersion: metadata.version, remoteControlEnabled: enabled && authenticated && accountReady, busy: host.turnRunningControllers().length > 0,
-      capabilities: [],
+      capabilities: provider.sharing?.supported ? [PROVIDER_SHARE_RELAY_CAPABILITY] : [],
     }),
     createWebSocket: options.createWebSocket ?? ((url, headers) => new WebSocket(url, { headers })),
     // Transport diagnostics can include payload details; emit only our fixed lifecycle messages.
@@ -163,8 +179,12 @@ export async function createCliHost(context: HostCommandContext, options: CliHos
       reply(peer, frame.id, { ok: false, error: { code: 'IPC_ERROR', message: code ? `[${code}] Remote Agent request failed.` : 'Remote Agent request failed.' } });
     }
   }
-  const off = wireAsyncInboundDispatch(client, frame => {
-    if (!frame.src || !frame.id || isScopedPeer(frame.src) || !current()) return;
+  const off = wireAsyncInboundDispatch(client, async frame => {
+    if (!frame.src || !frame.id || !current()) return;
+    if (isScopedPeer(frame.src)) {
+      if (parseProviderSharePeer(frame.src)?.role !== 'guest' || !shareManager) return;
+      if (!shareManager.access(frame.src)) await shareManager.refresh();
+    }
     if (frame.kind === 'link-open') {
       if (!authorized(frame.src) || (frame.payload as LinkOpenPayload)?.protocolVersion !== PROTOCOL_VERSION) return;
       try {
@@ -181,9 +201,10 @@ export async function createCliHost(context: HostCommandContext, options: CliHos
     if (stopped) return stopped;
     active = false;
     if (timer) clearInterval(timer);
+    if (shareTimer) clearInterval(shareTimer);
     signal?.removeEventListener('abort', abort);
     off(); offIssue(); admitted.clear(); replies.clear(); client.stop();
-    const disposal = host.dispose().finally(() => provider.dispose()).finally(resolveStopped);
+    const disposal = Promise.resolve(stopControl?.()).finally(() => host.dispose()).finally(() => provider.dispose()).finally(() => ledger.flush()).finally(resolveStopped);
     stopped = disposal;
     return disposal;
   }
@@ -206,6 +227,7 @@ export async function createCliHost(context: HostCommandContext, options: CliHos
             lastAuthProbe = Date.now(); authenticated = await provider.isAuthenticated();
           }
           if (!enabled || !authenticated || !accountReady) { admitted.clear(); await host.abortControllers(() => true); }
+          else await host.abortControllers(peer => isScopedPeer(peer) && !authorized(peer));
           if (client.getStatus() === 'online') {
             const presence = { remoteControlEnabled: enabled && authenticated && accountReady, busy: host.turnRunningControllers().length > 0 };
             if (!publishedPresence || publishedPresence.remoteControlEnabled !== presence.remoteControlEnabled || publishedPresence.busy !== presence.busy) {
@@ -227,6 +249,44 @@ export async function createCliHost(context: HostCommandContext, options: CliHos
       client.start();
       try { await client.waitUntilOnline(30_000); }
       catch { await stop(); throw new Error('Cindy relay handshake did not complete. Check authentication and network, then restart serve.'); }
+      if (current() && provider.sharing && process.platform !== 'win32') {
+        shareManager = createShareManager({ ledger, ownerScope: storageScope, providerId: provider.id, providerName: provider.view(true).name,
+          deviceId: () => client.getSelfDeviceId(), current, enabled: () => enabled && authenticated && accountReady,
+          server: context.endpoints.deviceLinkApiBaseUrl, notify: context.output,
+          revoke: (match, purge) => purge ? host.purgeControllers(match) : host.abortControllers(match),
+          async request(path, body, identity) {
+            for (let attempt = 0; attempt < 2; attempt++) {
+              if (!current()) throw new Error('Account changed');
+              const token = await options.auth.getToken();
+              if (!token || !current()) throw new Error('Authentication unavailable');
+              const response = await fetch((identity ? context.endpoints.authApiBaseUrl : context.endpoints.deviceLinkApiBaseUrl) + path, {
+                method: body === undefined ? 'GET' : 'POST', redirect: 'error',
+                headers: { authorization: `Bearer ${token}`, 'content-type': 'application/json' },
+                ...(body === undefined ? {} : { body: JSON.stringify(body) }),
+                signal: AbortSignal.any([signal!, AbortSignal.timeout(15000)]),
+              });
+              if (response.status === 401 && attempt === 0 && current()) {
+                await response.body?.cancel();
+                if (await options.auth.refresh()) continue;
+              }
+              if (!response.ok || !current()) throw new Error('Share service request failed');
+              return response.json();
+            }
+            throw new Error('Share authentication unavailable');
+          },
+        });
+        stopControl = await startShareControl(context.dataDir, async command => {
+          if (['link', 'approve', 'resume'].includes(command.action)) await provider.sharing!.prepare();
+          return shareManager!.execute(command);
+        });
+        const refreshShares = async () => {
+          if (!provider.sharing!.supported) return;
+          try { await provider.sharing!.prepare(); await shareManager!.refresh(); }
+          catch { /* Unavailable adapters/service never authorize a guest. */ }
+        };
+        await refreshShares();
+        shareTimer = setInterval(() => { void refreshShares(); }, 5000);
+      }
       if (current()) context.output(`Cindy provider online (same-account ${provider.kind}, relay transport).`);
     },
     stop,

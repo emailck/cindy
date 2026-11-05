@@ -25,7 +25,8 @@
     "./host/execServerStartupBatch": "./src/host/execServerStartupBatch.ts",
     "./controller/runClient": "./src/controller/runClient.ts",
     "./controller/poller": "./src/controller/poller.ts",
-    "./executor/workspace": "./src/executor/workspace.ts"
+    "./executor/workspace": "./src/executor/workspace.ts",
+    "./providerShareUsageStore": "./src/providerShareUsageStore.ts"
   },
   "scripts": {
     "build": "tsc --noEmit",
