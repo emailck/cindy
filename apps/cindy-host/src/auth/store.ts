@@ -1,6 +1,6 @@
 import { randomUUID } from 'node:crypto';
 
-/** Implementations must use a host/OS protected store, with no plaintext fallback. */
+/** Stores use OS protection or explicitly selected private POSIX files; no silent fallback. */
 export interface ProtectedCredentialStore {
   assertAvailable(): Promise<void>;
   get(key: string): Promise<string | null>;

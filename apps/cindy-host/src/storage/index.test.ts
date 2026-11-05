@@ -1,7 +1,8 @@
+import { mkdtemp, rm, readdir, stat, chmod, symlink, readFile, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { describe, expect, it, vi } from 'vitest';
-import { createProtectedCredentialStore, type KeyringModule } from './index';
+import { createProtectedCredentialStore, createHostCredentialStore, type KeyringModule } from './index';
 
 /**
  * Test value: public store CRUD, profile isolation, capability failure and error
@@ -107,5 +108,54 @@ describe('OS protected host credential storage', () => {
     const h = harness();
     await expect(h.create('fake-profile-a', 'freebsd').assertAvailable()).rejects.toMatchObject({ code: 'CREDENTIAL_STORE_UNAVAILABLE' });
     expect(h.loadKeyring).not.toHaveBeenCalled();
+  });
+});
+
+// File mode was explicitly requested for headless login without Secret Service.
+// Existing tests only exercise a fake OS store. These unit cases cover real private
+// file persistence/rotation/logout and rejection of a linked or public record.
+// Minimal inputs: one fake token, mode 0644, or a symlink in a unique OS temp directory.
+// Standalone run: 0.665s Vitest duration (15 cases total).
+describe.skipIf(process.platform === 'win32')('explicit file credential mode', () => {
+  it('persists across store instances, rotates and deletes without loading a keyring', async () => {
+    const dir = await mkdtemp(path.join(tmpdir(), 'cindy-file-store-'));
+    try {
+      const store = createHostCredentialStore(dir, 'file');
+      await store.assertAvailable();
+      expect(await readdir(path.join(dir, 'credentials'))).toEqual([]);
+      await store.set('auth', 'fake-token');
+      const reopened = createHostCredentialStore(dir, 'file');
+      expect(await reopened.get('auth')).toBe('fake-token');
+      await reopened.set('auth', 'fake-rotated-token');
+      expect(await store.get('auth')).toBe('fake-rotated-token');
+      const folder = path.join(dir, 'credentials');
+      expect((await stat(folder)).mode & 0o777).toBe(0o700);
+      const files = await readdir(folder);
+      expect(files).toHaveLength(1);
+      expect((await stat(path.join(folder, files[0]))).mode & 0o777).toBe(0o600);
+      await reopened.delete('auth');
+      expect(await store.get('auth')).toBeNull();
+    } finally { await rm(dir, { recursive: true, force: true }); }
+  });
+  it.each(['permissions', 'symlink', 'corrupt'] as const)('preserves and rejects an unsafe %s record', async kind => {
+    const dir = await mkdtemp(path.join(tmpdir(), 'cindy-file-store-'));
+    try {
+      const store = createHostCredentialStore(dir, 'file');
+      await store.set('auth', 'fake-token');
+      const folder = path.join(dir, 'credentials');
+      const file = path.join(folder, (await readdir(folder))[0]);
+      if (kind === 'permissions') await chmod(file, 0o644);
+      if (kind === 'corrupt') await writeFile(file, 'fake-broken-json');
+      if (kind === 'symlink') {
+        await rm(file);
+        const target = path.join(dir, 'target');
+        await writeFile(target, '"fake-token"', { mode: 0o600 });
+        await symlink(target, file);
+      }
+      const before = await readFile(file, 'utf8');
+      await expect(store.get('auth')).rejects.toMatchObject({ code: 'CREDENTIAL_STORE_UNAVAILABLE' });
+      await expect(store.set('auth', 'fake-replacement')).rejects.not.toThrow('fake-token');
+      expect(await readFile(file, 'utf8')).toBe(before);
+    } finally { await rm(dir, { recursive: true, force: true }); }
   });
 });

@@ -1,3 +1,4 @@
+import { createFileCredentialStore } from './file';
 import { createHash, randomUUID } from 'node:crypto';
 import path from 'node:path';
 import type { ProtectedCredentialStore } from '../auth/store';
@@ -89,4 +90,11 @@ export function createProtectedCredentialStore(
     set(key, value) { return guarded(async () => (await entry(key)).setPassword(value)); },
     async delete(key) { await guarded(async () => { await (await entry(key)).deletePassword(); }); },
   };
+}
+
+/** File mode is explicit opt-in; never silently downgrade an OS keyring failure. */
+export function createHostCredentialStore(dataDir: string, mode = process.env.CINDY_HOST_CREDENTIAL_STORE ?? 'keyring'): ProtectedCredentialStore {
+  if (mode === 'file') return createFileCredentialStore(dataDir);
+  if (mode === 'keyring') return createProtectedCredentialStore(dataDir);
+  throw new Error('CINDY_HOST_CREDENTIAL_STORE must be keyring or file.');
 }

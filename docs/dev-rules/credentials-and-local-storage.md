@@ -49,6 +49,14 @@
 - 测试只使用明显无效的假凭证，不读取或复制开发者真实的 `HOME`、Agent home、
   Electron userData 或系统凭证目录。
 
+## CLI 显式本地凭证文件例外
+
+`apps/cindy-host` 支持用户明确选择 `CINDY_HOST_CREDENTIAL_STORE=file`，用于没有
+Secret Service 的 POSIX 主机。此模式不加密，目录 0700、文件 0600，仅允许当前用户
+所有的普通文件，不接受链接或不安全权限；临时写入与原子替换均在仓库外的数据目录内。
+默认仍为 `keyring`，不能因密钥环失败自动降级；切换模式不迁移、不删除旧凭证，需重新
+登录。该例外不适用于 Desktop、Mobile 或插件。用户可通过取消环境变量恢复默认。
+
 ## Claude 订阅只经 Claude Code 自己的登录
 
 Anthropic 只允许用户用自己的订阅登录**未修改的 Claude Code**；第三方应用不得提供

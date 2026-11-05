@@ -2,12 +2,21 @@
 
 本文面向 Ubuntu 22.04 / 24.04、glibc、x86_64 或 ARM64 VPS。目标是让桌面 Cindy
 使用 VPS 上的 Claude Code，文件与命令工具仍回到发起任务的桌面执行。
-当前仅支持同账号、Claude Code 与 relay 通道；不包含 Docker、跨账号分享或无人值守部署。
+当前支持同账号、Claude Code 或 Codex（每个进程选择一种）与 relay 通道；不包含 Docker、跨账号分享或无人值守部署。
 
 **验证边界**：仓库已完成 Windows 上的构建、CLI 检查与自动化测试，并完成一次真实
-Global Google 登录及跨进程凭证存在性检查。以下 Linux 安装、Secret Service、SSH
-断开后的进程保留及真实两机调用尚未在目标 VPS 执行；这是待实机验收的部署步骤，
-不能据此宣称 Linux 已部署成功。当前证据见[进度台账](../../docs/cindy-cli-progress.md)。
+Global Google 登录及跨进程凭证存在性检查。本轮另已验证 Linux 构建、文件凭证登录及 Windows Desktop 到 Linux Codex API 的
+真实两机调用。下文 Ubuntu Secret Service、SSH 断开后的进程保留与无人值守运行仍需
+按目标环境验收，不能把文件凭证模式的结果当作密钥环模式已通过。当前证据见[进度台账](../../docs/cindy-cli-progress.md)。
+
+Codex 配置参见 [Codex provider](README.md#codex-provider)，选择 Codex 时无需配置 Claude。
+
+## 无密钥环的简化登录
+
+接受凭证以当前用户私有文件保存（不加密）时，可以设置
+`CINDY_HOST_CREDENTIAL_STORE=file`，按 [README](README.md#headless-linux-without-a-keyring)
+登录。该模式跳过下文密钥环、D-Bus 和解锁步骤；每次启动命令保持相同环境变量和数据目录。
+默认密钥环模式及其部署步骤仍保留。tmux 只用于需要断开 SSH 后保持前台服务的情况。
 
 ## 1. 准备专用普通用户与依赖
 

@@ -60,7 +60,7 @@ and requires an available browser sign-in method.
 The native `@napi-rs/keyring` dependency must be installed alongside the built
 entry. Credentials use macOS Keychain, Windows Credential Manager or Linux Secret
 Service. Linux requires an installed, unlocked Secret Service provider and its
-user D-Bus session. There is no plaintext or temporary kernel-keyring fallback.
+user D-Bus session. There is no automatic plaintext or temporary kernel-keyring fallback. Explicit file mode is described below.
 `doctor` reports setup failures without showing credential values.
 
 Install and authenticate an unmodified Claude Code executable using its own
@@ -78,6 +78,70 @@ credentials. For API usage, choose `CINDY_HOST_CLAUDE_AUTH=api-key` and supply
 `ANTHROPIC_API_KEY` through your trusted process/service secret manager. An optional
 `ANTHROPIC_BASE_URL` applies to API mode. Do not place secrets in command arguments,
 shell history, repository files or `config.json`.
+
+## Codex provider
+
+Select one harness per host process. The default `CINDY_HOST_AGENT=claude-code`
+keeps existing deployments unchanged. `codex` uses the same-account remote host
+and the native Codex execution-environment tunnel; project commands/files stay
+on the requesting desktop. No new Device Link channel or relay protocol is used.
+Cross-account sharing is not enabled by this selection.
+
+```sh
+export CINDY_HOST_AGENT=codex
+export CINDY_HOST_CODEX_BINARY=/absolute/path/to/codex
+"$CINDY_HOST_CODEX_BINARY" login --device-auth
+cindy-host config set remoteAccessEnabled true
+cindy-host doctor
+cindy-host serve
+```
+
+Use the repository-pinned native binary, e.g.
+`apps/codex-package-bin/linux-x64/bin/codex` with an absolute checkout prefix.
+Codex accepts native ChatGPT or API-key login. Existing native `config.toml`
+provider settings (including a Responses-compatible relay) and inherited credential
+environment are preserved. Use the same HOME/CODEX_HOME and environment as your
+working Codex CLI; verify that this executable reports success for `login status`.
+For an existing API setup, skip `login --device-auth`; do not replace it with ChatGPT login. Native Codex owns its credentials and refresh, using
+the process's normal HOME/CODEX_HOME. Cindy does not copy them into its own store.
+Remote provider IDs are used for discovery and admission only; native session start,
+fork and model changes do not inject them as credential routes, so concurrent
+sessions retain the same native configuration.
+Models and reasoning levels come from Codex `model/list`; no static fallback
+models are advertised. `doctor` disposes its probe app-server; shutdown disposes
+the runtime app-server after closing hosted sessions. Keep these environment
+variables when restarting, or unset CINDY_HOST_AGENT to return to Claude.
+
+Validation covers fake-relay discovery, admission, session/tunnel wiring, explicit
+permission preservation and cleanup for both harnesses. Manual Windows Desktop to
+Linux Codex API invocation has also been exercised, including native relay configuration.
+This does not establish parity for every desktop feature: session-list/subscription
+endpoints remain unsupported, and initial payload upload can still be slow.
+
+## Headless Linux without a keyring
+
+Explicitly choose private local files when OS keyring encryption is not required:
+
+```sh
+export CINDY_HOST_CREDENTIAL_STORE=file
+export CINDY_HOST_DATA_DIR="$HOME/.local/share/cindy-host"
+cindy-host login --social google
+cindy-host status
+```
+
+Keep the same variables for login, status, doctor, logout and serve. `file` stores
+unencrypted credentials in `credentials/` under the selected data directory, with
+POSIX directory permissions 700 and file permissions 600. Only the owning user
+(and privileged administrators) can read them. Windows file mode is unsupported.
+Unsafe permissions, links and malformed records fail without replacing the record.
+Writes use a private temporary file and atomic rename; logout deletes its auth record.
+
+The default remains `keyring`; invalid values are rejected, and a keyring failure
+never falls back to files. Unset the variable to restore the default. Switching
+stores does not migrate or delete the other store's credentials: sign in again in
+the selected store. Log out of each store separately when revoking both logins.
+File mode requires neither D-Bus nor a keyring password. Status reports saved
+credential presence, not a verified live connection.
 
 ## Configuration and authorization
 
@@ -116,8 +180,8 @@ its abort signal, and cleanup must be idempotent. A runtime may expose
 When composed without a runtime or protected authentication adapter, commands fail with
 `RUNTIME_UNAVAILABLE` / `AUTH_UNAVAILABLE`; `doctor` exits nonzero. They do not claim
 the machine is providing Agents. The executable wires the relay runtime and native
-credential store. First-phase acceptance still requires real same-account
-desktop discovery and Claude Code execution with tools returning to the desktop.
+credential store. Live acceptance still requires real same-account desktop discovery and execution
+with tools returning to the desktop for each selected harness.
 Cross-account sharing, provider groups, all Harnesses, SSH workspaces and direct
 WebRTC connectivity are not implied by this scaffold.
 

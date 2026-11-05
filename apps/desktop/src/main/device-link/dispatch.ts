@@ -1,3 +1,4 @@
+import { wireAsyncInboundDispatch } from '@cindy/device-link';
 import { parseKimiUsageRequest, isKimiCodingProvider } from '../../shared/kimiCodingUsage.js';
 import { readKimiCodingAccountUsage } from '../maker-host/provider-account-usage.js';
 import { PROVIDER_SHARE_INSIGHTS_CHANNEL } from '../../shared/providerShareInsights.js';
@@ -2689,13 +2690,8 @@ export function purgeRevokedController(deviceId: string): void {
  */
 export function wireInboundDispatch(client: DeviceLinkClient): () => void {
   activeClient = client;
-  return client.onFrame((env: Envelope) => {
-    // 可靠传输的 ACK 边界是“已进入本地执行状态机”，不是“耗时 IPC 已执行完成”。
-    // handleInvoke 会在第一次 await 前登记 in-flight requestId 去重；这里不把它的
-    // Promise 交回 transport，避免一个慢查询把后续 stop/steer/push 全部堵在队头。
-    void handleFrame(client, env).catch((err) => {
-      log.error('inbound frame handling failed', err);
-    });
+  return wireAsyncInboundDispatch(client, env => handleFrame(client, env), err => {
+    log.error('inbound frame handling failed', err);
   });
 }
 

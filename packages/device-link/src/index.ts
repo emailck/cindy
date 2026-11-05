@@ -81,3 +81,5 @@ export * from "./orcaRemoteWorker.js";
 export * from "./companionCloud.js";
 export * from "./machineStatus.js";
 export * from "./pluginPages.js";
+
+export { wireAsyncInboundDispatch } from './asyncInboundDispatch.js';

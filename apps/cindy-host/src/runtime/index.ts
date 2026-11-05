@@ -1,14 +1,15 @@
 import path from 'node:path';
 import { createHash } from 'node:crypto';
 import WebSocket from 'ws';
-import { DeviceLinkClient, DEVICE_LINK_CAPABILITY_BACKGROUND_LINK_V1, REMOTE_AGENT_CHANNEL,
+import { wireAsyncInboundDispatch, DeviceLinkClient, DEVICE_LINK_CAPABILITY_BACKGROUND_LINK_V1, REMOTE_AGENT_CHANNEL,
   PROTOCOL_VERSION, isScopedPeer, type Envelope, type InvokePayload, type InvokeResultPayload,
   type LinkOpenPayload, type DeviceLinkClientOptions } from '@cindy/device-link';
 import { createRemoteAgentHost, hostedStartOptions } from '@cindy/remote-agent-host';
 import type { HostCommandContext } from '../cli';
 import { readConfig } from '../config';
 import type { HostLifecycle } from '../lifecycle';
-import { createClaudeProvider, quietRuntimeLogger } from './claude';
+import { quietRuntimeLogger } from './claude';
+import { createProvider } from './provider';
 import metadata from '../../package.json';
 
 export interface HostAuthPort {
@@ -22,7 +23,7 @@ export interface CliHostOptions {
   auth: HostAuthPort;
   /** Provider settings/credential source only; HOME/PATH/native execution identity remain ambient. */
   env?: NodeJS.ProcessEnv;
-  createProvider?: typeof createClaudeProvider;
+  createProvider?: typeof createProvider;
   createWebSocket?: DeviceLinkClientOptions['createWebSocket'];
   loadConfig?: () => Promise<HostCommandContext['config']>;
 }
@@ -36,7 +37,7 @@ export async function createCliHost(context: HostCommandContext, options: CliHos
   const owner = options.auth.captureOwner();
   const storageScope = options.auth.storageScope();
   if (!owner || !storageScope) throw new Error('Cindy authentication owner is unavailable.');
-  const provider = await (options.createProvider ?? createClaudeProvider)(context.dataDir, logger, options.env);
+  const provider = await (options.createProvider ?? createProvider)(context.dataDir, logger, options.env);
   let active = false;
   let enabled = context.config.remoteAccessEnabled;
   let authenticated = true;
@@ -58,9 +59,9 @@ export async function createCliHost(context: HostCommandContext, options: CliHos
     isOwnerCurrent: candidate => candidate === owner && current(),
     isControllerAuthorized: authorized,
     controllerTrust: () => 'owner',
-    isAgentAvailable: kind => kind === 'claude-code' && authenticated,
-    startHosted: input => {
-      if (input.kind !== 'claude-code' || input.guest) throw new Error('[REMOTE_AGENT_UNSUPPORTED] Only same-account Claude sessions are supported.');
+    isAgentAvailable: kind => kind === provider.kind && authenticated,
+    startHosted: async input => {
+      if (input.kind !== provider.kind || input.guest) throw new Error('[REMOTE_AGENT_UNSUPPORTED] Only same-account sessions for the selected harness are supported.');
       // Full access is the host default; an explicit desktop policy always wins.
       const startOptions = hostedStartOptions(input);
       return provider.agent.startSession({ ...startOptions,
@@ -68,14 +69,14 @@ export async function createCliHost(context: HostCommandContext, options: CliHos
       });
     },
     forkHosted: (kind, input) => {
-      if (kind !== 'claude-code') throw new Error('[REMOTE_AGENT_UNSUPPORTED] Unsupported harness.');
+      if (kind !== provider.kind) throw new Error('[REMOTE_AGENT_UNSUPPORTED] Unsupported harness.');
       return provider.agent.forkSdkSession(input);
     },
     providerAccess: {
-      resolve: async (kind, model, id, controller) => authorized(controller) && kind === 'claude-code'
+      resolve: async (kind, model, id, controller) => authorized(controller) && kind === provider.kind
         && (!id || id === provider.id) && provider.modelIds.has(model) ? provider.id : null,
       isAllowed: (id, controller, model) => authorized(controller) && id === provider.id && (!model || provider.modelIds.has(model)),
-      models: async kind => kind === 'claude-code' ? [...provider.modelIds] : [],
+      models: async kind => kind === provider.kind ? [...provider.modelIds] : [],
     },
   });
   const client: DeviceLinkClient = new DeviceLinkClient({
@@ -121,7 +122,7 @@ export async function createCliHost(context: HostCommandContext, options: CliHos
   async function invoke(frame: Envelope): Promise<void> {
     if (!frame.id) return;
     const peer = frame.src!;
-    if (!authorized(peer) || !admitted.has(peer)) { reply(peer, frame.id, { ok: false, error: { code: 'ACCESS_REVOKED', message: 'Remote access is unavailable.' } }); return; }
+    if (!authorized(peer)) { reply(peer, frame.id, { ok: false, error: { code: 'ACCESS_REVOKED', message: 'Remote access is unavailable.' } }); return; }
     const payload = frame.payload as InvokePayload;
     if (!payload || !channels.includes(payload.channel) || (payload.args !== undefined && !Array.isArray(payload.args))) {
       reply(peer, frame.id, { ok: false, error: { code: 'CHANNEL_NOT_ALLOWED', message: 'This channel is unavailable on this host.' } }); return;
@@ -131,12 +132,29 @@ export async function createCliHost(context: HostCommandContext, options: CliHos
       let value: unknown;
       switch (payload.channel) {
         case REMOTE_AGENT_CHANNEL:
-          if (!admitted.has(peer)) throw new Error('Link is not open.');
+          if (!admitted.has(peer)) {
+            reply(peer, frame.id, { ok: false, error: { code: 'ACCESS_REVOKED', message: 'Open a control link before remote execution.' } });
+            return;
+          }
           value = await host.handle(peer, args[0]); break;
         case 'maker:provider:list': value = { providers: [provider.view(enabled)], modelVisibilityOverrides: {}, providerOrder: [provider.id] }; break;
-        case 'maker:list-available-agents': value = ['claude-code']; break;
-        case 'maker:get-capabilities': value = args[0] === 'claude-code' ? provider.agent.capabilities : null; break;
-        case 'maker:agent:status': value = { binaryReady: args[0] === 'claude-code', binaryPath: null, authReady: args[0] === 'claude-code' && authenticated }; break;
+        case 'maker:list-available-agents': value = [provider.kind]; break;
+        case 'maker:get-capabilities': {
+          // Desktop probes all harnesses together, including inactive ones. A null
+          // response is a malformed catalog, not an unavailable engine.
+          if (args[0] !== provider.kind) {
+            value = { availableModels: [], hasFastMode: false, effortLevels: [], permissionModes: [] };
+          } else {
+            const models = Object.values(provider.view(enabled).models).flat();
+            value = { ...provider.agent.capabilities, availableModels: models.map(model => ({
+              id: model.id, displayName: model.name, contextWindow: model.contextWindow,
+              efforts: model.efforts, defaultEffort: model.defaultEffort,
+              ...(model.supportsFastMode !== undefined ? { supportsFastMode: model.supportsFastMode } : {}),
+            })) };
+          }
+          break;
+        }
+        case 'maker:agent:status': value = { binaryReady: args[0] === provider.kind, binaryPath: null, authReady: args[0] === provider.kind && authenticated }; break;
       }
       if (authorized(peer)) reply(peer, frame.id, { ok: true, result: value });
     } catch (error) {
@@ -145,7 +163,7 @@ export async function createCliHost(context: HostCommandContext, options: CliHos
       reply(peer, frame.id, { ok: false, error: { code: 'IPC_ERROR', message: code ? `[${code}] Remote Agent request failed.` : 'Remote Agent request failed.' } });
     }
   }
-  const off = client.onFrame(frame => {
+  const off = wireAsyncInboundDispatch(client, frame => {
     if (!frame.src || !frame.id || isScopedPeer(frame.src) || !current()) return;
     if (frame.kind === 'link-open') {
       if (!authorized(frame.src) || (frame.payload as LinkOpenPayload)?.protocolVersion !== PROTOCOL_VERSION) return;
@@ -157,7 +175,7 @@ export async function createCliHost(context: HostCommandContext, options: CliHos
       } catch { /* Controller can reopen using the shared transport recovery. */ }
     } else if (frame.kind === 'link-close') admitted.delete(frame.src);
     else if (frame.kind === 'invoke') return invoke(frame);
-  });
+  }, () => context.error('Remote request dispatch failed.'));
   const abort = () => { void stop(); };
   function stop(): Promise<void> {
     if (stopped) return stopped;
@@ -165,7 +183,7 @@ export async function createCliHost(context: HostCommandContext, options: CliHos
     if (timer) clearInterval(timer);
     signal?.removeEventListener('abort', abort);
     off(); offIssue(); admitted.clear(); replies.clear(); client.stop();
-    const disposal = host.dispose().finally(resolveStopped);
+    const disposal = host.dispose().finally(() => provider.dispose()).finally(resolveStopped);
     stopped = disposal;
     return disposal;
   }
@@ -209,7 +227,7 @@ export async function createCliHost(context: HostCommandContext, options: CliHos
       client.start();
       try { await client.waitUntilOnline(30_000); }
       catch { await stop(); throw new Error('Cindy relay handshake did not complete. Check authentication and network, then restart serve.'); }
-      if (current()) context.output('Cindy provider online (same-account Claude, relay transport).');
+      if (current()) context.output(`Cindy provider online (same-account ${provider.kind}, relay transport).`);
     },
     stop,
     waitUntilStopped: () => stoppedPromise,

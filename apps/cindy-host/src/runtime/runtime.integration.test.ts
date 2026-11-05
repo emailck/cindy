@@ -1,6 +1,6 @@
 /**
  * Test value: createCliHost uses the production DeviceLinkClient/RemoteAgentHost to return discovery
- * only after same-account link admission, revoke access, and recover rejected relay credentials.
+ * for authorized peers before link admission, gate execution, revoke access, and recover rejected relay credentials.
  * Rule: CLI-005/006; protocol and remote adaptation rules require no unadmitted execution.
  * Gap: Desktop host tests do not exercise this new Node host's wiring or token recovery.
  * Minimal failure: provider:list before link-open; live config disable; WS upgrade rejection.
@@ -13,11 +13,13 @@ import os from 'node:os';
 import path from 'node:path';
 import { mkdir, readFile, rm, writeFile } from 'node:fs/promises';
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { PROTOCOL_VERSION, REMOTE_AGENT_CHANNEL, type Envelope, type WsLike, type RemoteAgentStreamItem, type RemoteAgentPollResult } from '@cindy/device-link';
+import { encodeReliableFrames, DEVICE_LINK_CAPABILITY_RELIABLE_TRANSPORT, PROTOCOL_VERSION, REMOTE_AGENT_CHANNEL, type Envelope, type WsLike, type RemoteAgentStreamItem, type RemoteAgentPollResult } from '@cindy/device-link';
 import type { StartSessionOptions, AgentSessionHandle } from '@cindy/maker-core';
 import { HOST_ENDPOINTS } from '../config';
 import { createCliHost } from './index';
-import { mapClaudeModels, type createClaudeProvider } from './claude';
+import { mapCodexModels, createNativeCodexAuth, createCodexProvider } from './codex';
+import type { CodexModelListItem } from '@cindy/maker-core';
+import { quietRuntimeLogger, mapClaudeModels, type createClaudeProvider } from './claude';
 
 class Socket implements WsLike {
   sent: Envelope[] = [];
@@ -51,15 +53,15 @@ class Socket implements WsLike {
 
 afterEach(() => { vi.useRealTimers(); });
 
-async function harness(startSession?: (options: StartSessionOptions) => Promise<AgentSessionHandle>) {
+async function harness(startSession?: (options: StartSessionOptions) => Promise<AgentSessionHandle>, kind: 'claude-code' | 'codex' = 'claude-code') {
   vi.useFakeTimers();
   let owner: string | null = 'account:incarnation-1';
   const config = { remoteAccessEnabled: true, permissionMode: 'full-access' as const, deviceName: 'test-host' };
   const sockets: Socket[] = [];
   const output = vi.fn();
   const auth = { getToken: vi.fn(async () => 'token'), captureOwner: () => owner, storageScope: () => 'global:account', refresh: vi.fn(async () => true) };
-  const provider = { id: 'anthropic', modelIds: new Set(['claude-test-1']), isAuthenticated: async () => true,
-    view: (enabled: boolean) => ({ id: 'anthropic', connected: true, remoteInvocationEnabled: enabled }),
+  const provider = { kind, dispose: vi.fn(async () => {}), id: 'anthropic', modelIds: new Set(['claude-test-1']), isAuthenticated: async () => true,
+    view: (enabled: boolean) => ({ id: 'anthropic', connected: true, remoteInvocationEnabled: enabled, models: { [kind]: [{ id: 'claude-test-1', name: 'Test model', contextWindow: 128000, efforts: ['low'], defaultEffort: 'low' }] } }),
     agent: { capabilities: { availableModels: [] }, startSession: startSession ?? vi.fn(), forkSdkSession: vi.fn() },
   } as unknown as Awaited<ReturnType<typeof createClaudeProvider>>;
   const dataDir = path.join(os.tmpdir(), `cindy-host-test-${randomUUID()}`);
@@ -71,22 +73,124 @@ async function harness(startSession?: (options: StartSessionOptions) => Promise<
   expect(output).not.toHaveBeenCalled();
   sockets[0].ack(); await start;
   const open = () => sockets.at(-1)!.request('link-open', 'link', { controllerName: 'desktop', protocolVersion: PROTOCOL_VERSION, appVersion: '1.0.0' });
-  return { host, sockets, output, auth, config, open, dataDir, setOwner: (next: string | null) => { owner = next; } };
+  return { host, provider, sockets, output, auth, config, open, dataDir, setOwner: (next: string | null) => { owner = next; } };
 }
 
 describe('Node provider host', () => {
-  it('requires an accepted same-account link and returns Desktop discovery response shape', async () => {
-    const h = await harness();
+  // Regression: returning the long-poll promise from onFrame stalled ordered
+  // delivery/ACK for 10 seconds, delaying even provider discovery behind it.
+  // Real reliable transport + shared host, virtual time; a second peer is unaffected.
+  it('admits later reliable requests before an idle poll completes without blocking another peer', async () => {
+    let releaseEvents!: () => void;
+    const ended = new Promise<void>(resolve => { releaseEvents = resolve; });
+    let started!: () => void;
+    const ready = new Promise<void>(resolve => { started = resolve; });
+    const h = await harness(async options => {
+      started();
+      return { id: 'poll-session', agentKind: 'claude-code', model: options.model,
+        async send() {}, async abort() {}, async steer() {}, close: async () => { releaseEvents(); },
+        events: () => ({ async *[Symbol.asyncIterator]() { await ended; } }),
+        setInteractionResolver() {}, getUsageSnapshot: () => ({ tokenUsage: 0, contextTokens: 0, contextWindow: 0, costUsd: 0 }),
+      };
+    });
+    try {
+      const socket = h.sockets[0];
+      h.open();
+      const runId = randomUUID();
+      await socket.remote({ op: 'open', runId, agentKind: 'claude-code', payload: { json: {
+        sessionId: 'idle-task', options: { model: 'claude-test-1', providerId: 'anthropic' },
+        workspace: { workingDir: '/desktop/project', platform: 'linux', shell: 'bash' },
+        projectFiles: [], ancestorFiles: [], personal: { files: [] }, mcpServers: [],
+      } } });
+      await ready;
+      await vi.advanceTimersByTimeAsync(0);
+      const initial = await socket.remote({ op: 'poll', runs: [{ runId, cursor: 0 }], waitMs: 0 }) as RemoteAgentPollResult;
+      const cursor = initial.runs[0].cursor;
+      for (const peer of ['desktop', 'other-desktop']) {
+        socket.request('link-open', `link-${peer}`, { controllerName: peer, protocolVersion: PROTOCOL_VERSION,
+          appVersion: '1', capabilities: [DEVICE_LINK_CAPABILITY_RELIABLE_TRANSPORT],
+          transportStreamId: `stream-${peer}`, transportBaseSeq: 1 }, peer);
+      }
+      const send = (peer: string, seq: number, id: string, channel: string, args: unknown[]) => {
+        for (const frame of encodeReliableFrames({ v: PROTOCOL_VERSION, kind: 'invoke', src: peer, id,
+          payload: { channel, args } }, `stream-${peer}`, seq)) socket.push(frame);
+      };
+      send('desktop', 1, 'idle-poll', REMOTE_AGENT_CHANNEL, [{ op: 'poll', runs: [{ runId, cursor }], waitMs: 10000 }]);
+      await vi.advanceTimersByTimeAsync(0);
+      expect(socket.result('idle-poll')).toBeUndefined();
+      send('desktop', 2, 'same-peer-discovery', 'maker:provider:list', []);
+      send('other-desktop', 1, 'other-peer-discovery', 'maker:provider:list', []);
+      await vi.advanceTimersByTimeAsync(0);
+      expect(socket.result('other-peer-discovery')).toBeDefined();
+      expect(socket.result('same-peer-discovery')).toBeDefined();
+      expect(socket.result('idle-poll')).toBeUndefined();
+      await vi.advanceTimersByTimeAsync(10000);
+      expect(socket.result('idle-poll')).toBeDefined();
+    } finally { releaseEvents(); await h.host.stop(); await rm(h.dataDir, { recursive: true, force: true }); }
+  });
+
+  // Native regression: two live API sessions previously requested provider-oauth
+  // despite using the native API configuration, so session two tried to replace
+  // an occupied app-server. No inference is sent; credentials and endpoint are fake.
+  it.skipIf(!process.env.CINDY_CODEX_TEST_BINARY)('keeps two native API sessions attached across model changes', async () => {
+    const dir = path.join(os.tmpdir(), `cindy-native-concurrency-${randomUUID()}`);
+    const home = path.join(dir, 'codex');
+    const workspace = path.join(dir, 'work');
+    await mkdir(home, { recursive: true, mode: 0o700 });
+    await mkdir(workspace, { recursive: true });
+    await writeFile(path.join(home, 'auth.json'), JSON.stringify({ OPENAI_API_KEY: 'invalid-fake-concurrency-key' }), { mode: 0o600 });
+    await writeFile(path.join(home, 'config.toml'), 'model_provider="fixture"\nmodel="gpt-5.4"\n[model_providers.fixture]\nname="Fixture"\nbase_url="http://127.0.0.1:1/v1"\nwire_api="responses"\nrequires_openai_auth=true\n[mcp_servers.cindy_memory]\ncommand="false"\nenabled=false\n');
+    vi.stubEnv('CODEX_HOME', home);
+    let provider: Awaited<ReturnType<typeof createCodexProvider>> | undefined;
+    const handles: AgentSessionHandle[] = [];
+    try {
+      provider = await createCodexProvider(dir, quietRuntimeLogger(), { CINDY_HOST_CODEX_BINARY: process.env.CINDY_CODEX_TEST_BINARY });
+      for (let i = 0; i < 2; i++) {
+        handles.push(await provider.agent.startSession({ sessionId: randomUUID(), workingDir: workspace,
+          model: 'gpt-5.4', providerId: provider.id, permissionMode: 'bypassPermissions' }));
+      }
+      expect(handles).toHaveLength(2);
+      await handles[0].setModel?.('gpt-5.4', { providerId: provider.id });
+      expect(await readFile(path.join(home, 'config.toml'), 'utf8')).toContain('model_provider="fixture"');
+    } finally {
+      for (const handle of handles) await handle.close();
+      await provider?.dispose();
+      vi.unstubAllEnvs();
+      await rm(dir, { recursive: true, force: true });
+    }
+  }, 30_000);
+
+  it.each(['claude-code', 'codex'] as const)('allows pre-link %s discovery while requiring admission for execution', async kind => {
+    const h = await harness(undefined, kind);
     try {
       const socket = h.sockets[0];
       socket.request('invoke', 'before', { channel: 'maker:provider:list', args: [] });
       await vi.advanceTimersByTimeAsync(0);
-      expect(socket.result('before')).toMatchObject({ ok: false, error: { code: 'ACCESS_REVOKED' } });
+      expect(socket.result('before')).toMatchObject({ ok: true, result: { providers: [{ id: 'anthropic' }] } });
+      socket.request('invoke', 'execution-before', { channel: REMOTE_AGENT_CHANNEL, args: [{ op: 'poll', runs: [] }] });
+      await vi.advanceTimersByTimeAsync(0);
+      expect(socket.result('execution-before')).toMatchObject({ ok: false, error: { code: 'ACCESS_REVOKED' } });
       h.open();
       expect(socket.sent.some(frame => frame.kind === 'link-accept')).toBe(true);
       socket.request('invoke', 'after', { channel: 'maker:provider:list', args: [] });
       await vi.advanceTimersByTimeAsync(0);
       expect(socket.result('after')).toMatchObject({ ok: true, result: { providers: [{ id: 'anthropic', connected: true }] } });
+      socket.request('invoke', 'agents', { channel: 'maker:list-available-agents', args: [] });
+      socket.request('invoke', 'other', { channel: 'maker:agent:status', args: [kind === 'codex' ? 'claude-code' : 'codex'] });
+      await vi.advanceTimersByTimeAsync(0);
+      expect(socket.result('agents')).toMatchObject({ ok: true, result: [kind] });
+      expect(socket.result('other')).toMatchObject({ ok: true, result: { binaryReady: false, authReady: false } });
+      // The desktop selector probes all three engines even when only one is enabled.
+      for (const engine of ['claude-code', 'codex', 'pi']) {
+        socket.request('invoke', `caps-${engine}`, { channel: 'maker:get-capabilities', args: [engine] });
+      }
+      await vi.advanceTimersByTimeAsync(0);
+      for (const engine of ['claude-code', 'codex', 'pi']) {
+        expect(socket.result(`caps-${engine}`)).toMatchObject({ ok: true, result: {
+          availableModels: engine === kind ? [{ id: 'claude-test-1', displayName: 'Test model', contextWindow: 128000, defaultEffort: 'low' }] : [],
+          ...(engine !== kind ? { hasFastMode: false, effortLevels: [], permissionModes: [] } : {}),
+        } });
+      }
       socket.request('invoke', 'denied', { channel: 'file-browser:remote-op', args: [] });
       await vi.advanceTimersByTimeAsync(0);
       expect(socket.result('denied')).toMatchObject({ ok: false, error: { code: 'CHANNEL_NOT_ALLOWED' } });
@@ -119,13 +223,36 @@ describe('Node provider host', () => {
     } finally { await h.host.stop(); }
   });
 
+  // Regression: API-key Codex login was rejected solely because status was not
+  // ChatGPT. Exercise the production adapter without reading real credentials.
+  it.each(['oauth', 'api-key'] as const)('accepts native %s login without replacing Codex configuration', async source => {
+    const status = vi.fn(async () => ({ stdout: '', stderr: source === 'oauth' ? 'Logged in using ChatGPT' : 'Logged in using an API key - fake-secret' }));
+    const auth = createNativeCodexAuth('/unused/codex', status);
+    expect(await auth.getState()).toEqual({ authenticated: true, authSource: source });
+    expect(await auth.getAuthEnv({ credentialMode: 'provider-oauth' })).toEqual({});
+    status.mockRejectedValueOnce(new Error('fake-secret'));
+    expect(await auth.getState()).toEqual({ authenticated: false });
+  });
+
+  // Codex model/list uses model slug rather than row id. Hidden models must not
+  // become remotely callable; the previous CLI only covered Claude alias mapping.
+  it('projects only visible native Codex model slugs and advertised reasoning levels', () => {
+    const base: CodexModelListItem = { id: 'row', model: 'test', displayName: 'Test', description: '', hidden: false, supportedReasoningEfforts: [], defaultReasoningEffort: 'low', additionalSpeedTiers: [], serviceTiers: [], isDefault: false };
+    const models = mapCodexModels([
+      { ...base, id: 'row-id', model: 'test-codex-model', displayName: 'Test Codex', supportedReasoningEfforts: [{ reasoningEffort: 'low', description: '' }], defaultReasoningEffort: 'low' },
+      { ...base, id: 'hidden', model: 'hidden-model', hidden: true },
+    ]);
+    expect(models).toHaveLength(1);
+    expect(models[0]).toMatchObject({ id: 'test-codex-model', efforts: ['low'], defaultEffort: 'low' });
+  });
+
   it('resolves reported SDK aliases and never adds registry models outside discovered membership', () => {
     const mapped = mapClaudeModels([{ value: 'opus', description: 'Opus 4.7 with 1M context' }, { value: 'sonnet' }, { value: 'opus', description: 'Sonnet 4.6' },
       { value: 'claude-fable-5-20260401[1m]' }, { value: 'claude-3-7-sonnet-20250219' }, { value: 'claude-fable-5' }]);
     expect(mapped.map(model => model.id)).toEqual(['claude-opus-4-7', 'claude-fable-5', 'claude-3-7-sonnet']);
   });
 
-  it('opens the shared host, routes a native tool through desktop poll/reply, and closes the engine', async () => {
+  it.each(['claude-code', 'codex'] as const)('routes %s sessions through desktop tunnel with permission preservation and cleanup', async kind => {
     let finishStream!: () => void;
     const streamEnded = new Promise<void>(resolve => { finishStream = resolve; });
     let toolResult!: Promise<string>;
@@ -137,7 +264,7 @@ describe('Node provider host', () => {
       permissions.push(options.permissionMode);
       const hosted = options.deviceHosted!;
       return {
-        id: 'native-session', agentKind: 'claude-code', model: options.model,
+        id: 'native-session', agentKind: kind, model: options.model,
         async send() {
           toolResult = fetch(`${hosted.tunnelUrl}/exec/read-file`, { method: 'POST',
             headers: { authorization: `Bearer ${hosted.tunnelToken}`, 'content-type': 'application/json' },
@@ -147,7 +274,7 @@ describe('Node provider host', () => {
         events: () => ({ async *[Symbol.asyncIterator]() { await streamEnded; } }),
         setInteractionResolver() {}, getUsageSnapshot: () => ({ tokenUsage: 0, contextTokens: 0, contextWindow: 0, costUsd: 0 }),
       };
-    });
+    }, kind);
     vi.useRealTimers();
     try {
       // Controller workspace is outside the provider's accounts/remote-agent shadow tree.
@@ -165,7 +292,7 @@ describe('Node provider host', () => {
         }
         return rows;
       };
-      await socket.remote({ op: 'open', runId, agentKind: 'claude-code', payload: { json: {
+      await socket.remote({ op: 'open', runId, agentKind: kind, payload: { json: {
         sessionId: 'desktop-task', options: { model: 'claude-test-1', providerId: 'anthropic' },
         workspace: { workingDir: '/desktop/project', platform: 'linux', shell: 'bash' }, projectFiles: [], ancestorFiles: [], personal: { files: [] }, mcpServers: [],
       } } });
@@ -187,7 +314,7 @@ describe('Node provider host', () => {
       await socket.remote({ op: 'close', runId, mode: 'close', reason: 'navigation' });
       expect(close).toHaveBeenCalledOnce();
       runId = randomUUID(); cursor = 0;
-      await socket.remote({ op: 'open', runId, agentKind: 'claude-code', payload: { json: {
+      await socket.remote({ op: 'open', runId, agentKind: kind, payload: { json: {
         sessionId: 'desktop-ask-task', options: { model: 'claude-test-1', providerId: 'anthropic', permissionMode: 'ask' },
         workspace: { workingDir: '/desktop/project', platform: 'linux', shell: 'bash' }, projectFiles: [], ancestorFiles: [], personal: { files: [] }, mcpServers: [],
       } } });
@@ -195,6 +322,7 @@ describe('Node provider host', () => {
       expect(permissions).toEqual(['bypassPermissions', 'ask']);
     } finally {
       await h.host.stop();
+      expect(h.provider.dispose).toHaveBeenCalledOnce();
       const relative = path.relative(os.tmpdir(), h.dataDir);
       if (relative.startsWith('..') || path.isAbsolute(relative)) throw new Error('Invalid test cleanup path');
       await rm(h.dataDir, { recursive: true, force: true });

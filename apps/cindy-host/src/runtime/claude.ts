@@ -91,7 +91,8 @@ export async function createClaudeProvider(dataDir: string, logger: Logger, env:
   })));
   const modelIds = new Set(models.map(model => model.id));
   return {
-    id, agent, modelIds,
+    kind: 'claude-code' as const, id, agent, modelIds,
+    dispose: async () => {},
     async isAuthenticated() { return (await auth.getState()).authenticated; },
     view(enabled: boolean) {
       return { id, name: settings.auth === 'native' ? catalog.name : 'Anthropic API', source: catalog.source,

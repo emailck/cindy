@@ -5,8 +5,9 @@ import { createHostAuthService, getOrCreateDeviceIdentity, HostAuthError, runAut
 import { runCli, type HostCommandContext, type Diagnostic } from './cli';
 import { HostCliError } from './config';
 import { createCliHost } from './runtime';
-import { createClaudeProvider, quietRuntimeLogger } from './runtime/claude';
-import { createProtectedCredentialStore, CredentialStoreUnavailableError } from './storage';
+import { quietRuntimeLogger } from './runtime/claude';
+import { createProvider } from './runtime/provider';
+import { createHostCredentialStore, CredentialStoreUnavailableError } from './storage';
 import { createHostAuthFetch } from './auth-fetch';
 
 /** Terminal answers are hidden, including verification codes. No answer enters argv or logs. */
@@ -31,7 +32,7 @@ async function prompt(question: string, signal?: AbortSignal): Promise<string> {
 
 async function authService(context: HostCommandContext) {
   context.signal?.throwIfAborted();
-  const store = createProtectedCredentialStore(context.dataDir);
+  const store = createHostCredentialStore(context.dataDir);
   try {
     await store.assertAvailable();
     context.signal?.throwIfAborted();
@@ -90,13 +91,13 @@ void runCli(process.argv.slice(2), {
       await auth.drain();
       if (error instanceof HostCliError) throw error;
       if (error instanceof HostAuthError) return authFailure(error);
-      throw new HostCliError('RUNTIME_START_FAILED', 'Provider startup failed. Run doctor; configure the Claude executable and authenticate it before starting serve.');
+      throw new HostCliError('RUNTIME_START_FAILED', 'Provider startup failed. Run doctor; configure the selected Agent executable and authenticate it before starting serve.');
     }
   },
   async status(context) {
     // A status read must never rotate a refresh token or initialize a device identity
     // while another process owns this profile. Stored authentication is not a live login check.
-    const store = createProtectedCredentialStore(context.dataDir);
+    const store = createHostCredentialStore(context.dataDir);
     try {
       const savedAuthentication = await store.get(`auth-session.v1.${context.region}`) !== null;
       return { state: 'not-probed', savedAuthentication, message: 'Stored authentication presence only; relay connectivity and login validity are verified by serve.' };
@@ -105,19 +106,20 @@ void runCli(process.argv.slice(2), {
   async doctor(context) {
     const checks: Diagnostic[] = [];
     try {
-      const store = createProtectedCredentialStore(context.dataDir);
+      const store = createHostCredentialStore(context.dataDir);
       await store.assertAvailable();
-      checks.push({ name: 'credentials', ok: true, message: 'OS protected credential store is available.' });
+      checks.push({ name: 'credentials', ok: true, message: 'Selected credential store is available.' });
       const savedAuthentication = await store.get(`auth-session.v1.${context.region}`) !== null;
       checks.push({ name: 'cindy-login', ok: savedAuthentication, message: savedAuthentication ? 'Stored Cindy login exists; validity is checked at startup.' : 'Sign in using cindy-host login before starting serve.' });
     } catch (error) {
-      checks.push({ name: 'credentials', ok: false, message: error instanceof CredentialStoreUnavailableError ? error.message : 'OS protected credential store is unavailable.' });
+      checks.push({ name: 'credentials', ok: false, message: error instanceof CredentialStoreUnavailableError ? error.message : 'Selected credential store is unavailable.' });
     }
     try {
-      await createClaudeProvider(context.dataDir, quietRuntimeLogger());
-      checks.push({ name: 'claude', ok: true, message: 'Claude executable and authentication checked. Model execution and relay connectivity require serve.' });
+      const provider = await createProvider(context.dataDir, quietRuntimeLogger());
+      await provider.dispose();
+      checks.push({ name: 'agent', ok: true, message: 'Selected Agent executable and authentication checked. Model execution and relay connectivity require serve.' });
     } catch {
-      checks.push({ name: 'claude', ok: false, message: 'Set CINDY_HOST_CLAUDE_BINARY to an absolute native executable and CINDY_HOST_CLAUDE_AUTH to native or api-key. Sign in using the native Claude CLI, or provide ANTHROPIC_API_KEY for api-key mode.' });
+      checks.push({ name: 'agent', ok: false, message: 'For Codex set CINDY_HOST_AGENT=codex and CINDY_HOST_CODEX_BINARY, then sign in with that binary. For Claude set CINDY_HOST_CLAUDE_BINARY and CINDY_HOST_CLAUDE_AUTH=native or api-key.' });
     }
     return checks;
   },

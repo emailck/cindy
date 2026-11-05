@@ -107,3 +107,61 @@ model-providers 类型检查通过；最终 diff --check 通过。构建仅有�
 新增[Ubuntu VPS 部署指南](../apps/cindy-host/DEPLOY.linux.zh-CN.md)，README 已链接并将第三方登录示例改为实际支持的 Google。指南覆盖版本校验、安装构建、固定 Claude runtime、专用用户 D-Bus/Secret Service、两套认证、tmux 运行与更新备份。没有新增无人值守部署脚本或明文凭证回退。
 
 15 个 Bash 命令块经 bash -n 语法检查通过，文档检查 10 项通过；没有执行 Linux 安装命令，目标 VPS 与重启恢复仍待实测。指南明确 tmux 持续会话不是开机自动解锁/自启保证。本次说明和真实 Google 登录记录整理后，用户已明确授权提交并推送至 feature/cli-provider-host；远端结果以 Git 核验为准。
+
+## Codex CLI 提供端接入
+
+新增显式 `CINDY_HOST_AGENT=codex` 与 `CINDY_HOST_CODEX_BINARY`，默认仍为 Claude Code。
+复用 maker-core CodexAgent 的原生 ChatGPT 登录、model/list 和 deviceHosted 执行环境，
+以及共享 RemoteAgentHost 的开关、同账号准入、停止与远程工具隧道。无新增 wire 字段、
+channel、自建中转适配或重试策略；两台真实机器互通仍待账号环境验收。
+配置/恢复见 apps/cindy-host/README.md。测试覆盖两引擎的发现、权限保留、工具隧道与释放，
+模型目录只发布原生可见型号。后续修正：原生 API Key 登录也可用，沿用 Codex config.toml 与进程环境中的中转配置；
+不再强制 OAuth 凭证模式，API 目录使用独立 cli-codex 身份。跨账号分享仍不支持。
+
+### 桌面发现兼容修正
+
+桌面在 link-open 前读取 maker:provider:list，CLI 原先要求所有 invoke 已建链，导致设备
+在线但供应商不可见。现在只有远程执行通道要求已建立控制连接；四个只读发现通道仍检查
+同账号、远程开关、登录有效性和账号代次。无新增 wire 字段、重试或 relay 逻辑。回归
+覆盖 Claude/Codex 的建链前发现及执行拒绝，真实桌面显示待重新启动 CLI 后确认。
+
+### 模型选择器多引擎能力读取
+
+桌面会同时探测 Claude/Codex/Pi，未启用引擎返回 null 会使整个选择器进入 error。
+CLI 现对未启用引擎返回空模型、空推理/权限档位及 hasFastMode=false；启用引擎的
+availableModels 从已发现目录投影。未启用引擎仍不列入 available-agents，执行仍拒绝。
+复用既有 get-capabilities 响应结构，无新增协议或 relay 改动。回归覆盖三种能力查询。
+
+### Codex 原生中转并发会话
+
+cli-codex 是发现/授权身份，不是 maker-core 的 host 注入凭证路由。将它作为
+providerId 传入会触发 provider-oauth，无 proxy 的 app-server 不能以此模式复用；
+第二个会话因此报 Cannot switch Codex credential mode。CLI 现在在 start、fork、
+setModel 接入边界移除展示 ID，继续使用原生 Codex 配置。外层供应商/模型/账号准入不变，
+共享引擎的凭证隔离检查不改。原生 Codex 0.166.0 隔离假 API 配置实测：旧接线复现
+1 active session 错误；修正后两个会话可同时打开并执行模型设置（不发送推理请求）。
+回归位于现有 runtime.integration.test.ts，通过 CINDY_CODEX_TEST_BINARY 启用；
+单文件 9.21s，其中原生回归 1.00s，其余为共享模块加载，维持 integration tier。
+
+### 可靠传输长轮询阻塞与桌面分发复用
+
+CLI onFrame 返回 invoke Promise，导致 10 秒 poll 占据可靠帧顺序交付/ACK，
+后面的目录、上传和发送一起排队。旧接线在真实 DeviceLinkClient 的可靠帧回归中失败；
+改为与 Desktop 共用 device-link 的 wireAsyncInboundDispatch 后，同一 peer 后续目录
+请求在 poll 完成前返回，另一 peer 不受影响。业务错误由宿主错误处理器接收，执行状态
+机继续负责幂等与最终回复；无新增帧、重试、授权或自建中转适配。临时正文事件计时已移除。
+
+复用边界：Desktop 和 CLI 共用 DeviceLinkClient（传输、ACK/重传）、异步入站分发、
+RemoteAgentHost（运行记录、调用幂等、隧道、poll/close）、hostedStartOptions 和原生
+CodexAgent。CLI 仍负责本机账号、单供应商配置及明确的接口子集；它不是 Desktop 的
+数据库/完整远控宿主。日志中的 sessions:list 等 CHANNEL_NOT_ALLOWED 不能用虚假空
+数据消除，也不应以放开接口来修复传输阻塞。
+
+### 本轮交付验证
+
+CLI 构建、类型检查、67 项测试（含原生 Codex 双会话）通过；Device Link 类型检查、
+Desktop 入站分发 125 项定向测试、文档与测试规范检查通过。未执行整仓 CI 或完整
+Desktop 类型检查。用户完成 Windows Desktop 到 Linux Codex API 的真实调用，确认
+供应商与模型可见、后续回复速度改善。对照日志中两次新任务的启动总时长约 99.7 秒
+与 32.7 秒，不是同负载基准；后一次仍有约 21.1 秒上传与 9.6 秒会话就绪等待。
+串行分块上传优化尚未实现，不宣称启动延迟已全部解决。
