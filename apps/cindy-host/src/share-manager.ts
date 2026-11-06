@@ -71,6 +71,7 @@ export function createShareManager(options: {
     return inflight;
   }
   async function execute(command: ShareCommand) {
+    if (command.action === 'usage' || command.action === 'quota') throw new Error('Share quota and usage settings are handled by the host.');
     await refresh(true);
     if (!options.current()) throw new Error('Sharing unavailable');
     if (['link', 'approve', 'resume'].includes(command.action) && !options.enabled()) throw new Error('Sharing is disabled');

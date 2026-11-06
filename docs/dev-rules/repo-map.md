@@ -57,7 +57,12 @@
 
 ### CLI 远程 Agent 提供端
 
-`apps/cindy-host` 是不启动 Electron 的 Node 提供端，复用官方认证与 Device Link；当前实现范围为同账号 Claude Code，项目工具通过反向隧道回到桌面执行。构建、登录和运行见 [CLI 使用说明](../../apps/cindy-host/README.md)，验收状态见 [CLI 开发进度](../cindy-cli-progress.md)。它不同于 SSH 工作区，也不同于用于评测的 `apps/cindy-headless`。
+`apps/cindy-host` 是不启动 Electron 的 Node 提供端，复用官方认证与 Device Link；已接入 Claude Code、Codex 及其供应商分享，实际认证与容器验收范围以 CLI 进度为准；项目工具通过反向隧道回到桌面执行。构建、登录和运行见 [CLI 使用说明](../../apps/cindy-host/README.md)，验收状态见 [CLI 开发进度](../cindy-cli-progress.md)。它不同于 SSH 工作区，也不同于用于评测的 `apps/cindy-headless`。
+
+[`tools/cindy-host-manager`](../../tools/cindy-host-manager/README.md) 是单台 Linux Docker
+宿主机的独立管理工具：网页管理 `cindy-host` CLI 容器、原生登录与分享，非 Desktop
+容器或官方 Server。它使用独立 npm package 与锁文件，部署数据在仓库外；实施计划与
+验收继续见上述 CLI 计划/进度。
 
 `packages/remote-agent-host` 保存 Desktop 与 CLI 共用的远程宿主、事件流和反向隧道；认证、供应商策略与存储由宿主注入。Desktop 原 remote-agent 路径保留兼容导出，既有行为测试仍从 Desktop 入口验证。
 

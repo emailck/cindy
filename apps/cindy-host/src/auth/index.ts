@@ -4,3 +4,6 @@ export { getOrCreateDeviceIdentity, HostAuthError } from './store.js';
 export type { ProtectedCredentialStore } from './store.js';
 export { runAuthCommand } from './command.js';
 export type { AuthCommandContext } from './command.js';
+
+export { readStoredAuthStatus } from './account-projection.js';
+export type { CindyAccountIdentity } from './account-projection.js';

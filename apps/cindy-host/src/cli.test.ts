@@ -107,6 +107,49 @@ describe('host commands and configuration', () => {
     });
     expect(await readdir(profile)).toEqual([]);
   });
+  // MGR-012: ordinary status stays read-only while explicit account refresh uses
+  // the existing profile lock. Existing auth/config tests did not exercise this option.
+  it('keeps ordinary status available beside serve but refuses a second account refresh', async () => {
+    const profile = path.join(root, 'account-status');
+    let refreshes = 0;
+    const result = capture({
+      status: async () => ({ state: 'not-probed', savedAuthentication: true, account: null }),
+      refreshAccount: async () => { refreshes++; },
+    });
+    await withProfileLock(profile, async () => {
+      expect(await runCli(['--data-dir', profile, 'status'], result.deps)).toBe(0);
+      expect(JSON.parse(result.output.at(-1)!).runtime.account).toBeNull();
+      expect(await runCli(['--data-dir', profile, 'status', '--refresh-account'], result.deps)).toBe(1);
+      expect(result.errors.at(-1)).toContain('PROFILE_BUSY');
+      expect(refreshes).toBe(0);
+    });
+    expect(await runCli(['--data-dir', profile, 'status', '--refresh-account'], result.deps)).toBe(0);
+    expect(refreshes).toBe(1);
+    expect(JSON.parse(result.output.at(-1)!).runtime.state).toBe('not-probed');
+    const missing = capture();
+    expect(await runCli(['--data-dir', profile, 'status', '--refresh-account'], missing.deps)).toBe(1);
+    expect(missing.errors.at(-1)).toContain('AUTH_UNAVAILABLE');
+  });
+  it('holds the account refresh lock until its adapter drains, then emits the normal status envelope', async () => {
+    const profile = path.join(root, 'account-drain');
+    let finish!: () => void;
+    let started!: () => void;
+    const ready = new Promise<void>(resolve => { started = resolve; });
+    const drained = new Promise<void>(resolve => { finish = resolve; });
+    const account = { displayName: 'Fixture', loginMethod: 'cindy' };
+    const result = capture({
+      refreshAccount: async context => { expect(context.signal?.aborted).toBe(false); started(); await drained; },
+      status: async () => ({ state: 'not-probed', savedAuthentication: true, account }),
+    });
+    const command = runCli(['--data-dir', profile, 'status', '--refresh-account'], result.deps);
+    await ready;
+    await expect(withProfileLock(profile, async () => {})).rejects.toMatchObject({ code: 'PROFILE_BUSY' });
+    expect(result.output).toEqual([]);
+    finish();
+    expect(await command).toBe(0);
+    expect(JSON.parse(result.output[0]!).runtime).toEqual({ state: 'not-probed', savedAuthentication: true, account });
+    expect(await readdir(profile)).toEqual([]);
+  });
   it('validates auth and ordinary arguments without outputting submitted values', async () => {
     const profile = path.join(root, 'args');
     const result = capture();

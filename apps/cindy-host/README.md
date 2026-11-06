@@ -7,6 +7,11 @@ The implementation plan and current acceptance evidence live in
 
 For Ubuntu VPS deployment, see [Linux 部署指南（中文）](DEPLOY.linux.zh-CN.md).
 
+For browser-based management of multiple Docker **CLI** instances on one Linux host,
+see [Cindy CLI Host Manager](../../tools/cindy-host-manager/README.md). It creates
+isolated Codex or Claude Code instances and exposes native login and existing
+sharing operations; it does not run Desktop or Electron in containers.
+
 ## Build and inspect
 
 From the repository root after installing workspace dependencies:
@@ -212,6 +217,21 @@ the selected store. Log out of each store separately when revoking both logins.
 File mode requires neither D-Bus nor a keyring password. Status reports saved
 credential presence, not a verified live connection.
 
+`status.runtime.account` contains only saved public display details (name, email,
+Cindy login method and organization), or `null` when unavailable. It never exposes
+membership IDs, credentials or avatar URLs. The protected display snapshot is
+bound to the current saved session; logout, another session or a missing snapshot
+cannot reuse an old account name. Snapshot writes are optional and cannot fail a
+successful login or refresh-token rotation.
+
+Ordinary `status` is read-only and never refreshes credentials. For an older profile
+without display details, explicitly run `cindy-host status --refresh-account`.
+This restores the official session and returns the same status JSON with the saved
+account projection. It takes the same profile lock as `serve` and waits for auth
+writes to drain; stop the host first if it returns `PROFILE_BUSY`. No automatic
+second refresh process runs beside an active host. A stored name is the last
+confirmed identity, not a promise that authorization or relay connectivity is live.
+
 ## Configuration and authorization
 
 `config.json` stores only explicit nonsecret overrides. `config reset <key>` removes
@@ -249,7 +269,7 @@ tokens, passwords and provider secrets must never be placed in `config.json`, CL
 arguments, logs, or the source repository; the authentication adapter uses a
 protected credential store. No desktop encrypted credential file is imported.
 
-`serve`, authentication commands and configuration edits take the same profile
+`serve`, authentication commands, `status --refresh-account` and configuration edits take the same profile
 lock to prevent overlapping token rotation and profile changes. A second process
 fails with `PROFILE_BUSY`. If a crash leaves `profile.lock`, verify that the old
 process has exited before removing that lock. A lock is not proof of a live relay;

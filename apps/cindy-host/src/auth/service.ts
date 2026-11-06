@@ -12,6 +12,7 @@ import {
 } from '@cindy/auth-client';
 
 import { HostAuthError, protectedStoreCall, type ProtectedCredentialStore } from './store.js';
+import { accountSnapshotKey, authSessionKey, serializeAccountSnapshot } from './account-projection.js';
 
 export type HostLoginResult =
   | { status: 'ok'; membership: AuthMembership }
@@ -32,7 +33,8 @@ export interface HostAuthOptions {
 /** Auth tickets and tokens remain private to the trusted Node host. Never print this object. */
 export function createHostAuthService(options: HostAuthOptions) {
   const { store, client, region } = options;
-  const sessionKey = `auth-session.v1.${region}`;
+  const sessionKey = authSessionKey(region);
+  const snapshotKey = accountSnapshotKey(region);
   let session: AuthTokenPair | null = null;
   let pending: Exclude<LoginOutcome, { status: 'ok' }> | null = null;
   let browser: { verifier: string; pollSecret: string } | null = null;
@@ -65,13 +67,22 @@ export function createHostAuthService(options: HostAuthOptions) {
   async function commit(pair: AuthTokenPair): Promise<void> {
     // Save rotation before exposing the new access token. Failure leaves the host unauthenticated.
     session = null;
-    await protectedStoreCall(() => store.set(sessionKey, serializeAuthSessionRecord(region, pair.refreshToken)));
+    const serializedSession = serializeAuthSessionRecord(region, pair.refreshToken);
+    await protectedStoreCall(() => store.set(sessionKey, serializedSession));
     session = pair;
     pendingRotation = null;
     clearRefreshWait();
     if (owner?.id !== pair.membership.id) owner = { id: pair.membership.id, incarnation: ++incarnation };
     pending = null;
     browser = null;
+    // Display cache failure must never discard a successfully committed rotation. A stale
+    // cache is suppressed by its binding to the current serialized refresh record.
+    try { await store.set(snapshotKey, serializeAccountSnapshot(region, serializedSession, pair.membership)); }
+    catch { /* Optional metadata only; do not fail login or retry a consumed refresh token. */ }
+  }
+
+  async function discardSnapshot() {
+    try { await store.delete(snapshotKey); } catch { /* Missing session always suppresses this cache. */ }
   }
 
   async function accept(outcome: LoginOutcome): Promise<HostLoginResult> {
@@ -117,9 +128,10 @@ export function createHostAuthService(options: HostAuthOptions) {
         owner = null;
         clearRefreshWait();
         await protectedStoreCall(() => store.delete(sessionKey));
+        await discardSnapshot();
         throw error;
       }
-      if (error instanceof AuthApiError && error.code === 'DEVICE_MISMATCH') { owner = null; clearRefreshWait(); throw error; }
+      if (error instanceof AuthApiError && error.code === 'DEVICE_MISMATCH') { owner = null; clearRefreshWait(); await discardSnapshot(); throw error; }
       if (error instanceof HostAuthError && error.code === 'AUTH_SESSION_INVALID') { clearRefreshWait(); throw error; }
       const floor = Math.min(60_000 * 2 ** refreshFailures, 300_000);
       refreshFailures = Math.min(refreshFailures + 1, 3);
@@ -244,6 +256,7 @@ export function createHostAuthService(options: HostAuthOptions) {
       browser = null;
       // Clear local credentials even when the network is down. A failed clear is never reported as success.
       await protectedStoreCall(() => store.delete(sessionKey));
+      await discardSnapshot();
       if (!accessToken) return { remoteRevoked: false };
       try { await client.logout(accessToken); return { remoteRevoked: true }; }
       catch { return { remoteRevoked: false }; }

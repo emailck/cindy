@@ -13,12 +13,14 @@ COPY apps/cindy-host ./apps/cindy-host
 ENV XDT_SKIP_AGENT_BIN_INSTALL=1 ELECTRON_SKIP_BINARY_DOWNLOAD=1
 RUN pnpm install --filter @cindy/host... --frozen-lockfile --prod=false \
     && pnpm --filter @cindy/host build \
-    && pnpm install:codex
+    && pnpm install:codex \
+    && pnpm install:claude
 RUN cd apps/cindy-host && node -e 'const fs=require("node:fs"); fs.mkdirSync("/runtime",{recursive:true}); const dependencies={}; for(const name of ["@napi-rs/keyring","better-sqlite3","sharp"]) dependencies[name]=name==="sharp"?require(name).versions.sharp:require(name+"/package.json").version; fs.writeFileSync("/runtime/package.json",JSON.stringify({private:true,dependencies}));' \
     && npm install --prefix /runtime --omit=dev
-RUN mkdir -p /runtime/dist /runtime/codex \
+RUN mkdir -p /runtime/dist /runtime/codex /runtime/claude \
     && cp apps/cindy-host/dist/cli.cjs /runtime/dist/cli.cjs \
-    && cp -a apps/codex-package-bin/linux-$(node -p process.arch)/. /runtime/codex/
+    && cp -a apps/codex-package-bin/linux-$(node -p process.arch)/. /runtime/codex/ \
+    && cp apps/claude-code-bin/linux-$(node -p process.arch)/claude /runtime/claude/claude
 
 FROM node:22.22.0-bookworm-slim
 RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates git libsecret-1-0 \

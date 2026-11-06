@@ -1,7 +1,7 @@
 import { Writable } from 'node:stream';
 import { createInterface } from 'node:readline/promises';
 import { CindyAuthClient } from '@cindy/auth-client';
-import { createHostAuthService, getOrCreateDeviceIdentity, HostAuthError, runAuthCommand } from './auth';
+import { createHostAuthService, getOrCreateDeviceIdentity, HostAuthError, runAuthCommand, readStoredAuthStatus } from './auth';
 import { runCli, type HostCommandContext, type Diagnostic } from './cli';
 import { HostCliError } from './config';
 import { createCliHost } from './runtime';
@@ -99,9 +99,17 @@ void runCli(process.argv.slice(2), {
     // while another process owns this profile. Stored authentication is not a live login check.
     const store = createHostCredentialStore(context.dataDir);
     try {
-      const savedAuthentication = await store.get(`auth-session.v1.${context.region}`) !== null;
-      return { state: 'not-probed', savedAuthentication, message: 'Stored authentication presence only; relay connectivity and login validity are verified by serve.' };
-    } catch { return { state: 'not-probed', credentials: 'unavailable', message: 'Run doctor to check protected storage.' }; }
+      const saved = await readStoredAuthStatus(store, context.region);
+      return { state: 'not-probed', ...saved, message: 'Stored authentication presence only; relay connectivity and login validity are verified by serve.' };
+    } catch { return { state: 'not-probed', credentials: 'unavailable', account: null, message: 'Run doctor to check protected storage.' }; }
+  },
+  async refreshAccount(context) {
+    let auth: Awaited<ReturnType<typeof authService>> | undefined;
+    try {
+      auth = await authService(context);
+      await auth.restore();
+    } catch (error) { authFailure(error); }
+    finally { await auth?.drain(); }
   },
   async doctor(context) {
     const checks: Diagnostic[] = [];

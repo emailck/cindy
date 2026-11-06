@@ -31,6 +31,17 @@ function fixture() {
 }
 
 describe('CLI provider share management', () => {
+  // Direct execute previously allowed quota/usage to reach the member-action path.
+  // The public runtime routes these to quota.manage; no member endpoint may be called.
+  // Unit: existing fake REST fixture, minimal input is either action plus a valid member.
+  it.each(['usage', 'quota'] as const)('rejects direct %s dispatch without a member request', async action => {
+    const h = fixture();
+    await h.manager.execute({ action: 'approve', id: h.requestId, code: '1234' });
+    h.request.mockClear();
+    await expect(h.manager.execute({ action, id: h.memberId })).rejects.toThrow('handled by the host');
+    expect(h.request).not.toHaveBeenCalled();
+    expect(h.manager.access(h.peer)).not.toBeNull();
+  });
   it('requires approval and matching pairing code before admitting the exact share/member', async () => {
     const h = fixture();
     await h.manager.refresh();

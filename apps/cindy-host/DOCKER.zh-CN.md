@@ -100,3 +100,46 @@ docker exec cindy-host cindy-host share remove MEMBER_ID
 自动化验证使用假账号 API、假 Key 和本地模拟上游，包括审批/暂停/删除、跨账号协议帧、
 本地管理 socket、原生 Codex 访客运行、主人的说明/凭证隔离及代理的模型/令牌检查。
 实际官方服务的两账号审批与 Docker 镜像构建/运行，必须在可用环境执行后才能记为通过。
+
+## 单机网页管理
+
+`tools/cindy-host-manager` 为独立的本地管理工具；构建上面的同一个镜像后，在管理工具
+配置中固定 `CINDY_MANAGER_IMAGE=cindy-host:local`。启动与管理员认证见该工具 README。
+镜像运行的是无 Electron 的 Cindy CLI，不包含桌面界面、VNC 或浏览器管理端口。
+镜像同时包含仓库 pin 的 Codex 和 Claude Code，默认入口仍为 `cindy-host serve` 和 Codex；
+手动 Compose 用户的现有卷与路径不变。下载使用仓库已有校验器，不刷新版本 pin。
+
+管理工具创建实例时固定一个引擎，并分配两份独立命名卷：Cindy profile，以及原生 CLI 的
+HOME（包括 `.codex`、`.claude` 与 `.claude.json`）。两类登录分别由 Cindy 和对应原生 CLI
+完成；后台只转接临时容器 TTY，不读取 Claude 凭证。业务容器不挂载 Docker socket，
+不提供通用 shell，也不保存登录终端日志。停止和重新创建服务容器均保留两份卷。
+管理端能控制本机 Docker，必须仅向受信管理员开放，远程使用时由 HTTPS 反向代理保护。
+
+先停止实例，再打开任一种登录终端；完成登录后启动实例。启动会先执行固定的
+`config set remoteAccessEnabled true` 命令，再启动独立服务容器。服务运行状态只说明
+容器在运行；检查显示保存的 Cindy 登录与原生 CLI 认证结果，不代表 relay 已就绪。
+分享管理只调用运行服务内的 `cindy-host share`，不会另起认证实例。
+
+管理工具在创建及每次检查、登录、启动前，以实例 UID 1000 初始化缺失的原生目录：
+Codex 的 `HOME/.codex` 或 Claude Code 的 `HOME/.claude`。新目录权限为 0700；
+既有配置、凭证和目录权限保持原样。旧实例缺少目录时使用上述管理操作即可补齐，
+无需删除卷或重新登录 Cindy。目录是链接、所有权不符或不可写时明确失败，不递归改权限。
+Codex 状态仅将原生命令明确返回 `Not logged in` 视为未登录；其它非零结果显示未知，
+不能用“未登录”掩盖原生配置加载错误。
+
+可选代理首版支持 `http://` CONNECT 代理（包括 HTTPS 目标站点），同时下发
+HTTP_PROXY/HTTPS_PROXY 及小写变量；localhost、127.0.0.1、::1 保持直连。`https://`
+代理服务和 SOCKS 暂不支持，配置会被拒绝。代理仅对实例显式选择 default 的后续启动和
+登录生效；原生 CLI、服务原生进程和 Codex 分享转发使用同样配置。Cindy 自身登录与
+Device Link 继续使用既有网络路径；这不是强制出口隔离。代理地址必须在容器网络中可达，
+容器内 localhost 指向容器本身。真实代理出口与真实账号登录须在部署环境验收。
+
+停止仅发送 SIGTERM 并等待退出，不隐式 SIGKILL；超时明确失败并保留资源，不会并发启动
+登录或覆盖 profile。取消登录也等待该临时容器实际退出。进程崩溃留下 `profile.lock` 时，
+工具不会自动删除锁：管理员先确认该实例所有容器停止、没有其它进程或手工挂载使用这些卷，
+再在受控运维终端恢复。不要通过删卷解决锁或认证问题。
+
+2026-11-06 镜像验证发现现有 pin `sharp 0.35.3` 的 npm audit 高危报告：
+`GHSA-rgj7-g3m4-5g8c`（libheif，影响 `<0.35.4`）与 `GHSA-wq5f-xc86-pv6w`
+（librsvg，影响 `<0.35.5`）。这是既有直接依赖，管理工具未升级或放宽版本；需单独做
+依赖升级与媒体回归，不能把当前镜像记为依赖审计全通过。

@@ -2,6 +2,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import { CindyAuthClient, serializeAuthSessionRecord, type AuthFetch, type AuthMembership } from '@cindy/auth-client';
 
 import { createHostAuthService } from './service.js';
+import { accountSnapshotKey, readStoredAuthStatus } from './account-projection.js';
 import { getOrCreateDeviceIdentity, type ProtectedCredentialStore } from './store.js';
 import { runAuthCommand } from './command.js';
 
@@ -56,7 +57,7 @@ function fixture(handler: (path: string, body: Record<string, unknown>) => unkno
 }
 
 describe('CLI protected authentication lifecycle', () => {
-  it('keeps selection tickets private and persists only the official refresh record after selection', async () => {
+  it('keeps selection tickets private and persists refresh credentials separately from safe account details', async () => {
     const f = fixture((path, body) => {
       if (path.endsWith('verify-code')) return { status: 'select_account', loginTicket: 'invalid-fixture-ticket', accounts: [membership] };
       expect(body).toMatchObject({ loginTicket: 'invalid-fixture-ticket', accountId: membership.id });
@@ -70,7 +71,78 @@ describe('CLI protected authentication lifecycle', () => {
     expect(JSON.parse(f.entries.get(key)!)).toEqual({ version: 1, realm: 'global', refreshToken: pair.refreshToken });
     expect(f.service.getAccessToken()).toBe(pair.accessToken);
     expect(JSON.stringify(f.service.status())).not.toContain('invalid-fixture-access');
-    expect(f.entries.size).toBe(1);
+    expect(f.entries.size).toBe(2);
+    expect(await readStoredAuthStatus(f.store, 'global')).toEqual({ savedAuthentication: true, account: { displayName: 'Fixture', loginMethod: 'cindy' } });
+  });
+
+  // MGR-012: read-only status had no account metadata coverage. Minimal failures:
+  // legacy session, rotation/account switch, malformed display data or a failed cache write.
+  // These unit inputs exercise the real auth client/service and protected-store projection.
+  it('projects only display fields and suppresses mismatched, missing or peer-realm account snapshots', async () => {
+    const details = { ...membership, displayName: ' Fixture Name ', email: 'fixture@example.invalid', orgName: 'Fixture Org' };
+    const f = fixture(() => ({ status: 'ok', ...pair, membership: details }));
+    await f.service.verifyCode('email', 'fixture@example.invalid', '000000');
+    const safe = { displayName: 'Fixture Name', email: 'fixture@example.invalid', loginMethod: 'cindy', organization: 'Fixture Org' };
+    expect(await readStoredAuthStatus(f.store, 'global')).toEqual({ savedAuthentication: true, account: safe });
+    const snapshotKey = accountSnapshotKey('global');
+    const snapshot = JSON.parse(f.entries.get(snapshotKey)!);
+    // Re-reading does not trust arbitrary extra fields even in protected display metadata.
+    snapshot.account.refreshToken = 'invalid-fixture-unexpected-secret';
+    snapshot.account.id = membership.id;
+    snapshot.account.avatarUrl = 'https://avatar.invalid/fixture';
+    f.entries.set(snapshotKey, JSON.stringify(snapshot));
+    const output = JSON.stringify(await readStoredAuthStatus(f.store, 'global'));
+    for (const secret of [membership.id, pair.accessToken, pair.refreshToken, 'invalid-fixture-unexpected-secret', 'avatar.invalid']) expect(output).not.toContain(secret);
+    f.entries.set(key, serializeAuthSessionRecord('global', 'invalid-fixture-other-session'));
+    expect((await readStoredAuthStatus(f.store, 'global')).account).toBeNull();
+    f.entries.set(key, serializeAuthSessionRecord('cn', pair.refreshToken));
+    expect((await readStoredAuthStatus(f.store, 'global')).account).toBeNull();
+    f.entries.delete(key);
+    expect(await readStoredAuthStatus(f.store, 'global')).toEqual({ savedAuthentication: false, account: null });
+    expect(f.calls).toHaveLength(1); // status reads never refresh or probe an account.
+  });
+
+  it('restores legacy saved authentication and replaces account identity on a new login', async () => {
+    let current = pair;
+    const f = fixture(() => ({ status: 'ok', ...current }));
+    f.entries.set(key, serializeAuthSessionRecord('global', 'invalid-fixture-legacy-session'));
+    expect(await readStoredAuthStatus(f.store, 'global')).toEqual({ savedAuthentication: true, account: null });
+    expect(await f.service.restore()).toBe(true);
+    expect((await readStoredAuthStatus(f.store, 'global')).account?.displayName).toBe('Fixture');
+    current = { ...pair, refreshToken: 'invalid-fixture-second-session', membership: { ...membership, id: 'invalid-fixture-second-member', displayName: 'Other Fixture' } };
+    await f.service.verifyCode('email', 'other@example.invalid', '000000');
+    expect((await readStoredAuthStatus(f.store, 'global')).account?.displayName).toBe('Other Fixture');
+    const remove = f.store.delete;
+    f.store.delete = async entry => { if (entry === accountSnapshotKey('global')) throw new Error('invalid-fixture-delete-failure'); await remove(entry); };
+    await f.service.logout();
+    expect(f.entries.has(accountSnapshotKey('global'))).toBe(true);
+    expect(await readStoredAuthStatus(f.store, 'global')).toEqual({ savedAuthentication: false, account: null });
+  });
+
+  it('keeps successful login and authoritative rotation when the optional display cache cannot be saved', async () => {
+    let refreshToken = pair.refreshToken;
+    const f = fixture(() => ({ status: 'ok', ...pair, refreshToken }));
+    const save = f.store.set;
+    f.store.set = async (entry, value) => { if (entry === accountSnapshotKey('global')) throw new Error('invalid-fixture-cache-failure'); await save(entry, value); };
+    expect(await f.service.verifyCode('email', 'fixture@example.invalid', '000000')).toEqual({ status: 'ok', membership });
+    expect(f.service.getAccessToken()).toBe(pair.accessToken);
+    expect((await readStoredAuthStatus(f.store, 'global')).account).toBeNull();
+    refreshToken = 'invalid-fixture-committed-rotation';
+    expect(await f.service.refresh()).toBe(true);
+    await f.service.drain();
+    expect(JSON.parse(f.entries.get(key)!).refreshToken).toBe(refreshToken);
+    expect(f.service.getAccessToken()).toBe(pair.accessToken);
+    expect((await readStoredAuthStatus(f.store, 'global')).account).toBeNull();
+  });
+
+  it('drops unsafe display fields and does not use a snapshot across a concurrent session change', async () => {
+    const f = fixture(() => ({ status: 'ok', ...pair, membership: { ...membership, displayName: 'invalid\nname', email: 'x'.repeat(321), orgName: 'invalid\u007forg' } }));
+    await f.service.verifyCode('email', 'fixture@example.invalid', '000000');
+    expect((await readStoredAuthStatus(f.store, 'global')).account).toEqual({ loginMethod: 'cindy' });
+    const read = f.store.get;
+    let reads = 0;
+    f.store.get = async entry => { if (entry === key && ++reads === 2) return serializeAuthSessionRecord('global', 'invalid-fixture-new-rotation'); return read(entry); };
+    expect((await readStoredAuthStatus(f.store, 'global')).account).toBeNull();
   });
 
   it('blocks sending codes and accepting login when the secret backend is unavailable', async () => {
@@ -104,10 +176,16 @@ describe('CLI protected authentication lifecycle', () => {
   it.each(['INVALID_REFRESH_TOKEN', 'REFRESH_TOKEN_EXPIRED', 'ACCOUNT_UNAVAILABLE', 'MEMBERSHIP_DISABLED'])(
     'expires the saved session only after definitive server rejection: %s', async (code) => {
       const f = fixture(() => ({ httpError: 401, error: { code, message: 'invalid-fixture-server-message' } }));
-      f.entries.set(key, serializeAuthSessionRecord('global', pair.refreshToken));
+      // Create a real bound snapshot first, then reject its saved credential.
+      const primed = fixture(() => ({ status: 'ok', ...pair }));
+      await primed.service.verifyCode('email', 'fixture@example.invalid', '000000');
+      for (const [entry, value] of primed.entries) f.entries.set(entry, value);
+      const remove = f.store.delete;
+      f.store.delete = async entry => { if (entry === accountSnapshotKey('global')) throw new Error('invalid-fixture-cache-delete'); await remove(entry); };
       await expect(f.service.restore()).rejects.toMatchObject({ code });
       expect(f.entries.has(key)).toBe(false);
       expect(f.service.status().authenticated).toBe(false);
+      expect(await readStoredAuthStatus(f.store, 'global')).toEqual({ savedAuthentication: false, account: null });
     },
   );
 

@@ -25,6 +25,8 @@ export interface CliDependencies {
   authCommand?: (args: string[], context: HostCommandContext) => Promise<number>;
   /** Must return only explicitly safe fields; never return auth service/store objects. */
   status?: (context: HostCommandContext) => Promise<Record<string, unknown>>;
+  /** Explicit credential rotation; caller holds profile.lock until this adapter drains auth work. */
+  refreshAccount?: (context: HostCommandContext) => Promise<void>;
   doctor?: (context: HostCommandContext) => Promise<Diagnostic[]>;
 }
 
@@ -35,7 +37,7 @@ Usage: cindy-host [--data-dir ABSOLUTE_PATH] <command>
 Commands:
   help, --help                       Show this help
   version, --version                 Show version
-  status                             Show local configuration and runtime status
+  status [--refresh-account]         Show status; optionally refresh saved account details
   doctor                             Check host readiness
   config show                        Show effective configuration and overrides
   config set <key> <value>           Save a nonsecret override
@@ -91,7 +93,7 @@ export async function runCli(argv: string[], dependencies: CliDependencies = {})
       return await withProfileLock(dataDir, signal => { context.signal = signal; return dependencies.authCommand!([command, ...args], context); }, { signals: dependencies.signals });
     }
     // Strictly reject stray flags/arguments for commands without their own schema.
-    if (command !== 'config') parseArgs({ args, options: {}, allowPositionals: false, strict: true });
+    const parsed = command !== 'config' ? parseArgs({ args, options: command === 'status' ? { 'refresh-account': { type: 'boolean' } } : {}, allowPositionals: false, strict: true }) : undefined;
     if (command === 'config') {
       const action = args.shift() ?? 'show';
       if (action === 'show' && args.length === 0) {
@@ -104,6 +106,10 @@ export async function runCli(argv: string[], dependencies: CliDependencies = {})
       throw new HostCliError('INVALID_ARGUMENT', 'Use config show, config set <key> <value>, or config reset <key>.');
     }
     if (command === 'status') {
+      if (parsed?.values['refresh-account']) {
+        if (!dependencies.refreshAccount) throw new HostCliError('AUTH_UNAVAILABLE', 'No account refresh adapter is installed in this build.');
+        await withProfileLock(dataDir, signal => { context.signal = signal; return dependencies.refreshAccount!(context); }, { signals: dependencies.signals });
+      }
       const runtime = dependencies.status ? await dependencies.status(context) : { state: 'unavailable', message: 'No runtime status adapter installed.' };
       output(JSON.stringify({ region: context.region, dataDir, remoteAccessEnabled: context.config.remoteAccessEnabled, permissionMode: context.config.permissionMode, runtime }, null, 2));
       return 0;

@@ -129,7 +129,7 @@ importers:
         specifier: 12.11.1
         version: 12.11.1
       sharp:
-        specifier: 0.35.3
+        specifier: ^0.35.0
         version: 0.35.3(@types/node@22.20.1)
       ws:
         specifier: ^8.18.0
