@@ -1,3 +1,4 @@
+import { DEFAULT_REMOTE_AGENT_LIMITS, isRemoteAgentLimitsPatch, REMOTE_AGENT_IDLE_MINUTES_MAX } from '@cindy/remote-agent-host/limits';
 import { hostname } from 'node:os';
 import path from 'node:path';
 import { randomUUID } from 'node:crypto';
@@ -16,9 +17,11 @@ export interface HostConfig {
   remoteAccessEnabled: boolean;
   permissionMode: 'full-access';
   deviceName: string;
+  /** Minutes before reclaiming an idle Agent; 0 disables idle reclamation. */
+  idleMinutes?: number;
 }
 export type HostConfigOverrides = Partial<HostConfig>;
-export const CONFIG_KEYS = ['remoteAccessEnabled', 'permissionMode', 'deviceName'] as const;
+export const CONFIG_KEYS = ['remoteAccessEnabled', 'permissionMode', 'deviceName', 'idleMinutes'] as const;
 
 function isMissing(error: unknown): boolean { return (error as NodeJS.ErrnoException).code === 'ENOENT'; }
 async function assertOutsideGitTree(directory: string): Promise<void> {
@@ -66,6 +69,9 @@ function validateOverrides(value: unknown): HostConfigOverrides {
   if ('deviceName' in record && (typeof record.deviceName !== 'string' || !record.deviceName.trim() || record.deviceName.length > 128 || /[\x00-\x1f\x7f]/.test(record.deviceName))) {
     throw new HostCliError('INVALID_CONFIG', 'deviceName must contain 1–128 printable characters.');
   }
+  if ('idleMinutes' in record && !isRemoteAgentLimitsPatch({ idleMinutes: record.idleMinutes })) {
+    throw new HostCliError('INVALID_CONFIG', `idleMinutes must be an integer from 0 to ${REMOTE_AGENT_IDLE_MINUTES_MAX} (0 disables idle reclamation).`);
+  }
   return { ...record } as HostConfigOverrides;
 }
 
@@ -86,7 +92,7 @@ export async function readConfig(dataDir: string): Promise<{ overrides: HostConf
     else if (error instanceof HostCliError) throw error;
     else throw new HostCliError('INVALID_CONFIG', 'Cannot read configuration. The original file has been preserved.');
   }
-  return { overrides, effective: { remoteAccessEnabled: false, permissionMode: 'full-access', deviceName: hostname(), ...overrides } };
+  return { overrides, effective: { remoteAccessEnabled: false, permissionMode: 'full-access', deviceName: hostname(), idleMinutes: DEFAULT_REMOTE_AGENT_LIMITS.idleMinutes, ...overrides } };
 }
 
 /** Lock + atomic replace; preserve malformed files rather than silently resetting user choices. */
@@ -106,6 +112,8 @@ export async function updateConfig(dataDir: string, key: string, value: string |
     else if (key === 'remoteAccessEnabled') {
       if (value !== 'true' && value !== 'false') throw new HostCliError('INVALID_CONFIG', 'remoteAccessEnabled must be true or false.');
       next[key] = value === 'true';
+    } else if (key === 'idleMinutes') {
+      next[key] = value.trim() ? Number(value) : NaN;
     } else next[key] = value;
     validateOverrides(next);
     const output = await open(temporary, 'wx', 0o600);

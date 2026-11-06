@@ -8,6 +8,7 @@ import WebSocket from 'ws';
 import { wireAsyncInboundDispatch, DeviceLinkClient, DEVICE_LINK_CAPABILITY_BACKGROUND_LINK_V1, REMOTE_AGENT_CHANNEL,
   PROTOCOL_VERSION, isScopedPeer, parseProviderSharePeer, PROVIDER_SHARE_RELAY_CAPABILITY, type Envelope, type InvokePayload, type InvokeResultPayload,
   type LinkOpenPayload, type DeviceLinkClientOptions } from '@cindy/device-link';
+import { DEFAULT_REMOTE_AGENT_LIMITS } from '@cindy/remote-agent-host/limits';
 import { createRemoteAgentHost, hostedStartOptions } from '@cindy/remote-agent-host';
 import type { HostCommandContext } from '../cli';
 import { readConfig } from '../config';
@@ -69,6 +70,7 @@ export async function createCliHost(context: HostCommandContext, options: CliHos
       await provider.dispose(); throw new Error('Share quota preferences could not be loaded.');
     });
   const host = createRemoteAgentHost({
+    readLimits: () => ({ ...DEFAULT_REMOTE_AGENT_LIMITS, idleMinutes: context.config.idleMinutes ?? DEFAULT_REMOTE_AGENT_LIMITS.idleMinutes }),
     runsRoot: path.join(context.dataDir, 'accounts', createHash('sha256').update(storageScope).digest('hex'), 'remote-agent'),
     captureOwner: () => owner,
     isOwnerCurrent: candidate => candidate === owner && current(),

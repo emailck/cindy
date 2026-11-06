@@ -57,6 +57,26 @@ describe('host commands and configuration', () => {
     expect(result.errors.join('\n')).not.toContain('INVALID_TEST_SECRET');
     expect((await readConfig(profile)).effective.remoteAccessEnabled).toBe(false);
   });
+  // Unit: CLI previously rejected idle retention overrides; verify persisted numbers,
+  // zero (not default fallback), reset semantics and invalid inputs without data loss.
+  it('sets idle retention, rejects invalid values and resets the override', async () => {
+    const profile = path.join(root, 'idle-retention');
+    const result = capture();
+    for (const minutes of ['0', '120', '1440']) {
+      expect(await runCli(['--data-dir', profile, 'config', 'set', 'idleMinutes', minutes], result.deps)).toBe(0);
+      expect((await readConfig(profile)).overrides).toEqual({ idleMinutes: Number(minutes) });
+      expect((await readConfig(profile)).effective.idleMinutes).toBe(Number(minutes));
+    }
+    for (const invalid of ['-1', '1441', '1.5', '', 'abc', 'Infinity']) {
+      expect(await runCli(['--data-dir', profile, 'config', 'set', 'idleMinutes', invalid], result.deps)).toBe(1);
+      expect((await readConfig(profile)).overrides).toEqual({ idleMinutes: 1440 });
+    }
+    expect(await runCli(['--data-dir', profile, 'config', 'reset', 'idleMinutes'], result.deps)).toBe(0);
+    expect((await readConfig(profile)).overrides).toEqual({});
+    expect((await readConfig(profile)).effective.idleMinutes).toBe(30);
+    await writeFile(path.join(profile, 'config.json'), JSON.stringify({ idleMinutes: '0' }));
+    await expect(readConfig(profile)).rejects.toMatchObject({ code: 'INVALID_CONFIG' });
+  });
   it('preserves corrupt config and refuses unsupported permission modes', async () => {
     const profile = path.join(root, 'corrupt');
     await mkdir(profile);

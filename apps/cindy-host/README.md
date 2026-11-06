@@ -224,6 +224,24 @@ replacement. Restart `serve` after changing settings.
 | `remoteAccessEnabled` | `false` | Explicitly allow authenticated remote provider requests |
 | `permissionMode` | `full-access` | Fallback only when the desktop omits its permission mode; explicit desktop permissions take precedence. Peer/account/session checks still apply. |
 | `deviceName` | OS hostname | Device name advertised by the installed runtime |
+| `idleMinutes` | `30` | Idle Agent retention in minutes (integer 0–1440); 0 disables idle reclamation |
+
+To retain idle Agents longer, stop `serve` gracefully (Ctrl+C in its tmux pane),
+then use the same data directory and environment:
+
+```sh
+cindy-host config set idleMinutes 120
+cindy-host config show
+cindy-host serve
+```
+
+Use `config set idleMinutes 0` to disable idle reclamation, or
+`config reset idleMinutes` to follow the shared host default again. This applies
+to all remote Agents on this host, including shared providers. Busy tasks are not
+reclaimed; longer retention consumes memory and remote task slots. tmux keeps the
+host process alive but does not override this policy. Network loss and host shutdown
+still have their existing cleanup behavior. Configuration edits while `serve` is
+running fail with `PROFILE_BUSY`; restart is required to apply the setting.
 
 Region is the build identity (`global`), not a runtime selector. The checked-in
 `config/endpoint.global.json` is bundled as the endpoint source. Authentication

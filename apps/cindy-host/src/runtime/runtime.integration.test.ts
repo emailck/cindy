@@ -61,10 +61,10 @@ class Socket implements WsLike {
 
 afterEach(() => { vi.useRealTimers(); });
 
-async function harness(startSession?: (options: StartSessionOptions) => Promise<AgentSessionHandle>, kind: 'claude-code' | 'codex' = 'claude-code', sharing = false) {
+async function harness(startSession?: (options: StartSessionOptions) => Promise<AgentSessionHandle>, kind: 'claude-code' | 'codex' = 'claude-code', sharing = false, idleMinutes?: number) {
   vi.useFakeTimers();
   let owner: string | null = 'account:incarnation-1';
-  const config = { remoteAccessEnabled: true, permissionMode: 'full-access' as const, deviceName: 'test-host' };
+  const config = { remoteAccessEnabled: true, permissionMode: 'full-access' as const, deviceName: 'test-host', idleMinutes };
   const sockets: Socket[] = [];
   const output = vi.fn();
   const auth = { getToken: vi.fn(async () => 'token'), captureOwner: () => owner, storageScope: () => 'global:account', refresh: vi.fn(async () => true) };
@@ -87,6 +87,18 @@ async function harness(startSession?: (options: StartSessionOptions) => Promise<
 }
 
 describe('Node provider host', () => {
+  // Integration: config parsing alone cannot catch missing readLimits wiring.
+  // The real remote caps response must preserve zero and advertise the host policy.
+  it.each([[undefined, 30], [0, 0], [120, 120]])('advertises configured idle retention %s', async (minutes, expected) => {
+    const h = await harness(undefined, 'claude-code', false, minutes);
+    try {
+      h.open();
+      const socket = h.sockets[0];
+      socket.request('invoke', 'retention', { channel: REMOTE_AGENT_CHANNEL, args: [{ op: 'caps' }] });
+      await vi.advanceTimersByTimeAsync(0);
+      expect(socket.result('retention')).toMatchObject({ ok: true, result: { idleReclaimMinutes: expected } });
+    } finally { await h.host.stop(); await rm(h.dataDir, { recursive: true, force: true }); }
+  });
   // Actual scoped wire frames, official API parser and local management socket:
   // a link applicant cannot read a catalog until approval and loses access on pause.
   it('authorizes cross-account discovery only after local approval and rejects unrelated channels', async () => {

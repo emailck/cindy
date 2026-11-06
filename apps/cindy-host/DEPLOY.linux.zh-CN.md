@@ -282,6 +282,24 @@ Claude 供应商并选择它，验证消息流、本机文件与命令、停止�
 
 ## 8. SSH 断开、停止与恢复
 
+### 调整闲置 Agent 的保留时间
+
+默认闲置 30 分钟后收回 Agent。可在提供方设置 `idleMinutes`（0～1440 的整数），
+0 表示不因闲置收回；正在运行的任务不会被闲置回收，延长保留会持续占用内存和任务名额。
+tmux 保持主进程运行，但不会关闭闲置回收。
+
+先在原 tmux 窗格按 Ctrl+C 正常停止 `serve`，保持原数据目录和环境变量，再执行：
+
+```sh
+node apps/cindy-host/dist/cli.cjs config set idleMinutes 120
+node apps/cindy-host/dist/cli.cjs config show
+node apps/cindy-host/dist/cli.cjs serve
+```
+
+不希望闲置回收时改为 `config set idleMinutes 0`；恢复默认用
+`config reset idleMinutes`（删除覆盖值）。配置在重启后生效；运行期间修改会返回
+`PROFILE_BUSY`。这不改变断网、进程退出时的清理规则。
+
 - **暂离 SSH**：在 `serve` 前台运行时按 `Ctrl+B`，松开后按 `D`，脱离 tmux；重新
   SSH 后使用 `tmux attach-session -t cindy-host` 返回原来的 D-Bus 窗格。不要在另一个
   SSH shell 里新建 D-Bus 后假定它能访问原来的已解锁服务。

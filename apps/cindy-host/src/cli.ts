@@ -50,7 +50,8 @@ Commands:
   share reject REQUEST_ID           Reject a pending request
   share pause|resume|remove MEMBER  Change an existing share
 
-Configuration keys: remoteAccessEnabled (true|false), permissionMode (full-access), deviceName.
+Configuration keys: remoteAccessEnabled (true|false), permissionMode (full-access), deviceName,
+idleMinutes (0–1440; default 30; 0 disables idle reclamation).
 Data directory: --data-dir or CINDY_HOST_DATA_DIR; required outside Git workspaces.
 The build connects to Cindy services; tokens and passwords are never configuration values.
 Full access is the fallback when desktop permissions are omitted; explicit desktop permissions win.
