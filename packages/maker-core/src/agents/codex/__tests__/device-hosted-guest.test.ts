@@ -112,6 +112,7 @@ async function makeTempDir(prefix: string): Promise<string> {
 }
 
 interface Fixture {
+  logger?: Logger;
   guest: boolean;
   codexHomeInstructions?: string;
   resume?: boolean;
@@ -196,7 +197,7 @@ async function startHosted(fixture: Fixture) {
       taskShellEnv: () => ({ CINDY_INPUT_HANDOFF_ROUTE: 'host-route' }),
     },
     binaryPath: process.execPath,
-    logger: noopLogger(),
+    logger: fixture.logger ?? noopLogger(),
     getGhostRosterPrompt,
     getDisabledSkillPaths,
     getManagedSkills: async () => [{
@@ -562,6 +563,37 @@ describe('Codex device-hosted guest sessions', () => {
     // Terminal password prompts would reach this computer's owner, not the account running the task.
     expect(config['shell_environment_policy.set.CINDY_INPUT_HANDOFF_ROUTE']).toBeUndefined();
     await handle.close();
+  });
+
+  // Startup latency diagnosis: production startSession must expose the last awaited
+  // stage even on rejection, without logging request payloads. Existing isolation
+  // assertions do not cover this diagnostic contract. Minimal input: guest with a
+  // rejected feature-list RPC; unit tier, no native process or real waiting.
+  it.each([false, true])('reports bounded startup stages without payloads (feature failure: %s)', async noFeatureList => {
+    const logger = noopLogger();
+    const info = vi.fn();
+    logger.info = info;
+    const fixture = await startHosted({ guest: true, noFeatureList, logger });
+    if (noFeatureList) await expect(fixture.started).rejects.toThrow('Cannot start Codex for a shared user safely');
+    else await (await fixture.started).close();
+    const entries = info.mock.calls.filter(([message]) => message === 'remote agent startup timing')
+      .map(([, fields]) => fields as Record<string, unknown>);
+    const completed = entries.filter(entry => entry.status !== 'started');
+    expect(completed.map(entry => entry.stage)).toEqual(expect.arrayContaining([
+      'capability-skills', 'capability-config', 'capability-mcp-status', 'hosted-mcp-config', 'guest-features', 'session-total',
+    ]));
+    expect(completed.find(entry => entry.stage === 'guest-features')?.status).toBe(noFeatureList ? 'failed' : 'ok');
+    expect(completed.find(entry => entry.stage === 'session-total')?.status).toBe(noFeatureList ? 'failed' : 'ok');
+    expect(entries.some(entry => entry.stage === 'thread-start')).toBe(!noFeatureList);
+    for (const entry of entries) {
+      expect(entry.sessionRef).toBe('hosted-s');
+      expect(entry.elapsedMs).toEqual(expect.any(Number));
+      expect(Object.keys(entry).every(key => ['side', 'stage', 'status', 'durationMs', 'elapsedMs', 'sessionRef'].includes(key))).toBe(true);
+    }
+    const text = JSON.stringify(entries);
+    for (const secret of [fixture.workingDir, fixture.codexHome, 'unknown method', 'http://127.0.0.1', 'route-token']) expect(text).not.toContain(secret);
+    const methods = fixture.request.mock.calls.map(([method]) => method);
+    if (!noFeatureList) expect(methods.indexOf(Method.EnvironmentAdd)).toBeLessThan(methods.indexOf(Method.ThreadStart));
   });
 
   it('refuses a shared user when Codex cannot list its features', async () => {

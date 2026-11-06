@@ -3,6 +3,7 @@ import path from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 
 import { EXEC_SERVER_NOT_FOUND_CODE } from './execServerShortcut';
+import type { StartupExecServerBatchStats } from '../startupTiming';
 
 const MANIFEST_DIRS = ['.codex-plugin', '.claude-plugin', '.cursor-plugin'];
 // Includes the virtual workspace padding and host ancestors; bounded per connection.
@@ -25,6 +26,9 @@ function parse(data: string): Rpc | null {
 }
 
 interface BatchDeps {
+  stats?: StartupExecServerBatchStats;
+  /** CLI opt-in: extend prefetch to new Skill branches within one connection-wide budget. */
+  incremental?: boolean;
   shortcut(data: string): string | null;
   forward(data: string): void;
   answer(data: string): void;
@@ -42,11 +46,17 @@ export function createExecServerStartupBatch(deps: BatchDeps) {
   const pending = new Map<string, string>(); // internal id -> original file URI
   const absent = new Set<string>();
   const waiters = new Map<string, string[]>();
+  // Only synthetic RPCs consume this budget. Real queries always retain their original fallback.
+  const prefetched = new Set<string>();
+  const maxPrefetched = MAX_LEVELS * MANIFEST_DIRS.length;
+  let nextId = 0;
   let scope: string | undefined;
   let active = true;
   let attempted = false;
 
-  function finish(): void {
+  function finish(reason: keyof StartupExecServerBatchStats['stopped'] = 'startup-complete'): void {
+    if (!active) return;
+    if (deps.stats) deps.stats.stopped[reason] = (deps.stats.stopped[reason] ?? 0) + 1;
     active = false;
     absent.clear();
     for (const messages of waiters.values()) for (const message of messages) deps.forward(message);
@@ -56,51 +66,77 @@ export function createExecServerStartupBatch(deps: BatchDeps) {
 
   function request(data: string): boolean {
     if (!active) return false;
-    if (data.length > MAX_MESSAGE_CHARS) { finish(); return false; }
+    if (data.length > MAX_MESSAGE_CHARS) { finish('oversize'); return false; }
     const rpc = parse(data);
-    if (!rpc) { finish(); return false; }
+    if (!rpc) { finish('invalid-message'); return false; }
     if (typeof rpc.method !== 'string') return false;
     if (rpc.method === 'process/start' || (rpc.method?.startsWith('fs/') && !READ_ONLY.has(rpc.method))) {
-      finish();
+      finish(rpc.method === 'process/start' ? 'process-start' : 'write');
       return false;
     }
     if (rpc.method !== 'fs/getMetadata' || (typeof rpc.id !== 'string' && typeof rpc.id !== 'number')) return false;
     const uri = rpc.params?.path;
-    if (typeof uri !== 'string' || !uri.startsWith('file://')) return false;
+    if (typeof uri !== 'string' || !uri.startsWith('file://')) { if (deps.stats) deps.stats.rejectedUri += 1; return false; }
     let target: string;
-    try { target = fileURLToPath(uri); } catch { return false; }
+    try { target = fileURLToPath(uri); } catch { if (deps.stats) deps.stats.rejectedUri += 1; return false; }
     if (path.basename(target) !== 'plugin.json' || !MANIFEST_DIRS.includes(path.basename(path.dirname(target)))) return false;
     const rest = { ...rpc.params };
     delete rest.path;
     const currentScope = JSON.stringify(rest);
-    if (attempted && currentScope !== scope) return false;
+    if (attempted && currentScope !== scope) { if (deps.stats) deps.stats.scopeMismatch += 1; return false; }
+    // Do not infer equivalence for foreign encodings, drive letters or UNC paths. In CLI mode
+    // such a query remains untouched and does not consume the first canonical prefetch opportunity.
+    if (deps.incremental && pathToFileURL(target).href !== uri) {
+      if (deps.stats) deps.stats.uriMismatch += 1;
+      return false;
+    }
 
-    if (!attempted) {
+    const newBranch = deps.incremental && !prefetched.has(uri);
+    if (newBranch && prefetched.size >= maxPrefetched) {
+      if (deps.stats) deps.stats.budgetExhausted = (deps.stats.budgetExhausted ?? 0) + 1;
+      return false;
+    }
+    if (!attempted || newBranch) {
       attempted = true;
+      if (deps.stats) deps.stats.attempted += 1;
       scope = currentScope;
       // Build the whole batch before forwarding: even a synchronous test transport may reply.
       const batch: string[] = [];
       let dir = path.dirname(path.dirname(target));
       for (let level = 0; level < MAX_LEVELS; level += 1) {
         for (const marker of MANIFEST_DIRS) {
+          if (deps.incremental && prefetched.size >= maxPrefetched) break;
           const candidate = pathToFileURL(path.join(dir, marker, 'plugin.json')).href;
-          const id = `${prefix}${batch.length}`;
+          if (deps.incremental && prefetched.has(candidate)) continue;
+          const id = `${prefix}${deps.incremental ? nextId++ : batch.length}`;
           const message = JSON.stringify({ ...rpc, id, params: { ...rpc.params, path: candidate } });
           if (deps.shortcut(message) !== null) continue;
+          if (deps.incremental) prefetched.add(candidate);
           pending.set(id, candidate);
           batch.push(message);
         }
+        if (deps.incremental && prefetched.size >= maxPrefetched) break;
         const parent = path.dirname(dir);
         if (parent === dir) break;
         dir = parent;
       }
       // Match exact URIs; unfamiliar encodings keep their original query semantics.
       const held = [...pending.values()].includes(uri);
+      if (deps.stats) {
+        deps.stats.prefetched += batch.length;
+        if (deps.incremental) deps.stats.batches = (deps.stats.batches ?? 0) + 1;
+        if (!held) {
+          if (!deps.incremental) deps.stats.uriMismatch += 1;
+          else if (prefetched.size >= maxPrefetched) deps.stats.budgetExhausted = (deps.stats.budgetExhausted ?? 0) + 1;
+          else deps.stats.unprefetched += 1;
+        }
+      }
       if (held) waiters.set(uri, [data]);
       for (const message of batch) deps.forward(message);
       return held;
     }
     if (absent.has(uri)) {
+      if (deps.stats) deps.stats.answered += 1;
       deps.answer(JSON.stringify({ id: rpc.id, error: { code: EXEC_SERVER_NOT_FOUND_CODE, message: 'No such file or directory (os error 2)' } }));
       return true;
     }
@@ -112,6 +148,7 @@ export function createExecServerStartupBatch(deps: BatchDeps) {
       waiters.set(uri, messages);
       return true;
     }
+    if (deps.stats) deps.stats.unprefetched += 1;
     return false;
   }
 
@@ -124,11 +161,16 @@ export function createExecServerStartupBatch(deps: BatchDeps) {
     const uri = pending.get(rpc.id);
     if (uri === undefined) return false;
     pending.delete(rpc.id);
+    if (deps.stats) {
+      if (rpc.error?.code === EXEC_SERVER_NOT_FOUND_CODE) deps.stats.notFound += 1;
+      else deps.stats.nonNotFound += 1;
+    }
     if (active && rpc.error?.code === EXEC_SERVER_NOT_FOUND_CODE) absent.add(uri);
     const messages = waiters.get(uri) ?? [];
     waiters.delete(uri);
     for (const message of messages) {
       if (active && absent.has(uri)) {
+        if (deps.stats) deps.stats.answered += 1;
         deps.answer(JSON.stringify({ ...rpc, id: parse(message)!.id }));
       } else deps.forward(message);
     }

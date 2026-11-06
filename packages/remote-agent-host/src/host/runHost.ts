@@ -4,7 +4,7 @@ export interface GeneratedImageUpstream {
   sessionId: string;
   relay: string;
 }
-import { remoteAgentStartupTiming } from '../startupTiming';
+import { remoteAgentStartupTiming, type StartupExecServerStats } from '../startupTiming';
 import { parseProviderSharePeer, providerShareGuestPeer } from '@cindy/device-link';
 import { DEFAULT_REMOTE_AGENT_LIMITS, type RemoteAgentLimits, type RemoteAgentLimitUsage } from '../limits.js';
 /**
@@ -210,6 +210,10 @@ export interface OwnerProviderRouteBinding {
 }
 
 export interface RemoteAgentHostDeps {
+  /** Opt in to bounded incremental manifest prefetch; omitted preserves the legacy single branch. */
+  incrementalStartupBatch?: boolean;
+  /** CLI compatibility: allocation can select the existing local route without a direct-executor grant. */
+  localGuestAllocation?: boolean;
   /**
    * 这台自己的 Cindy 托管 Skill(启用中的；命令名与 SKILL.md 所在目录)。caps 据此报指纹，任务所在电脑报「用你自己那份」
    * 时据此复制；组所在电脑中转时据此替组内电脑补文件。
@@ -1470,15 +1474,17 @@ export function createRemoteAgentHost(deps: RemoteAgentHostDeps) {
 
   async function startRun(run: Run, payload: RemoteAgentOpenPayload): Promise<void> {
     run.imageDeliveryEpoch = payload.imageDeliveryEpoch;
+    const hostSessionId = hostSessionIdFor(guestScopeOf(run.controller, run.relayKey), payload.sessionId);
     const timing = remoteAgentStartupTiming(deps.log, {
       side: 'host',
       kind: run.kind,
       sessionId: payload.sessionId,
+      engineSessionId: hostSessionId,
       runId: run.id,
     });
     let status: 'ok' | 'failed' = 'failed';
     let startupComplete = false;
-    const execServerStats = {
+    const execServerStats: StartupExecServerStats = {
       shortcutEnabled: false,
       ancestorLevels: payload.ancestorMarkers?.levels.length ?? 0,
       connections: 0,
@@ -1494,7 +1500,6 @@ export function createRemoteAgentHost(deps: RemoteAgentHostDeps) {
         if (provider !== run.providerId) failProviderNotAllowed();
       }
       // 中转过来的任务按(控制端, relay)派生：不同受邀者即使任务 id 相同也不会共用本机侧任务。
-      const hostSessionId = hostSessionIdFor(guestScopeOf(run.controller, run.relayKey), payload.sessionId);
       run.hostSessionId = hostSessionId;
       run.forkWorkspaceIds = await timing.measure('resume-workspaces', () =>
         forkWorkspacesFor(guestScopeOf(run.controller, run.relayKey), payload.options.resumeSessionId),
@@ -1561,9 +1566,18 @@ export function createRemoteAgentHost(deps: RemoteAgentHostDeps) {
             (run.localWs ??= new Set()).add(connId);
             if (wsPath.split('?')[0] === EXEC_SERVER_WS_PATH) {
               execConns.add(connId);
+              if (!startupComplete) execServerStats.shortcutAnswered ??= 0;
               if (!startupComplete) execServerStats.connections += 1;
               if (!startupComplete && shortcut) {
+                const batchStats = execServerStats.batch ??= {
+                  connections: 0, attempted: 0, prefetched: 0, answered: 0, notFound: 0, nonNotFound: 0, uriMismatch: 0,
+                  rejectedUri: 0, scopeMismatch: 0, unprefetched: 0, stopped: {},
+                  incrementalEnabled: deps.incrementalStartupBatch === true, batches: 0, budgetExhausted: 0,
+                };
+                batchStats.connections += 1;
                 (run.execStartupBatches ??= new Map()).set(connId, createExecServerStartupBatch({
+                  stats: batchStats,
+                  incremental: deps.incrementalStartupBatch === true,
                   shortcut,
                   forward: data => {
                     if (!startupComplete) execServerStats.forwarded += 1;
@@ -1581,7 +1595,10 @@ export function createRemoteAgentHost(deps: RemoteAgentHostDeps) {
           wsMessage: (connId, data) => {
             const local = shortcut && execConns.has(connId) ? shortcut(data) : null;
             if (local !== null) {
-              if (!startupComplete) execServerStats.answered += 1;
+              if (!startupComplete) {
+                execServerStats.answered += 1;
+                execServerStats.shortcutAnswered = (execServerStats.shortcutAnswered ?? 0) + 1;
+              }
               run.tunnel?.sendWs(connId, local);
               return;
             }
@@ -3027,6 +3044,9 @@ export function createRemoteAgentHost(deps: RemoteAgentHostDeps) {
         if (trustOf(controller) !== 'guest' || !deps.directGuestExecution?.locate) fail('REMOTE_AGENT_INVALID', 'location is only for shared users');
         return deps.directGuestExecution.locate(controller, request);
       case 'allocate': {
+        // null only selects the ordinary local startup route. It grants no execution authority:
+        // open still checks guest/provider/model/resume permissions and prepares the isolated workspace.
+        if (deps.localGuestAllocation === true && trustOf(controller) === 'guest' && !deps.directGuestExecution) return null;
         if (trustOf(controller) !== 'guest' || !deps.directGuestExecution) fail('REMOTE_AGENT_INVALID', 'allocation is only for shared users');
         if (!directLocked) return withDirectGuestLock(controller, () => handleRequest(controller, request, signal, true));
         // An existing O-hosted task stays on its legacy route, even when an old

@@ -135,9 +135,12 @@ export function mapClaudeModels(raw: unknown[]): CatalogModel[] {
 }
 
 /** Runtime logs may contain user content and credentials: expose fixed lifecycle events only. */
-export function quietRuntimeLogger(): Logger {
+export function quietRuntimeLogger(startup?: (message: string, fields?: Record<string, unknown>) => void): Logger {
   const noop = () => undefined;
-  const logger: Logger = { trace: noop, debug: noop, info: noop, warn: noop, error: noop, fatal: noop, child: () => logger };
+  const diagnostic: Logger['info'] = (message, fields) => {
+    if (message === 'remote agent startup timing') startup?.(message, fields);
+  };
+  const logger: Logger = { trace: noop, debug: diagnostic, info: diagnostic, warn: noop, error: noop, fatal: noop, child: () => logger };
   return logger;
 }
 

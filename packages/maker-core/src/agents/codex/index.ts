@@ -44,6 +44,7 @@ import { structuredPatch } from 'diff';
 import { syncCodexArchiveState } from './archive-state.js';
 import { readCodexThreadMcpServerTools } from './mcp-server-tools.js';
 import { readAccountRateLimitsWithRefresh } from './app-server/account-rate-limits.js';
+import { codexStartupTiming } from './startup-timing.js';
 
 import {
   BaseAgent,
@@ -1954,21 +1955,22 @@ export class CodexAgent extends BaseAgent {
       plugin?: (pluginId: string) => boolean;
       allSkills?: true;
     },
+    timing = codexStartupTiming(),
   ): Promise<Record<string, unknown>> {
-    const { skills, errors } = keep?.allSkills ? { skills: [], errors: [] } : await this.listSkillsForHost(
+    const { skills, errors } = keep?.allSkills ? { skills: [], errors: [] } : await timing.measure('capability-skills', () => this.listSkillsForHost(
       host,
       workingDir,
       false,
       CRITICAL_THREAD_RPC_TIMEOUT_MS,
-    );
+    ));
     const unscopedSkillError = errors.find((error) => !error.path);
     if (unscopedSkillError && !keep?.skill('')) throw new Error(unscopedSkillError.message);
 
-    const configResponse = await host.request<{ config?: Record<string, unknown> }>(
+    const configResponse = await timing.measure('capability-config', () => host.request<{ config?: Record<string, unknown> }>(
       Method.ConfigRead,
       { includeLayers: false },
       { timeoutMs: CRITICAL_THREAD_RPC_TIMEOUT_MS },
-    );
+    ));
     const effectiveConfig = asRecord(configResponse.config);
     const configuredMcp = asRecord(effectiveConfig.mcp_servers);
     const configuredPlugins = asRecord(effectiveConfig.plugins);
@@ -1989,11 +1991,11 @@ export class CodexAgent extends BaseAgent {
     let cursor: string | null = null;
     do {
       const status: CodexMcpServerStatusListResponse =
-        await host.request<CodexMcpServerStatusListResponse>(
+        await timing.measure('capability-mcp-status', () => host.request<CodexMcpServerStatusListResponse>(
         Method.McpServerStatusList,
         { cursor, limit: 100, detail: 'toolsAndAuthOnly', threadId: null },
         { timeoutMs: CRITICAL_THREAD_RPC_TIMEOUT_MS },
-      );
+      ));
       for (const server of status.data) {
         if (
           !transportConfiguredMcpServerNames.has(server.name) &&
@@ -3042,7 +3044,8 @@ assertRouteCurrent();
       const state =
         spawnCredentialMode === 'gateway-key' && requestedGatewayState
           ? requestedGatewayState
-          : await this.deps.auth.getState(authOptions);
+          : await codexStartupTiming(deviceHostedGuestSessionId ? this.deps.logger : undefined,
+            deviceHostedGuestSessionId).measure('auth-status', () => this.deps.auth.getState(authOptions));
       assertCurrentGeneration('auth');
       if (!state.authenticated) {
         throw new AgentNotAuthenticatedError('codex', `codex not authenticated: ${state.errorReason ?? 'no_credentials'}`);
@@ -3286,6 +3289,7 @@ assertRouteCurrent();
     }
 
     const host = new AppServerHost({
+      startupSessionId: deviceHostedGuestSessionId,
       createTransport,
       supportsModelProviderSelection: codexProxyActive && !remoteHostId,
       defaultModelProviderId,
@@ -3532,6 +3536,11 @@ assertRouteCurrent();
   }
 
   async startSession(opts: StartSessionOptions): Promise<AgentSessionHandle> {
+    return codexStartupTiming(opts.deviceHosted ? this.deps.logger : undefined, opts.sessionId)
+      .measure('session-total', () => this.startSessionWithStartupRetries(opts));
+  }
+
+  private async startSessionWithStartupRetries(opts: StartSessionOptions): Promise<AgentSessionHandle> {
     const signal = this.routeResolutionAbort.signal;
     for (let attempt = 0; ; attempt++) {
       const startup = {
@@ -3582,6 +3591,7 @@ assertRouteCurrent();
     const hostedEnvironmentId = hosted ? `cindy-device-${randomUUID()}` : undefined;
     // 受邀者(另一个账号)：本机用户的插件、技能、MCP、hooks、connectors、记忆与全局说明不进入会话。
     const hostedGuest = hosted?.guest === true;
+    const startupTiming = codexStartupTiming(hosted ? this.deps.logger : undefined, sid);
     // 受邀者只能用分享给它的那一个供应商(启动来源就是它)：app-server 不升格、不开智能子代理调配，
     // 自定义供应商路由与按模型分流也只留它(见 prepareCodexExtraSpawnConfig 的 deviceHostedGuestProviderId)。
     const guestProviderId = hostedGuest ? hosted?.guestProvider?.providerId : undefined;
@@ -5474,7 +5484,7 @@ assertRouteCurrent();
         const guestCapabilityConfig = await this.buildLocalCapabilityIsolationConfig(host, opts.workingDir, {
           skill: (skillPath, scope) => guestSkillAllowed!(skillPath, scope),
           mcpServer: (serverName) => hosted.mcpServers.includes(serverName),
-        });
+        }, startupTiming);
         capabilityRoutingConfig = mergeCodexSkillConfigOverrides(capabilityRoutingConfig, guestCapabilityConfig);
         assertCurrentHost('Shared-user capability isolation');
       } catch (error) {
@@ -5625,10 +5635,10 @@ assertRouteCurrent();
     let nativeContinuationConfig: Record<string, unknown> = {};
     if (!reviewMode && nativeApprovalsReviewerRouteSupported) {
       try {
-        const response = await host.request<{ config?: Record<string, unknown> }>(
+        const response = await startupTiming.measure('native-review-config', () => host.request<{ config?: Record<string, unknown> }>(
           Method.ConfigRead, { cwd: opts.workingDir, includeLayers: false },
           { timeoutMs: CRITICAL_THREAD_RPC_TIMEOUT_MS },
-        );
+        ));
         assertCurrentHost('Native auto-review policy');
         if (response.config) nativeContinuationConfig = nativeAutoReviewContinuationConfig(initResp.userAgent, response.config);
       } catch {
@@ -6418,11 +6428,11 @@ assertRouteCurrent();
     async function addHostedEnvironment(): Promise<void> {
       if (!hosted || !hostedEnvironmentId) return;
       assertCurrentHost('environment/add');
-      await host.request(Method.EnvironmentAdd, {
+      await startupTiming.measure('environment-add', () => host.request(Method.EnvironmentAdd, {
         environmentId: hostedEnvironmentId,
         execServerUrl: `${stripTrailingSlashes(hosted.tunnelUrl.replace(/^http/, 'ws'))}/ws/exec-server`,
         authBearerToken: hosted.tunnelToken,
-      }, { timeoutMs: CRITICAL_THREAD_RPC_TIMEOUT_MS });
+      }, { timeoutMs: CRITICAL_THREAD_RPC_TIMEOUT_MS }));
       assertCurrentHost('environment/add');
     }
 
@@ -6990,7 +7000,7 @@ assertRouteCurrent();
       };
       acquireHostBindingLeaseIfNeeded();
       assertCurrentHost('thread/start');
-      const resp = await withMcpDiscoveryContext(() => {
+      const resp = await startupTiming.measure('thread-start', () => withMcpDiscoveryContext(() => {
           assertCurrentHost('thread/start dispatch');
           return host.request<ThreadStartResponse>(Method.ThreadStart, params, {
             ...criticalThreadRpcOptions(),
@@ -6999,7 +7009,7 @@ assertRouteCurrent();
               startup.threadDispatched = true;
             },
           });
-        });
+        }));
       assertCurrentHost('thread/start');
       if (Object.hasOwn(resp, 'serviceTier')) {
         serviceTierState.value = normalizeServiceTier(resp.serviceTier) ?? null;
@@ -7078,10 +7088,10 @@ assertRouteCurrent();
     if (hosted && hostedEnvironmentId) {
       // 设备托管：本机 MCP 名单(全部停用，只留隧道提供的)，再把任务所在电脑的 exec-server 接成环境。
       try {
-        const response = await host.request<{ config?: Record<string, unknown> }>(
+        const response = await startupTiming.measure('hosted-mcp-config', () => host.request<{ config?: Record<string, unknown> }>(
           Method.ConfigRead, { includeLayers: false },
           { timeoutMs: CRITICAL_THREAD_RPC_TIMEOUT_MS },
-        );
+        ));
         hostedLocalMcpNames = Object.keys(asRecord(asRecord(response.config).mcp_servers));
       } catch (error) {
         log.warn('codex: hosted session could not list local MCP servers', { error: String(error) });
@@ -7091,10 +7101,10 @@ assertRouteCurrent();
       if (hostedGuest) {
         // 受邀者：Codex 的功能只开白名单里的。清单取不到就不启动。
         try {
-          hostedGuestFeatureConfig = codexGuestFeatureOverrides(await listCodexFeatures((cursor) => host.request(
+          hostedGuestFeatureConfig = codexGuestFeatureOverrides(await startupTiming.measure('guest-features', () => listCodexFeatures((cursor) => host.request(
             Method.ExperimentalFeatureList, { limit: 200, ...(cursor ? { cursor } : {}) },
             { timeoutMs: CRITICAL_THREAD_RPC_TIMEOUT_MS },
-          )));
+          ))));
         } catch (error) {
           throw new Error(`Cannot start Codex for a shared user safely: ${String(error)}`);
         }
@@ -7130,7 +7140,7 @@ assertRouteCurrent();
         acquireHostBindingLeaseIfNeeded();
         assertCurrentHost('thread/resume');
         let providerHistoryFork = false;
-        const resume = () => withMcpDiscoveryContext(async () => {
+        const resume = () => startupTiming.measure('thread-resume', () => withMcpDiscoveryContext(async () => {
           assertCurrentHost('thread/resume dispatch');
           const requestOptions = {
             ...criticalThreadRpcOptions(),
@@ -7156,7 +7166,7 @@ assertRouteCurrent();
             providerHistoryFork = true;
             return fork;
           }
-        });
+        }));
         let resp: ThreadResumeResponse;
         try {
           resp = await resume();

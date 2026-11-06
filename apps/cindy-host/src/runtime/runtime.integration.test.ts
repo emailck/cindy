@@ -19,7 +19,7 @@ import { runShareControl, startShareControl } from '../share-control';
 import { randomUUID } from 'node:crypto';
 import os from 'node:os';
 import path from 'node:path';
-import { mkdir, readFile, rm, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, readFile, rm, writeFile, stat, symlink, link } from 'node:fs/promises';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { PROVIDER_SHARE_RELAY_CAPABILITY, encodeReliableFrames, DEVICE_LINK_CAPABILITY_RELIABLE_TRANSPORT, PROTOCOL_VERSION, REMOTE_AGENT_CHANNEL, type Envelope, type WsLike, type RemoteAgentStreamItem, type RemoteAgentPollResult } from '@cindy/device-link';
 import type { StartSessionOptions, AgentSessionHandle } from '@cindy/maker-core';
@@ -28,6 +28,7 @@ import { createCliHost } from './index';
 import { mapCodexModels, createNativeCodexAuth, createCodexProvider } from './codex';
 import type { CodexModelListItem } from '@cindy/maker-core';
 import { quietRuntimeLogger, mapClaudeModels, createNativeClaudeSharing, type createClaudeProvider } from './claude';
+import { startupDiagnostics } from './startupDiagnostics';
 
 class Socket implements WsLike {
   sent: Envelope[] = [];
@@ -67,6 +68,7 @@ async function harness(startSession?: (options: StartSessionOptions) => Promise<
   const config = { remoteAccessEnabled: true, permissionMode: 'full-access' as const, deviceName: 'test-host', idleMinutes };
   const sockets: Socket[] = [];
   const output = vi.fn();
+  const diagnostics = vi.fn();
   const auth = { getToken: vi.fn(async () => 'token'), captureOwner: () => owner, storageScope: () => 'global:account', refresh: vi.fn(async () => true) };
   const provider = { kind, sharing: sharing ? { supported: true, prepare: async () => {}, bind: async () => null } : undefined, dispose: vi.fn(async () => {}), id: 'anthropic', modelIds: new Set(['claude-test-1']), isAuthenticated: async () => true,
     view: (enabled: boolean) => ({ id: 'anthropic', connected: true, remoteInvocationEnabled: enabled, models: { [kind]: [{ id: 'claude-test-1', name: 'Test model', contextWindow: 128000, efforts: ['low'], defaultEffort: 'low' }] } }),
@@ -76,17 +78,81 @@ async function harness(startSession?: (options: StartSessionOptions) => Promise<
   const dataDir = path.join(os.tmpdir(), `cindy-host-test-${randomUUID()}`);
   if (sharing) await mkdir(dataDir, { recursive: true, mode: 0o700 });
   const host = await createCliHost({ dataDir, region: 'global', endpoints: HOST_ENDPOINTS,
-    config, output, error: vi.fn() }, { auth, createProvider: async () => provider, loadConfig: async () => config,
+    config, output, error: diagnostics }, { auth, createProvider: async () => provider, loadConfig: async () => config,
     createWebSocket: () => { const socket = new Socket(); sockets.push(socket); return socket; } });
   const start = host.start(new AbortController().signal);
   await vi.advanceTimersByTimeAsync(0);
   expect(output).not.toHaveBeenCalled();
   sockets[0].ack(); await start;
   const open = () => sockets.at(-1)!.request('link-open', 'link', { controllerName: 'desktop', protocolVersion: PROTOCOL_VERSION, appVersion: '1.0.0' });
-  return { host, provider, sockets, output, auth, config, open, dataDir, setOwner: (next: string | null) => { owner = next; } };
+  return { host, provider, sockets, output, diagnostics, auth, config, open, dataDir, setOwner: (next: string | null) => { owner = next; } };
 }
 
 describe('Node provider host', () => {
+  // Production logging boundary: only fixed startup diagnostics may leave the quiet runtime.
+  // Existing startup tests injected desktop loggers and missed CLI no-op wiring. Minimal input:
+  // approved timing with secret extra fields plus an ordinary runtime log; integration fixture.
+  it('rebuilds startup diagnostics and suppresses arbitrary runtime messages and fields', () => {
+    const output = vi.fn();
+    const logger = quietRuntimeLogger(startupDiagnostics(output));
+    const secret = 'private-secret-payload';
+    logger.info(secret, { stage: 'initialize' });
+    logger.info('remote agent startup timing', { side: 'codex', stage: secret, status: 'ok' });
+    logger.child(secret).info('remote agent startup timing', {
+      side: 'codex', stage: 'initialize', status: 'ok', durationMs: 12, elapsedMs: Infinity,
+      runtimeVersion: '0.159.2', sessionRef: secret, token: secret, path: secret,
+      stagesMs: { initialize: 12, [secret]: 9 },
+      execServer: { answered: 2, forwarded: -1, path: secret, batch: { attempted: 1, token: secret, stopped: { write: 1, [secret]: 1 } } },
+    });
+    expect(output).toHaveBeenCalledTimes(1);
+    const line = output.mock.calls[0][0] as string;
+    expect(line).not.toContain(secret);
+    const fields = JSON.parse(line.slice('remote agent startup timing '.length));
+    expect(fields).toMatchObject({ diagnosticsVersion: 1, hostVersion: expect.any(String), buildRevision: 'dev',
+      runtimeVersion: '0.159.2', durationMs: 12, stagesMs: { initialize: 12 },
+      execServer: { answered: 2, batch: { attempted: 1, stopped: { write: 1 } } } });
+    expect(fields).not.toHaveProperty('elapsedMs');
+    expect(fields.execServer).not.toHaveProperty('forwarded');
+    expect(() => quietRuntimeLogger(startupDiagnostics(() => { throw new Error(secret); })).info(
+      'remote agent startup timing', { side: 'host', stage: 'total', status: 'ok' },
+    )).not.toThrow();
+  });
+  // LogConfig:none loses stderr: the production diagnostic boundary must preserve only safe JSON
+  // in the external data root, even when stderr fails. Existing timing tests checked memory only.
+  // Minimal input: one approved event at the file limit; integration tier, no runtime/accounts.
+  it('persists safe startup JSON with private permissions and bounded rotation when stderr fails', async () => {
+    const dir = await mkdtemp(path.join(os.tmpdir(), 'cindy-startup-log-'));
+    const file = path.join(dir, 'startup-timing.jsonl');
+    try {
+      await writeFile(file, 'x'.repeat(1024 * 1024), { mode: 0o600 });
+      const diagnostics = startupDiagnostics(() => { throw new Error('stderr unavailable'); }, dir);
+      diagnostics('remote agent startup timing', { side: 'host', stage: 'total', status: 'ok', durationMs: 3, token: 'private-test-secret' });
+      await diagnostics.flush();
+      const line = await readFile(file, 'utf8');
+      expect(JSON.parse(line)).toMatchObject({ side: 'host', stage: 'total', durationMs: 3, recordedAt: expect.any(String) });
+      expect(line).not.toContain('private-test-secret');
+      expect((await stat(`${file}.1`)).size).toBe(1024 * 1024);
+      if (process.platform !== 'win32') expect((await stat(file)).mode & 0o777).toBe(0o600);
+    } finally { await rm(dir, { recursive: true, force: true }); }
+  });
+  // A pre-existing diagnostic path must never write through a symbolic or hard link.
+  it.each(['symlink', 'hardlink'])('refuses a %s at the diagnostic file path', async (kind, context) => {
+    const dir = await mkdtemp(path.join(os.tmpdir(), 'cindy-startup-link-'));
+    const target = path.join(dir, 'unrelated.txt');
+    try {
+      await writeFile(target, 'untouched');
+      try {
+        await (kind === 'symlink' ? symlink(target, path.join(dir, 'startup-timing.jsonl')) : link(target, path.join(dir, 'startup-timing.jsonl')));
+      } catch (error) {
+        if (kind === 'symlink' && ['EPERM', 'ENOTSUP'].includes((error as NodeJS.ErrnoException).code ?? '')) { context.skip(); return; }
+        throw error;
+      }
+      const diagnostics = startupDiagnostics(() => {}, dir);
+      diagnostics('remote agent startup timing', { side: 'host', stage: 'total', status: 'ok' });
+      await diagnostics.flush();
+      expect(await readFile(target, 'utf8')).toBe('untouched');
+    } finally { await rm(dir, { recursive: true, force: true }); }
+  });
   // Integration: config parsing alone cannot catch missing readLimits wiring.
   // The real remote caps response must preserve zero and advertise the host policy.
   it.each([[undefined, 30], [0, 0], [120, 120]])('advertises configured idle retention %s', async (minutes, expected) => {
@@ -270,6 +336,11 @@ describe('Node provider host', () => {
       await ready;
       await vi.advanceTimersByTimeAsync(0);
       const initial = await socket.remote({ op: 'poll', runs: [{ runId, cursor: 0 }], waitMs: 0 }) as RemoteAgentPollResult;
+      const timingLines = h.diagnostics.mock.calls.map(([line]) => line as string);
+      expect(timingLines.some(line => line.includes('"side":"host"') && line.includes('"stage":"agent-session"'))).toBe(true);
+      expect(timingLines.some(line => line.includes('"stage":"total"') && line.includes('"execServer":'))).toBe(true);
+      expect(timingLines.some(line => line.includes('"engineSessionRef":'))).toBe(true);
+      expect(timingLines.join('\n')).not.toContain('/desktop/project');
       const cursor = initial.runs[0].cursor;
       for (const peer of ['desktop', 'other-desktop']) {
         socket.request('link-open', `link-${peer}`, { controllerName: peer, protocolVersion: PROTOCOL_VERSION,

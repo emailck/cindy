@@ -297,3 +297,32 @@ direct WebRTC connectivity are not implied by this host.
 pnpm --filter @cindy/host typecheck
 pnpm --filter @cindy/host test
 ```
+
+## Startup diagnostics
+
+`serve` emits `remote agent startup timing` records on stderr and saves the same
+whitelisted JSON objects in `startup-timing.jsonl` under its private data directory.
+The file is mode 0600, rotates at 1 MiB and retains one backup; a bounded async
+queue avoids blocking startup. `droppedRecords` reports discarded/failed records.
+Container log drivers set to `none` do not discard this file. These records contain only
+fixed stages, elapsed time, results, short correlation IDs, counts and versions.
+Ordinary native runtime logs remain suppressed. Match the host's `engineSessionRef`
+to Codex's `sessionRef`; the host also records the requesting task's `sessionRef`.
+Compare `agent-session` with the Codex initialization, isolation, capability,
+`environment-add` and `thread-start` stages. Nested durations must not be summed
+as independent wall time, and execution-environment waits are not network RTT.
+
+`execServer` separates shortcut answers from batch prefetch and fallback counts.
+CLI startup prefetch extends to subsequent Skill branches with exact-URI deduplication
+and a connection-wide synthetic-query budget; exceeding it forwards real queries
+normally. Existing files, permission failures and unfamiliar URIs retain real
+executor handling. The default Desktop host behavior is unchanged.
+
+CLI accepts an authorized guest's `allocate` request by returning the existing
+`null` local-route result. This is not a direct-executor grant; normal startup still
+checks permissions and isolation. It avoids the unsupported-allocation exception
+but does not remove the request round trip.
+
+Build diagnostics identify source revisions, including `-dirty`; source archives
+without Git metadata report `unknown`. Release automation can supply
+`CINDY_HOST_BUILD_REVISION` as a Git hash, optionally suffixed with `-dirty`.

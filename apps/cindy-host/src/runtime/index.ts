@@ -14,6 +14,7 @@ import type { HostCommandContext } from '../cli';
 import { readConfig } from '../config';
 import type { HostLifecycle } from '../lifecycle';
 import { quietRuntimeLogger } from './claude';
+import { startupDiagnostics } from './startupDiagnostics';
 import { createProvider } from './provider';
 import metadata from '../../package.json';
 
@@ -37,7 +38,7 @@ const allowlistHash = createHash('sha256').update([...channels].sort().join('\n'
 
 /** Relay-only same-account provider. All project tools run through the shared host's reverse tunnel. */
 export async function createCliHost(context: HostCommandContext, options: CliHostOptions): Promise<HostLifecycle> {
-  const logger = quietRuntimeLogger();
+  const logger = quietRuntimeLogger(startupDiagnostics(line => context.error(line), context.dataDir));
   if (!await options.auth.getToken()) throw new Error('Sign in to Cindy before starting serve.');
   const owner = options.auth.captureOwner();
   const storageScope = options.auth.storageScope();
@@ -70,6 +71,9 @@ export async function createCliHost(context: HostCommandContext, options: CliHos
       await provider.dispose(); throw new Error('Share quota preferences could not be loaded.');
     });
   const host = createRemoteAgentHost({
+    incrementalStartupBatch: true,
+    localGuestAllocation: true,
+    log: { debug: (message, fields) => logger.debug(message, fields), info() {}, warn() {} },
     readLimits: () => ({ ...DEFAULT_REMOTE_AGENT_LIMITS, idleMinutes: context.config.idleMinutes ?? DEFAULT_REMOTE_AGENT_LIMITS.idleMinutes }),
     runsRoot: path.join(context.dataDir, 'accounts', createHash('sha256').update(storageScope).digest('hex'), 'remote-agent'),
     captureOwner: () => owner,

@@ -11,6 +11,25 @@ export interface StartupExecServerStats {
   connections: number;
   answered: number;
   forwarded: number;
+  shortcutAnswered?: number;
+  batch?: StartupExecServerBatchStats;
+}
+
+export interface StartupExecServerBatchStats {
+  incrementalEnabled?: boolean;
+  batches?: number;
+  budgetExhausted?: number;
+  connections: number;
+  attempted: number;
+  prefetched: number;
+  answered: number;
+  notFound: number;
+  nonNotFound: number;
+  uriMismatch: number;
+  rejectedUri: number;
+  scopeMismatch: number;
+  unprefetched: number;
+  stopped: Partial<Record<'startup-complete' | 'process-start' | 'write' | 'oversize' | 'invalid-message', number>>;
 }
 
 /** 本机单调时钟计时；只接收关联 ID 和固定阶段名，不接收路径、配置、凭证或错误正文。 */
@@ -20,6 +39,7 @@ export function remoteAgentStartupTiming(
     side: 'controller' | 'transport' | 'host';
     kind: string;
     sessionId?: string;
+    engineSessionId?: string;
     runId?: string;
     reconnect?: boolean;
   },
@@ -30,6 +50,7 @@ export function remoteAgentStartupTiming(
     side: context.side,
     kind: context.kind,
     ...(context.sessionId ? { sessionRef: context.sessionId.slice(0, 8) } : {}),
+    ...(context.engineSessionId ? { engineSessionRef: context.engineSessionId.slice(0, 8) } : {}),
     ...(context.runId ? { runRef: context.runId.slice(0, 8) } : {}),
     ...(context.reconnect !== undefined ? { reconnect: context.reconnect } : {}),
   };
@@ -62,7 +83,10 @@ export function remoteAgentStartupTiming(
         status,
         durationMs: Math.round(performance.now() - started),
         stagesMs: { ...stagesMs },
-        ...(execServer ? { execServer: { ...execServer } } : {}),
+        ...(execServer ? { execServer: {
+          ...execServer,
+          ...(execServer.batch ? { batch: { ...execServer.batch, stopped: { ...execServer.batch.stopped } } } : {}),
+        } } : {}),
       });
     },
   };

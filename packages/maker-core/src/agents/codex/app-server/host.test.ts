@@ -113,6 +113,7 @@ class NotificationTransport implements Transport {
 
   constructor(
     private readonly resultForMethod?: (method: string) => unknown,
+    private readonly userAgent = 'mock-codex/test',
   ) {}
 
   async writeLine(line: string): Promise<void> {
@@ -121,7 +122,7 @@ class NotificationTransport implements Transport {
     if (msg.id == null) return;
     const result = msg.method === 'initialize'
       ? {
-          userAgent: 'mock-codex/test',
+          userAgent: this.userAgent,
           codexHome: '/tmp/codex-home',
           platformOs: 'linux',
         }
@@ -188,6 +189,53 @@ describe('concrete writer candidate proof', () => {
 });
 
 describe('AppServerHost isolated account lifecycle', () => {
+  // Diagnose cold startup without weakening the pre-token ephemeral-policy gate.
+  // Existing lifecycle tests cannot reveal a stalled stage to CLI operators.
+  // Minimal input: initialize + persistent/ephemeral config; unit, fake transport.
+  it.each([false, true])('times startup authentication while preserving its gate (persistent: %s)', async persistent => {
+    const info = vi.fn();
+    const transport = new NotificationTransport(method => method === 'config/read'
+      ? { config: { cli_auth_credentials_store: persistent ? 'file' : 'ephemeral' } }
+      : { type: 'chatgptAuthTokens' }, 'codex_cli_rs/0.166.0 (/tmp/private-native-runtime)');
+    const host = new AppServerHost({ createTransport: () => transport, logger: { ...logger, info },
+      startupSessionId: 'session-private-suffix', requireEphemeralAuth: true,
+      clientInfo: { name: 'test', version: '0.0.0' },
+      externalAuth: { readTokens: async () => ({ accessToken: 'never-log-token', chatgptAccountId: 'never-log-account' }) },
+    });
+    try {
+      if (persistent) await expect(host.ensureStarted()).rejects.toThrow('isolated account authentication');
+      else await host.ensureStarted();
+      const entries = info.mock.calls.filter(([message]) => message === 'remote agent startup timing')
+        .map(([, fields]) => fields as Record<string, unknown>);
+      const completed = entries.filter(entry => entry.status !== 'started');
+      expect(completed.map(entry => entry.stage)).toEqual(persistent
+        ? ['process-spawn', 'initialize', 'ephemeral-auth-config']
+        : ['process-spawn', 'initialize', 'ephemeral-auth-config', 'external-auth']);
+      expect(completed.at(-1)?.status).toBe(persistent ? 'failed' : 'ok');
+      expect(completed.find(entry => entry.stage === 'ephemeral-auth-config')?.runtimeVersion).toBe('0.166.0');
+      for (const entry of entries) {
+        expect(entry.sessionRef).toBe('session-');
+        expect(String(entry.hostRef)).toHaveLength(8);
+        expect(entry.elapsedMs).toEqual(expect.any(Number));
+      }
+      const output = JSON.stringify(entries);
+      for (const secret of ['never-log-token', 'never-log-account', 'private-suffix', '/tmp', 'cli_auth_credentials_store']) expect(output).not.toContain(secret);
+      const methods = transport.lines.map(line => JSON.parse(line).method);
+      expect(methods.includes('account/login/start')).toBe(!persistent);
+    } finally { await host.retire(); }
+  });
+
+  it('preserves startup success when the diagnostic sink throws', async () => {
+    const transport = new NotificationTransport(() => ({ config: { cli_auth_credentials_store: 'ephemeral' } }));
+    const host = new AppServerHost({ createTransport: () => transport,
+      logger: { ...logger, info(message) { if (message === 'remote agent startup timing') throw new Error('sink unavailable'); } },
+      startupSessionId: 'session', requireEphemeralAuth: true,
+      clientInfo: { name: 'test', version: '0.0.0' },
+    });
+    try { await expect(host.ensureStarted()).resolves.toMatchObject({ userAgent: 'mock-codex/test' }); }
+    finally { await host.retire(); }
+  });
+
   it.each([false, true])('rejects persistent native policy before task dispatch (OAuth: %s)', async oauth => {
     const transport = new NotificationTransport(() => ({ config: { cli_auth_credentials_store: 'file' } }));
     const readTokens = vi.fn(async () => ({ accessToken: 'fixture-token', chatgptAccountId: 'account-b' }));

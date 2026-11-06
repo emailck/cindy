@@ -24,6 +24,7 @@
  */
 
 import { randomUUID } from 'node:crypto';
+import { codexStartupTiming } from '../startup-timing.js';
 
 import type { Logger } from '../../../interfaces/logger.js';
 import type { CodexSessionMcpConfigInput, CodexSubagentRoutingProfile } from '../../base-agent.js';
@@ -245,6 +246,8 @@ export interface ThreadSubscription {
 }
 
 export interface AppServerHostOptions {
+  /** Correlation only; diagnostics emit at most its first eight characters. */
+  startupSessionId?: string;
   /** Applied before the host becomes ready, and reapplied after every transport restart. */
   externalAuth?: CodexExternalAuth;
   /** Required for every cross-home runtime, including gateway-only routes. */
@@ -678,6 +681,8 @@ export class AppServerHost {
     nativeAttempt = 0,
     nativeEpoch = this.nativeInitializationEpoch,
   ): Promise<InitializeResponse> {
+    const timing = codexStartupTiming(this.opts.startupSessionId ? this.opts.logger : undefined,
+      this.opts.startupSessionId, this.connectionId);
     const client = new AppServerClient({
       createTransport: () => this.opts.createTransport(this.modelProvider),
       logger: this.opts.logger,
@@ -874,7 +879,15 @@ export class AppServerHost {
     // start() = create transport + wire onLine/onStderr/onClose. 必须在所有
     // onNotification/setRequestHandler 之后, 在 initialize() 之前。等价于原版
     // 的 client.spawnProcess()。
-    client.start();
+    // This measures synchronous spawn submission only; initialize includes readiness.
+    const spawnDone = timing.begin('process-spawn');
+    try {
+      client.start();
+      spawnDone('ok');
+    } catch (error) {
+      spawnDone('failed');
+      throw error;
+    }
 
     const mergedCapabilities: InitializeCapabilities = {
       experimentalApi: true,
@@ -883,7 +896,7 @@ export class AppServerHost {
     };
     let resp: InitializeResponse;
     try {
-      resp = await client.initialize(this.opts.clientInfo, mergedCapabilities);
+      resp = await timing.measure('initialize', () => client.initialize(this.opts.clientInfo, mergedCapabilities));
     } catch (error) {
       if (!client.nativeSqliteInitializationFailed()) throw error;
       // No task/config/authentication RPC has been submitted. The transport
@@ -896,13 +909,16 @@ export class AppServerHost {
       this.logger.warn('retrying exited native SQLite initialization', { attempt: nativeAttempt + 2, maxAttempts: 3 });
       return this.bootstrap(capabilities, nativeAttempt + 1, nativeEpoch);
     }
+    timing.setRuntimeVersion(resp.userAgent);
     if (this.opts.requireEphemeralAuth || this.externalAuth) {
       // Requirements can override CLI configuration. Reject before any task RPC
       // or token installation; initialization has already loaded native config.
-      await assertCodexEphemeralAuth((method, params) => client.request(method, params, { timeoutMs: 10_000 }));
+      await timing.measure('ephemeral-auth-config', () =>
+        assertCodexEphemeralAuth((method, params) => client.request(method, params, { timeoutMs: 10_000 })));
     }
     if (this.externalAuth) {
-      await this.externalAuth.authenticate((method, params) => client.request(method, params, { timeoutMs: 10_000 }));
+      await timing.measure('external-auth', () =>
+        this.externalAuth!.authenticate((method, params) => client.request(method, params, { timeoutMs: 10_000 })));
       if (this.client !== client || this.shuttingDown || this.retired) {
         throw new Error('Codex account authentication host has retired');
       }
