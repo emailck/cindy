@@ -90,11 +90,27 @@ not claim the Desktop client's full locale coverage.
 ## Optional HTTP Proxy
 
 Under Settings, enter an `http://host:port` CONNECT Proxy and optional username
-and password. Each instance explicitly selects No Proxy or Use default Proxy.
-Empty password retains the saved password; Clear default Proxy removes the
-configuration. Credentials are encrypted on the manager host and are never
-returned by the settings API. Settings apply to future starts and logins; restart
-running instances to pick up changes. Keep loopback destinations direct.
+and password. Each instance selects No Proxy, Use default Proxy, or Custom Proxy.
+Custom Proxy has its own address and optional authentication, independent of the
+global default and other instances. Stop an instance before changing its Proxy.
+Existing instances keep their current selection after upgrading.
+
+Blank username/password fields preserve saved authentication when the address is
+unchanged; Clear saved authentication removes both. Changing the address does not
+carry old credentials to the new Proxy. Clear default Proxy removes the global
+configuration. Credentials use the existing encrypted manager store and are never
+returned by the API. Custom configuration and its instance selection are saved in
+one transaction, without changing the existing database schema or account volumes.
+Settings apply to future starts and logins; restart running instances to pick up
+changes. Selecting an unconfigured default fails explicitly. Keep loopback destinations direct.
+
+Test Proxy checks the currently entered configuration without saving it. A temporary
+container on the same Docker bridge as the instances queries `https://ipwho.is/`
+through HTTP CONNECT and displays the exit IP and estimated country, region and
+city. The test has no account/profile mounts, verifies TLS, follows no redirects,
+and does not retry directly if the Proxy fails. The external service sees the Proxy
+exit IP; an IP location estimate is not proof of the machine's physical location.
+The temporary container is removed after the test, including on failure.
 
 The address must be HTTP; it can tunnel HTTPS destinations. HTTPS-to-Proxy
 transport (`https://`), SOCKS, and forced egress for arbitrary child processes are

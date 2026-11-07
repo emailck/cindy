@@ -1,4 +1,5 @@
 import { readClaudeQuota } from './claude-quota';
+import { requestClaudeApiModels } from './claude-api-request';
 import { emptyQuota } from '../share-quota';
 import { randomBytes } from 'node:crypto';
 import type { RemoteAgentHostDeps } from '@cindy/remote-agent-host';
@@ -74,9 +75,7 @@ export async function createClaudeProvider(dataDir: string, logger: Logger, env:
       const url = new URL(`${base.href.replace(/\/$/, '')}/v1/models`);
       url.searchParams.set('limit', '100');
       if (after) url.searchParams.set('after_id', after);
-      const response = await fetch(url, { headers: { 'x-api-key': env.ANTHROPIC_API_KEY!, 'anthropic-version': '2023-06-01' }, redirect: 'error', signal: AbortSignal.timeout(15_000) });
-      if (!response.ok) throw new Error('Anthropic model discovery failed. Check API credentials and endpoint.');
-      const body = await response.json() as { data?: unknown[]; has_more?: boolean; last_id?: string };
+      const body = await requestClaudeApiModels(url, env.ANTHROPIC_API_KEY!) as { data?: unknown[]; has_more?: boolean; last_id?: string };
       if (!Array.isArray(body.data)) throw new Error('Invalid Anthropic model discovery response.');
       entries.push(...body.data.map(value => {
         const entry = value as { id?: string; display_name?: string };

@@ -5,7 +5,7 @@ import { dirname, isAbsolute, join } from 'node:path';
 import type { RuntimeInstance, RuntimeProxy } from './runtime-types.js';
 export interface InstanceRecord extends RuntimeInstance {
     name: string;
-    proxyMode: 'none' | 'default';
+    proxyMode: 'none' | 'default' | 'custom';
     createdAt: string;
 }
 export function privateDirectory(path: string): string {
@@ -51,6 +51,10 @@ export class Store {
         chmodSync(dbPath, 0o600);
         this.db.exec('PRAGMA journal_mode=DELETE; PRAGMA synchronous=FULL; CREATE TABLE IF NOT EXISTS metadata (key TEXT PRIMARY KEY,value TEXT NOT NULL); CREATE TABLE IF NOT EXISTS instances (id TEXT PRIMARY KEY,name TEXT NOT NULL,engine TEXT NOT NULL,proxyMode TEXT NOT NULL,createdAt TEXT NOT NULL);');
     }
+    transaction(run: () => void) {
+        this.db.exec('BEGIN IMMEDIATE');
+        try { run(); this.db.exec('COMMIT'); } catch (error) { this.db.exec('ROLLBACK'); throw error; }
+    }
     close() { this.db.close(); }
     get(key: string): string | undefined { return (this.db.prepare('SELECT value FROM metadata WHERE key=?').get(key) as {
         value: string;
@@ -60,8 +64,8 @@ export class Store {
     update(instance: InstanceRecord) { this.db.prepare('UPDATE instances SET name=?,proxyMode=? WHERE id=?').run(instance.name, instance.proxyMode, instance.id); }
     list(): InstanceRecord[] { return this.db.prepare('SELECT * FROM instances ORDER BY createdAt,id').all() as unknown as InstanceRecord[]; }
     instance(id: string): InstanceRecord | undefined { return this.db.prepare('SELECT * FROM instances WHERE id=?').get(id) as unknown as InstanceRecord | undefined; }
-    proxy(): RuntimeProxy | null {
-        const encrypted = this.get('proxy');
+    proxy(instanceId?: string): RuntimeProxy | null {
+        const encrypted = this.get(instanceId ? `proxy:${instanceId}` : 'proxy');
         if (!encrypted)
             return null;
         const buffer = Buffer.from(encrypted, 'base64');
@@ -69,13 +73,14 @@ export class Store {
         decipher.setAuthTag(buffer.subarray(12, 28));
         return JSON.parse(Buffer.concat([decipher.update(buffer.subarray(28)), decipher.final()]).toString()) as RuntimeProxy;
     }
-    setProxy(proxy: RuntimeProxy | null) {
+    setProxy(proxy: RuntimeProxy | null, instanceId?: string) {
+        const key = instanceId ? `proxy:${instanceId}` : 'proxy';
         if (!proxy) {
-            this.db.prepare('DELETE FROM metadata WHERE key=?').run('proxy');
+            this.db.prepare('DELETE FROM metadata WHERE key=?').run(key);
             return;
         }
         const iv = randomBytes(12), cipher = createCipheriv('aes-256-gcm', this.key, iv);
         const ciphertext = Buffer.concat([cipher.update(JSON.stringify(proxy)), cipher.final()]);
-        this.set('proxy', Buffer.concat([iv, cipher.getAuthTag(), ciphertext]).toString('base64'));
+        this.set(key, Buffer.concat([iv, cipher.getAuthTag(), ciphertext]).toString('base64'));
     }
 }

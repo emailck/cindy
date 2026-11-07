@@ -1,0 +1,1453 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <meta name="color-scheme" content="light dark" />
+  <title>Cindy CLI 实例管理 · UI 与交互优化样例</title>
+  <style>
+    /* 严格遵循 DESIGN.md §2 / §3 / §4 / §5 语义 Token */
+    :root {
+      color-scheme: light;
+      --surface: #f8f8f6;
+      --surface-elevated: #ffffff;
+      --surface-hover: #f2f2ef;
+      --surface-chip: #e5e5e5;
+      --border-default: #d7d7d4;
+      --text-primary: #262626;
+      --text-secondary-mid: #525252;
+      --text-secondary: #737373;
+      --text-tertiary: #a3a3a3;
+      --text-placeholder: #c4c4c4;
+      --accent-cta-bg-pure: #000000;
+      --accent-pure-cta-fg: #ffffff;
+      --button-cta-hover: #262626;
+      --button-primary-hover: #d7d7d6;
+      --button-secondary-hover: #f2f2ef;
+      --focus-ring: #417cdd;
+      --focus-ring-soft: rgba(65, 124, 221, 0.5);
+      --status-success: #2aae5b;
+      --warning-fg: #f3a115;
+      --warning-accent: #ea6b17;
+      --error-fg: #d91f37;
+      --error-border: rgba(217, 31, 55, 0.35);
+      --overlay-modal: rgba(0, 0, 0, 0.5);
+      --shadow-menu: 0 8px 24px rgba(0, 0, 0, 0.12), 0 2px 6px rgba(0, 0, 0, 0.06);
+      --segmented-track: rgba(0, 0, 0, 0.06);
+      --segmented-selected-bg: #ffffff;
+      --segmented-selected-shadow: 0 1px 3px rgba(0, 0, 0, 0.08);
+      --terminal-bg: #181817;
+      --terminal-fg: #e5e5e2;
+    }
+
+    :root[data-theme="dark"] {
+      color-scheme: dark;
+      --surface: #1f1f1e;
+      --surface-elevated: #2c2c2a;
+      --surface-hover: #353533;
+      --surface-chip: #3c3c3a;
+      --border-default: #3c3c3a;
+      --text-primary: #d4d4d4;
+      --text-secondary-mid: #b8b8b5;
+      --text-secondary: #a3a3a3;
+      --text-tertiary: #737373;
+      --text-placeholder: #525252;
+      --accent-cta-bg-pure: #ffffff;
+      --accent-pure-cta-fg: #000000;
+      --button-cta-hover: #e5e5e5;
+      --button-primary-hover: #4a4a48;
+      --button-secondary-hover: #353533;
+      --focus-ring: #417cdd;
+      --focus-ring-soft: rgba(65, 124, 221, 0.5);
+      --status-success: #55c886;
+      --warning-fg: #f3a115;
+      --warning-accent: #ea6b17;
+      --error-fg: #ff667a;
+      --error-border: rgba(255, 102, 122, 0.4);
+      --overlay-modal: rgba(0, 0, 0, 0.7);
+      --shadow-menu: 0 8px 24px rgba(0, 0, 0, 0.45), 0 2px 6px rgba(0, 0, 0, 0.3);
+      --segmented-track: rgba(0, 0, 0, 0.28);
+      --segmented-selected-bg: #353533;
+      --segmented-selected-shadow: 0 1px 3px rgba(0, 0, 0, 0.35);
+      --terminal-bg: #141413;
+      --terminal-fg: #d4d4d4;
+    }
+
+    * {
+      box-sizing: border-box;
+    }
+    [hidden] {
+      display: none !important;
+    }
+    body {
+      margin: 0;
+      background: var(--surface);
+      color: var(--text-primary);
+      font: 14px/1.5 Inter, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      -webkit-font-smoothing: antialiased;
+    }
+    button, input, select {
+      font: inherit;
+      color: inherit;
+    }
+    button {
+      cursor: pointer;
+    }
+    button:focus-visible, input:focus-visible, select:focus-visible {
+      outline: 2px solid var(--focus-ring-soft);
+      outline-offset: 2px;
+    }
+
+    /* ==================== 顶部交互样例控制栏（仅供预览切换） ==================== */
+    .demo-banner {
+      position: sticky;
+      top: 0;
+      z-index: 90;
+      background: var(--surface-elevated);
+      border-bottom: 1px solid var(--border-default);
+      padding: 8px 24px;
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      flex-wrap: wrap;
+      font-size: 12px;
+    }
+    .demo-badge {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      padding: 3px 10px;
+      border-radius: 9999px;
+      background: var(--surface-chip);
+      font-weight: 600;
+      color: var(--text-primary);
+    }
+    .demo-group {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      color: var(--text-secondary);
+    }
+    .demo-seg {
+      display: inline-flex;
+      padding: 2px;
+      border-radius: 9999px;
+      background: var(--segmented-track);
+      gap: 2px;
+    }
+    .demo-seg button {
+      border: 0;
+      background: transparent;
+      padding: 4px 12px;
+      border-radius: 9999px;
+      font-size: 12px;
+      font-weight: 500;
+      color: var(--text-secondary);
+      min-height: 26px;
+    }
+    .demo-seg button[aria-pressed="true"] {
+      background: var(--segmented-selected-bg);
+      color: var(--text-primary);
+      box-shadow: var(--segmented-selected-shadow);
+    }
+    .demo-spacer {
+      flex: 1;
+    }
+
+    /* ==================== 浮动状态 Toast（消除原本页面上下抖动） ==================== */
+    .toast-layer {
+      position: fixed;
+      top: 60px;
+      right: 24px;
+      z-index: 120;
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+      pointer-events: none;
+    }
+    .toast-pill {
+      pointer-events: auto;
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      padding: 8px 16px;
+      border-radius: 9999px;
+      background: var(--surface-elevated);
+      border: 1px solid var(--border-default);
+      box-shadow: var(--shadow-menu);
+      font-size: 13px;
+      font-weight: 500;
+      color: var(--text-primary);
+    }
+    .toast-dot {
+      width: 8px;
+      height: 8px;
+      border-radius: 50%;
+      background: var(--status-success);
+      flex-shrink: 0;
+    }
+    .toast-dot.pending {
+      background: var(--warning-accent);
+    }
+    .toast-dot.error {
+      background: var(--error-fg);
+    }
+
+    /* ==================== 通用按钮与表单控件（DESIGN.md §4） ==================== */
+    .btn {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      gap: 6px;
+      height: 32px;
+      padding: 0 18px;
+      border-radius: 9999px;
+      border: 1px solid var(--border-default);
+      background: var(--surface-elevated);
+      color: var(--text-primary);
+      font-size: 13px;
+      font-weight: 500;
+      white-space: nowrap;
+      transition: background 120ms ease, border-color 120ms ease;
+    }
+    .btn:hover:not(:disabled) {
+      background: var(--button-secondary-hover);
+    }
+    .btn.lg {
+      height: 36px;
+      padding: 0 22px;
+    }
+    .btn.sm {
+      height: 28px;
+      padding: 0 12px;
+      font-size: 12px;
+    }
+    .btn.primary {
+      background: var(--surface-chip);
+      border-color: var(--surface-chip);
+    }
+    .btn.primary:hover:not(:disabled) {
+      background: var(--button-primary-hover);
+      border-color: var(--button-primary-hover);
+    }
+    .btn.cta {
+      background: var(--accent-cta-bg-pure);
+      border-color: var(--accent-cta-bg-pure);
+      color: var(--accent-pure-cta-fg);
+    }
+    .btn.cta:hover:not(:disabled) {
+      background: var(--button-cta-hover);
+      border-color: var(--button-cta-hover);
+    }
+    .btn.danger-outline {
+      color: var(--error-fg);
+      border-color: var(--border-default);
+    }
+    .btn.danger-outline:hover:not(:disabled) {
+      border-color: var(--error-border);
+      background: var(--button-secondary-hover);
+    }
+    .btn:disabled {
+      opacity: 0.55;
+      cursor: default;
+    }
+
+    .input, .select {
+      height: 36px;
+      width: 100%;
+      padding: 0 14px;
+      border-radius: 9999px;
+      border: 1px solid var(--border-default);
+      background: var(--surface-elevated);
+      color: var(--text-primary);
+      font-size: 13px;
+    }
+    .input::placeholder {
+      color: var(--text-placeholder);
+    }
+    .input:disabled, .select:disabled {
+      opacity: 0.6;
+      cursor: default;
+    }
+    .field {
+      display: flex;
+      flex-direction: column;
+      gap: 6px;
+      font-size: 13px;
+      font-weight: 500;
+    }
+    .field-hint {
+      font-size: 12px;
+      font-weight: 400;
+      color: var(--text-secondary);
+      line-height: 1.45;
+    }
+
+    /* ==================== 状态徽章（Status Pill） ==================== */
+    .badge {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      height: 24px;
+      padding: 0 10px;
+      border-radius: 9999px;
+      font-size: 12px;
+      font-weight: 500;
+      background: var(--surface-chip);
+      color: var(--text-primary);
+      white-space: nowrap;
+    }
+    .badge.subtle {
+      background: transparent;
+      border: 1px solid var(--border-default);
+      color: var(--text-secondary);
+    }
+    .dot {
+      width: 7px;
+      height: 7px;
+      border-radius: 50%;
+      background: var(--text-tertiary);
+      flex-shrink: 0;
+    }
+    .dot.ok {
+      background: var(--status-success);
+    }
+    .dot.warn {
+      background: var(--warning-fg);
+    }
+    .dot.busy {
+      background: var(--warning-accent);
+    }
+    .dot.err {
+      background: var(--error-fg);
+    }
+
+    /* ==================== 顶部应用导航 Header ==================== */
+    .app-header {
+      padding: 16px 32px;
+      border-bottom: 1px solid var(--border-default);
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 16px;
+      flex-wrap: wrap;
+    }
+    .app-brand {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+    }
+    .app-logo {
+      width: 34px;
+      height: 34px;
+      border-radius: 10px;
+      background: var(--accent-cta-bg-pure);
+      color: var(--accent-pure-cta-fg);
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      font-weight: 600;
+      font-size: 15px;
+      letter-spacing: -0.02em;
+    }
+    .app-brand h1 {
+      font-size: 18px;
+      font-weight: 600;
+      margin: 0;
+      line-height: 1.25;
+    }
+    .app-brand p {
+      font-size: 12px;
+      color: var(--text-secondary);
+      margin: 2px 0 0;
+    }
+    .header-controls {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      flex-wrap: wrap;
+    }
+    .header-select {
+      height: 32px;
+      width: auto;
+      padding: 0 12px;
+      font-size: 12px;
+    }
+
+    /* ==================== 列表页 -> 详情页 两级页面结构 ==================== */
+    .page-container {
+      max-width: 1140px;
+      margin: 0 auto;
+      padding: 28px 32px 56px;
+      display: flex;
+      flex-direction: column;
+      gap: 20px;
+    }
+
+    /* 一级页面：实例列表页顶部工具栏与统计条 */
+    .list-page-header {
+      display: flex;
+      align-items: flex-end;
+      justify-content: space-between;
+      gap: 16px;
+      flex-wrap: wrap;
+    }
+    .list-page-title h2 {
+      margin: 0;
+      font-size: 20px;
+      font-weight: 600;
+    }
+    .list-page-title p {
+      margin: 4px 0 0;
+      font-size: 13px;
+      color: var(--text-secondary);
+    }
+    .list-page-actions {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      flex-wrap: wrap;
+    }
+
+    .list-toolbar {
+      background: var(--surface-elevated);
+      border: 1px solid var(--border-default);
+      border-radius: 12px;
+      padding: 12px 16px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      flex-wrap: wrap;
+    }
+    .filter-pills {
+      display: inline-flex;
+      padding: 3px;
+      border-radius: 9999px;
+      background: var(--segmented-track);
+      gap: 2px;
+      flex-wrap: wrap;
+    }
+    .filter-pills button {
+      border: 0;
+      background: transparent;
+      height: 28px;
+      padding: 0 14px;
+      border-radius: 9999px;
+      font-size: 12px;
+      font-weight: 500;
+      color: var(--text-secondary);
+    }
+    .filter-pills button[aria-pressed="true"] {
+      background: var(--segmented-selected-bg);
+      color: var(--text-primary);
+      box-shadow: var(--segmented-selected-shadow);
+    }
+    .toolbar-right {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      flex-wrap: wrap;
+    }
+    .search-input {
+      width: 220px;
+      height: 32px;
+      font-size: 12px;
+    }
+
+    /* 一级页面：实例列表表格/行卡片 */
+    .instance-table-card {
+      background: var(--surface-elevated);
+      border: 1px solid var(--border-default);
+      border-radius: 12px;
+      overflow: hidden;
+    }
+    .instance-list-head {
+      display: grid;
+      grid-template-columns: minmax(210px, 1.4fr) minmax(120px, 0.85fr) minmax(175px, 1.15fr) minmax(175px, 1.15fr) minmax(220px, 1.35fr);
+      gap: 12px;
+      padding: 11px 20px;
+      background: var(--surface);
+      border-bottom: 1px solid var(--border-default);
+      font-size: 12px;
+      font-weight: 500;
+      color: var(--text-secondary);
+    }
+    .instance-row-card {
+      display: grid;
+      grid-template-columns: minmax(210px, 1.4fr) minmax(120px, 0.85fr) minmax(175px, 1.15fr) minmax(175px, 1.15fr) minmax(220px, 1.35fr);
+      gap: 12px;
+      align-items: center;
+      padding: 16px 20px;
+      background: var(--surface-elevated);
+      cursor: pointer;
+      transition: background 120ms ease;
+    }
+    .instance-row-card + .instance-row-card {
+      border-top: 1px solid var(--border-default);
+    }
+    .instance-row-card:hover {
+      background: var(--surface-hover);
+    }
+    .row-col-main {
+      display: flex;
+      flex-direction: column;
+      gap: 4px;
+      min-width: 0;
+    }
+    .row-name-line {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      flex-wrap: wrap;
+    }
+    .row-name {
+      font-size: 15px;
+      font-weight: 600;
+      color: var(--text-primary);
+    }
+    .row-subline {
+      font-size: 12px;
+      color: var(--text-secondary);
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      flex-wrap: wrap;
+    }
+    .row-error-hint {
+      font-size: 11px;
+      color: var(--error-fg);
+      margin-top: 2px;
+    }
+    .row-account-cell {
+      display: flex;
+      flex-direction: column;
+      gap: 2px;
+      min-width: 0;
+    }
+    .row-account-status {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      font-size: 13px;
+      font-weight: 500;
+      color: var(--text-primary);
+    }
+    .row-account-detail {
+      font-size: 12px;
+      color: var(--text-secondary);
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+      padding-left: 13px;
+    }
+    .row-actions-cell {
+      display: flex;
+      align-items: center;
+      justify-content: flex-end;
+      gap: 8px;
+      flex-wrap: wrap;
+    }
+
+    /* 二级页面：详情页顶部返回导航栏 */
+    .detail-breadcrumb-bar {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      flex-wrap: wrap;
+      padding-bottom: 4px;
+    }
+    .breadcrumb-left {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      flex-wrap: wrap;
+    }
+    .breadcrumb-sep {
+      color: var(--text-tertiary);
+      font-size: 13px;
+    }
+    .breadcrumb-current {
+      font-size: 14px;
+      font-weight: 600;
+      color: var(--text-primary);
+    }
+    .breadcrumb-right {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      font-size: 12px;
+      color: var(--text-secondary);
+    }
+
+    /* 二级页面详情主区 */
+    .detail-pane {
+      width: 100%;
+      display: flex;
+      flex-direction: column;
+      gap: 24px;
+    }
+
+    /* 顶部实例概览头卡 */
+    .hero-card {
+      background: var(--surface-elevated);
+      border: 1px solid var(--border-default);
+      border-radius: 12px;
+      padding: 20px 24px;
+      display: flex;
+      flex-direction: column;
+      gap: 16px;
+    }
+    .hero-top {
+      display: flex;
+      align-items: flex-start;
+      justify-content: space-between;
+      gap: 16px;
+      flex-wrap: wrap;
+    }
+    .hero-title-row {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      flex-wrap: wrap;
+    }
+    .hero-title-row h2 {
+      font-size: 20px;
+      font-weight: 600;
+      margin: 0;
+    }
+    .hero-sub {
+      margin: 6px 0 0;
+      font-size: 13px;
+      color: var(--text-secondary);
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      flex-wrap: wrap;
+    }
+    .hero-actions {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      flex-wrap: wrap;
+    }
+    .hero-footer {
+      padding-top: 14px;
+      border-top: 1px solid var(--border-default);
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      flex-wrap: wrap;
+      font-size: 12px;
+      color: var(--text-secondary);
+    }
+    .readiness-steps {
+      display: flex;
+      align-items: center;
+      gap: 14px;
+      flex-wrap: wrap;
+    }
+    .step-item {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      font-weight: 500;
+      color: var(--text-primary);
+    }
+
+    /* 错误提示卡（DESIGN.md §4 Error notices） */
+    .error-card {
+      background: var(--surface-elevated);
+      border: 1px solid var(--error-border);
+      border-radius: 12px;
+      padding: 14px 18px;
+      display: flex;
+      align-items: flex-start;
+      justify-content: space-between;
+      gap: 12px;
+    }
+    .error-card-body {
+      display: flex;
+      align-items: flex-start;
+      gap: 10px;
+      font-size: 13px;
+    }
+    .error-card-title {
+      font-weight: 600;
+      color: var(--text-primary);
+      margin-bottom: 2px;
+    }
+    .error-card-desc {
+      color: var(--text-secondary);
+      font-size: 12px;
+    }
+
+    /* 分段 Tab 导航（方案 B 视图） */
+    .view-tabs {
+      display: inline-flex;
+      align-self: flex-start;
+      padding: 3px;
+      border-radius: 9999px;
+      background: var(--segmented-track);
+      gap: 2px;
+    }
+    .view-tabs button {
+      border: 0;
+      background: transparent;
+      height: 30px;
+      padding: 0 16px;
+      border-radius: 9999px;
+      font-size: 13px;
+      font-weight: 500;
+      color: var(--text-secondary);
+    }
+    .view-tabs button[aria-selected="true"] {
+      background: var(--segmented-selected-bg);
+      color: var(--text-primary);
+      box-shadow: var(--segmented-selected-shadow);
+    }
+
+    /* 区块标题 */
+    .section-block {
+      display: flex;
+      flex-direction: column;
+      gap: 12px;
+    }
+    .section-header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      flex-wrap: wrap;
+    }
+    .section-header h3 {
+      font-size: 16px;
+      font-weight: 600;
+      margin: 0;
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+    .section-sub {
+      font-size: 12px;
+      color: var(--text-secondary);
+      margin: 0;
+    }
+
+    /* ==================== 双列账号卡片（核心优化点 1：状态与直登合一） ==================== */
+    .accounts-grid {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 16px;
+    }
+    .account-card {
+      background: var(--surface-elevated);
+      border: 1px solid var(--border-default);
+      border-radius: 12px;
+      padding: 18px 20px;
+      display: flex;
+      flex-direction: column;
+      justify-content: space-between;
+      gap: 16px;
+      min-height: 210px;
+    }
+    .account-card-head {
+      display: flex;
+      align-items: flex-start;
+      justify-content: space-between;
+      gap: 12px;
+    }
+    .account-card-title {
+      font-size: 15px;
+      font-weight: 600;
+      margin: 0;
+    }
+    .account-card-role {
+      font-size: 12px;
+      color: var(--text-secondary);
+      margin-top: 2px;
+    }
+    .account-identity-box {
+      padding: 12px 14px;
+      border-radius: 8px;
+      background: var(--surface);
+      border: 1px solid var(--border-default);
+      display: flex;
+      flex-direction: column;
+      gap: 6px;
+    }
+    .account-primary-name {
+      font-size: 14px;
+      font-weight: 600;
+      color: var(--text-primary);
+    }
+    .account-email {
+      font-size: 12px;
+      color: var(--text-secondary);
+    }
+    .account-meta-dl {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 6px 16px;
+      margin: 4px 0 0;
+      font-size: 12px;
+      color: var(--text-secondary);
+    }
+    .account-meta-dl strong {
+      color: var(--text-primary);
+      font-weight: 500;
+    }
+    .account-empty-box {
+      padding: 16px 14px;
+      border-radius: 8px;
+      background: var(--surface);
+      border: 1px dashed var(--border-default);
+      color: var(--text-secondary);
+      font-size: 13px;
+      line-height: 1.5;
+    }
+    .account-card-actions {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      flex-wrap: wrap;
+      padding-top: 4px;
+    }
+    .account-card-actions .select {
+      width: auto;
+      height: 32px;
+      min-width: 115px;
+    }
+    .account-card-actions .input {
+      height: 32px;
+      flex: 1 1 160px;
+    }
+
+    /* ==================== 登录终端面板（核心优化点 2：醒目授权链接置顶） ==================== */
+    .terminal-card {
+      background: var(--surface-elevated);
+      border: 1px solid var(--border-default);
+      border-radius: 12px;
+      overflow: hidden;
+    }
+    .terminal-header {
+      padding: 14px 20px;
+      border-bottom: 1px solid var(--border-default);
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      flex-wrap: wrap;
+    }
+    .terminal-title-group {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+    }
+    .terminal-title-group h4 {
+      margin: 0;
+      font-size: 14px;
+      font-weight: 600;
+    }
+    .oauth-link-banner {
+      padding: 12px 20px;
+      background: var(--surface);
+      border-bottom: 1px solid var(--border-default);
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      flex-wrap: wrap;
+    }
+    .oauth-step-text {
+      display: flex;
+      flex-direction: column;
+      gap: 2px;
+      font-size: 13px;
+    }
+    .oauth-step-text strong {
+      font-weight: 600;
+    }
+    .oauth-step-text span {
+      font-size: 12px;
+      color: var(--text-secondary);
+    }
+    .terminal-screen {
+      background: var(--terminal-bg);
+      color: var(--terminal-fg);
+      font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+      font-size: 13px;
+      line-height: 1.55;
+      padding: 16px 20px;
+      height: 220px;
+      overflow-y: auto;
+      white-space: pre-wrap;
+      user-select: text;
+    }
+    .terminal-footer {
+      padding: 12px 20px;
+      border-top: 1px solid var(--border-default);
+      background: var(--surface-elevated);
+    }
+    .terminal-answer-row {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      margin-top: 10px;
+      flex-wrap: wrap;
+    }
+    .terminal-answer-row .input {
+      flex: 1 1 240px;
+      height: 32px;
+    }
+
+    /* ==================== 供应商分享与用量区（核心优化点 3） ==================== */
+    .card-panel {
+      background: var(--surface-elevated);
+      border: 1px solid var(--border-default);
+      border-radius: 12px;
+      padding: 20px 24px;
+      display: flex;
+      flex-direction: column;
+      gap: 20px;
+    }
+    .empty-state-banner {
+      background: var(--surface-elevated);
+      border: 1px solid var(--border-default);
+      border-radius: 12px;
+      padding: 20px 24px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 16px;
+      flex-wrap: wrap;
+    }
+    .invitation-box {
+      padding: 14px 16px;
+      border-radius: 10px;
+      background: var(--surface);
+      border: 1px solid var(--border-default);
+      display: flex;
+      flex-direction: column;
+      gap: 10px;
+    }
+    .invitation-row {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      flex-wrap: wrap;
+    }
+    .invitation-row .input {
+      flex: 1 1 280px;
+      height: 32px;
+      font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+      font-size: 12px;
+    }
+    .sub-heading {
+      font-size: 13px;
+      font-weight: 600;
+      color: var(--text-secondary);
+      margin: 0 0 8px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+    }
+    .list-box {
+      border: 1px solid var(--border-default);
+      border-radius: 10px;
+      overflow: hidden;
+    }
+    .list-row {
+      padding: 12px 16px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      flex-wrap: wrap;
+      background: var(--surface-elevated);
+    }
+    .list-row + .list-row {
+      border-top: 1px solid var(--border-default);
+    }
+    .person-info {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      min-width: 180px;
+    }
+    .avatar-circle {
+      width: 30px;
+      height: 30px;
+      border-radius: 50%;
+      background: var(--surface-chip);
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      font-size: 12px;
+      font-weight: 600;
+      flex-shrink: 0;
+    }
+    .person-meta {
+      display: flex;
+      flex-direction: column;
+      gap: 2px;
+    }
+    .person-meta strong {
+      font-size: 13px;
+      font-weight: 600;
+    }
+    .person-meta span {
+      font-size: 12px;
+      color: var(--text-secondary);
+    }
+    .pairing-actions {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      flex-wrap: wrap;
+    }
+    .code-input {
+      width: 110px !important;
+      height: 32px !important;
+      text-align: center;
+      letter-spacing: 0.15em;
+      font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+      font-weight: 600;
+    }
+
+    /* 用量表格 */
+    .table-wrap {
+      border: 1px solid var(--border-default);
+      border-radius: 10px;
+      overflow-x: auto;
+    }
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      font-size: 13px;
+    }
+    th, td {
+      padding: 10px 14px;
+      text-align: left;
+      border-bottom: 1px solid var(--border-default);
+    }
+    tr:last-child td {
+      border-bottom: 0;
+    }
+    th {
+      font-size: 12px;
+      font-weight: 500;
+      color: var(--text-secondary);
+      background: var(--surface);
+    }
+    td.num, th.num {
+      text-align: right;
+      font-variant-numeric: tabular-nums;
+    }
+
+    /* ==================== 居中管理员登录卡片（Scene: signin） ==================== */
+    .signin-stage {
+      min-height: calc(100vh - 130px);
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      padding: 24px;
+    }
+    .signin-card {
+      width: 100%;
+      max-width: 400px;
+      background: var(--surface-elevated);
+      border: 1px solid var(--border-default);
+      border-radius: 12px;
+      padding: 28px;
+      display: flex;
+      flex-direction: column;
+      gap: 18px;
+    }
+    .signin-card h2 {
+      margin: 0;
+      font-size: 20px;
+      font-weight: 600;
+    }
+    .signin-card p {
+      margin: 4px 0 0;
+      font-size: 13px;
+      color: var(--text-secondary);
+    }
+
+    /* ==================== 模态弹窗（创建实例 / Proxy 设置，遵循 DESIGN.md §4 Dialog） ==================== */
+    .modal-scrim {
+      position: fixed;
+      inset: 0;
+      z-index: 100;
+      background: var(--overlay-modal);
+      backdrop-filter: blur(4px);
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      padding: 16px;
+    }
+    .modal-panel {
+      width: min(500px, calc(100vw - 32px));
+      max-height: 88vh;
+      overflow-y: auto;
+      background: var(--surface-elevated);
+      border: 1px solid var(--border-default);
+      border-radius: 12px;
+      box-shadow: var(--shadow-menu);
+      padding: 20px 24px;
+      display: flex;
+      flex-direction: column;
+      gap: 16px;
+    }
+    .modal-panel h3 {
+      margin: 0;
+      font-size: 18px;
+      font-weight: 600;
+    }
+    .modal-sub {
+      margin: 4px 0 0;
+      font-size: 12px;
+      color: var(--text-secondary);
+    }
+    .engine-cards {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 10px;
+    }
+    .engine-option {
+      padding: 12px 14px;
+      border-radius: 10px;
+      border: 1px solid var(--border-default);
+      background: var(--surface);
+      text-align: left;
+      display: flex;
+      flex-direction: column;
+      gap: 4px;
+    }
+    .engine-option[aria-checked="true"] {
+      border-color: var(--text-primary);
+      background: var(--surface-elevated);
+    }
+    .engine-option strong {
+      font-size: 13px;
+      font-weight: 600;
+    }
+    .engine-option span {
+      font-size: 11px;
+      color: var(--text-secondary);
+    }
+    .proxy-subbox {
+      padding: 14px;
+      border-radius: 10px;
+      background: var(--surface);
+      border: 1px solid var(--border-default);
+      display: flex;
+      flex-direction: column;
+      gap: 12px;
+    }
+    .two-col {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 10px;
+    }
+    .proxy-test-bar {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 10px;
+      flex-wrap: wrap;
+      padding-top: 4px;
+    }
+    .modal-footer {
+      display: flex;
+      align-items: center;
+      justify-content: flex-end;
+      gap: 8px;
+      padding-top: 8px;
+      border-top: 1px solid var(--border-default);
+    }
+
+    @media (max-width: 960px) {
+      .instance-list-head {
+        display: none;
+      }
+      .instance-row-card {
+        grid-template-columns: 1fr;
+        gap: 10px;
+      }
+      .row-actions-cell {
+        justify-content: flex-start;
+      }
+      .accounts-grid, .two-col {
+        grid-template-columns: 1fr;
+      }
+      .page-container {
+        padding: 20px;
+      }
+    }
+  </style>
+</head>
+<body>
+  <!-- 顶部交互样例控制栏（方便你快速切换不同状态、布局方案与弹窗） -->
+  <div class="demo-banner" role="region" aria-label="交互样例切换栏">
+    <span class="demo-badge">UI 优化交互样例 (列表 ➔ 详情两级视图)</span>
+    <div class="demo-group">
+      <span>快速跳转：</span>
+      <div class="demo-seg">
+        <button type="button" data-scene="list" aria-pressed="true">1. 实例列表页 (首页)</button>
+        <button type="button" data-scene="stopped" aria-pressed="false">2. 详情：停止态直登</button>
+        <button type="button" data-scene="login" aria-pressed="false">3. 详情：登录终端</button>
+        <button type="button" data-scene="running" aria-pressed="false">4. 详情：运行与分享</button>
+        <button type="button" data-scene="error" aria-pressed="false">5. 详情：异常恢复</button>
+        <button type="button" data-scene="signin" aria-pressed="false">6. 管理员登录页</button>
+      </div>
+    </div>
+    <div class="demo-group">
+      <span>详情页布局：</span>
+      <div class="demo-seg">
+        <button type="button" data-layout="stacked" aria-pressed="true">方案 A：同屏分卡 (推荐)</button>
+        <button type="button" data-layout="tabs" aria-pressed="false">方案 B：顶部 Tab 切换</button>
+      </div>
+    </div>
+    <div class="demo-spacer"></div>
+    <div class="demo-group">
+      <button type="button" class="btn sm" id="toggle-theme-btn">切换深色 / 浅色</button>
+    </div>
+  </div>
+
+  <!-- 右上角非侵入式浮动反馈胶囊（替代原先会导致页面跳动的顶部 .feedback） -->
+  <div class="toast-layer" id="toast-layer" aria-live="polite"></div>
+
+  <!-- 正式应用顶部导航栏 -->
+  <header class="app-header">
+    <div class="app-brand">
+      <div class="app-logo" aria-hidden="true">&gt;_</div>
+      <div>
+        <h1 id="app-title">Cindy CLI 实例管理</h1>
+        <p id="app-subtitle">管理这台电脑上的 Cindy CLI 容器实例、原生账号登录与供应商分享</p>
+      </div>
+    </div>
+    <div class="header-controls">
+      <select class="select header-select" id="locale-select" aria-label="语言">
+        <option value="zh-CN">简体中文</option>
+        <option value="en">English</option>
+      </select>
+      <select class="select header-select" id="theme-select" aria-label="外观">
+        <option value="light">外观：浅色</option>
+        <option value="dark">外观：深色</option>
+      </select>
+      <button type="button" class="btn sm" id="signout-btn">退出登录</button>
+    </div>
+  </header>
+
+  <!-- 场景 6：管理员密码登录视图 -->
+  <main class="signin-stage" id="signin-view" hidden>
+    <form class="signin-card" id="signin-form">
+      <div>
+        <h2>管理员登录</h2>
+        <p>输入此主机的管理员密码以管理 Cindy CLI 容器实例。</p>
+      </div>
+      <label class="field">
+        <span>管理员密码</span>
+        <input class="input" type="password" placeholder="请输入至少 12 位管理员密码" value="••••••••••••" required />
+      </label>
+      <button type="submit" class="btn cta lg" style="width: 100%;">登录管理台</button>
+    </form>
+  </main>
+
+  <!-- 一级页面：实例列表页（全宽列表总览，点击任意实例进入详情页） -->
+  <main class="page-container" id="list-page-view">
+    <div class="list-page-header">
+      <div class="list-page-title">
+        <h2>实例列表</h2>
+        <p>在同一页面总览所有 CLI 容器的运行状态、双端账号就绪情况与分享概况；点击任一实例进入管理详情。</p>
+      </div>
+      <div class="list-page-actions">
+        <button type="button" class="btn" data-open-modal="global-proxy" id="list-proxy-btn">
+          ⚙ 默认 HTTP Proxy：已配置 (127.0.0.1:7890)
+        </button>
+        <button type="button" class="btn" id="list-refresh-btn">↻ 刷新状态</button>
+        <button type="button" class="btn cta" data-open-modal="create">+ 创建实例</button>
+      </div>
+    </div>
+
+    <div class="list-toolbar">
+      <div class="filter-pills" role="group" aria-label="按状态筛选" id="list-filter-group"></div>
+      <div class="toolbar-right">
+        <input class="input search-input" id="list-search-input" type="search" placeholder="搜索实例名称或账号…" aria-label="搜索实例" />
+      </div>
+    </div>
+
+    <section class="instance-table-card" aria-label="实例列表">
+      <div class="instance-list-head">
+        <div>实例名称 / 引擎 / Proxy</div>
+        <div>运行状态</div>
+        <div>Cindy 账号</div>
+        <div>供应商账号</div>
+        <div style="text-align: right;">分享状态与操作</div>
+      </div>
+      <div id="instance-rows-container"></div>
+    </section>
+  </main>
+
+  <!-- 二级页面：单实例详情页（点击列表某一项后进入，顶部带返回列表与快速切换） -->
+  <main class="page-container" id="detail-page-view" hidden>
+    <nav class="detail-breadcrumb-bar" aria-label="详情导航">
+      <div class="breadcrumb-left">
+        <button type="button" class="btn sm" id="back-to-list-btn">← 返回实例列表</button>
+        <span class="breadcrumb-sep">/</span>
+        <span class="breadcrumb-current" id="breadcrumb-instance-name">My Codex CLI</span>
+      </div>
+      <div class="breadcrumb-right">
+        <span>快速切换实例：</span>
+        <select class="select header-select" id="quick-instance-switcher" aria-label="快速切换实例"></select>
+      </div>
+    </nav>
+
+    <article class="detail-pane" id="detail-pane"></article>
+  </main>
+
+  <!-- 弹窗 1：创建实例 -->
+  <div class="modal-scrim" id="modal-create" hidden>
+    <form class="modal-panel" id="create-instance-form">
+      <div>
+        <h3>创建实例</h3>
+        <p class="modal-sub">每个实例拥有独立的 Docker 卷与登录状态。引擎类型创建后不可修改。</p>
+      </div>
+      <label class="field">
+        <span>名称</span>
+        <input class="input" name="name" placeholder="例如：Team Codex #2" required maxlength="100" />
+      </label>
+      <div class="field">
+        <span>引擎</span>
+        <div class="engine-cards" role="radiogroup" aria-label="引擎">
+          <button type="button" class="engine-option" data-engine-choice="codex" aria-checked="true">
+            <strong>Codex</strong>
+            <span>OpenAI Codex CLI 容器运行时</span>
+          </button>
+          <button type="button" class="engine-option" data-engine-choice="claude-code" aria-checked="false">
+            <strong>Claude Code</strong>
+            <span>Anthropic Claude Code 容器运行时</span>
+          </button>
+        </div>
+      </div>
+      <label class="field">
+        <span>HTTP Proxy</span>
+        <select class="select" id="create-proxy-mode">
+          <option value="none">不使用 Proxy</option>
+          <option value="default" selected>使用默认 Proxy (http://127.0.0.1:7890)</option>
+          <option value="custom">自定义此实例的 Proxy</option>
+        </select>
+      </label>
+      <div class="proxy-subbox" id="create-custom-proxy-box" hidden>
+        <label class="field">
+          <span>此实例的 Proxy 地址</span>
+          <input class="input" type="url" placeholder="http://proxy.example:8080" value="http://10.0.0.2:8080" />
+        </label>
+        <div class="two-col">
+          <label class="field">
+            <span>Proxy 用户名 (选填)</span>
+            <input class="input" placeholder="留空则不使用" />
+          </label>
+          <label class="field">
+            <span>Proxy 密码 (选填)</span>
+            <input class="input" type="password" placeholder="留空则不使用" />
+          </label>
+        </div>
+      </div>
+      <div class="proxy-test-bar">
+        <button type="button" class="btn sm" data-test-proxy="create">测试 Proxy 连通性</button>
+        <span class="field-hint" id="create-proxy-test-result">测试当前填写的配置（不会保存），由 ipwho.is 估算出口位置。</span>
+      </div>
+      <div class="modal-footer">
+        <button type="button" class="btn" data-close-modal>取消</button>
+        <button type="submit" class="btn cta">创建实例</button>
+      </div>
+    </form>
+  </div>
+
+  <!-- 弹窗 2：全局默认 Proxy 设置 -->
+  <div class="modal-scrim" id="modal-global-proxy" hidden>
+    <form class="modal-panel" id="global-proxy-form">
+      <div>
+        <h3>默认 HTTP Proxy 设置</h3>
+        <p class="modal-sub">供选择“使用默认 Proxy”的实例共用。修改在下次启动或登录时生效；运行中的实例需重启。</p>
+      </div>
+      <label class="field">
+        <span>默认 Proxy 地址</span>
+        <input class="input" id="global-proxy-url-input" type="url" placeholder="http://127.0.0.1:7890" value="http://127.0.0.1:7890" />
+      </label>
+      <div class="two-col">
+        <label class="field">
+          <span>Proxy 用户名</span>
+          <input class="input" placeholder="选填，留空保留已保存认证" />
+        </label>
+        <label class="field">
+          <span>Proxy 密码</span>
+          <input class="input" type="password" placeholder="选填，留空保留已保存认证" />
+        </label>
+      </div>
+      <div class="proxy-test-bar">
+        <button type="button" class="btn sm" data-test-proxy="global">测试 Proxy</button>
+        <span class="field-hint" id="global-proxy-test-result">尚未测试</span>
+      </div>
+      <div class="modal-footer">
+        <button type="button" class="btn danger-outline" id="clear-global-proxy-btn" style="margin-right: auto;">清除默认 Proxy</button>
+        <button type="button" class="btn" data-close-modal>取消</button>
+        <button type="submit" class="btn cta">保存设置</button>
+      </div>
+    </form>
+  </div>
+
+  <!-- 弹窗 3：当前实例名称与 Proxy 设置 -->
+  <div class="modal-scrim" id="modal-instance-settings" hidden>
+    <form class="modal-panel" id="instance-settings-form">
+      <div>
+        <h3>实例与 Proxy 设置</h3>
+        <p class="modal-sub" id="instance-settings-note">修改实例显示名称或独立 Proxy 配置。运行中修改 Proxy 需先停止实例。</p>
+      </div>
+      <label class="field">
+        <span>实例名称</span>
+        <input class="input" id="instance-name-input" required />
+      </label>
+      <label class="field">
+        <span>HTTP Proxy 模式</span>
+        <select class="select" id="instance-proxy-mode-input">
+          <option value="none">不使用 Proxy</option>
+          <option value="default">使用默认 Proxy (http://127.0.0.1:7890)</option>
+          <option value="custom">自定义 Proxy</option>
+        </select>
+      </label>
+      <div class="proxy-subbox" id="instance-custom-proxy-box">
+        <label class="field">
+          <span>此实例的 Proxy 地址</span>
+          <input class="input" id="instance-proxy-url-input" type="url" placeholder="http://proxy.example:8080" value="http://proxy.internal:8080" />
+        </label>
+        <div class="two-col">
+          <label class="field">
+            <span>Proxy 用户名</span>
+            <input class="input" placeholder="留空保留原认证" />
+          </label>
+          <label class="field">
+            <span>Proxy 密码</span>
+            <input class="input" type="password" placeholder="留空保留原认证" />
+          </label>
+        </div>
+        <div class="proxy-test-bar">
+          <button type="button" class="btn sm" data-test-proxy="instance">测试 Proxy</button>
+          <span class="field-hint" id="instance-proxy-test-result">测试当前填写的配置（不会保存）</span>
+        </div>
+      </div>
+      <div class="modal-footer">
+        <button type="button" class="btn" data-close-modal>取消</button>
+        <button type="submit" class="btn cta">保存修改</button>
+      </div>
+    </form>
+  </div>
+
+  <script src="./preview.js"></script>
+</body>
+</html>

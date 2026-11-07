@@ -1,6 +1,8 @@
 import Docker from 'dockerode';
 import { randomUUID } from 'node:crypto';
 import { PassThrough } from 'node:stream';
+import { isIP } from 'node:net';
+import { PROXY_PROBE } from './proxy-probe.js';
 import { sanitizeAccount, CODEX_ACCOUNT_PROBE } from './account-identity.js';
 import type { AccountIdentity, DockerRuntime, RuntimeInstance, RuntimeProxy, RuntimeInspection, RuntimeLogin, LoginRequest, ShareRequest } from './runtime-types.js';
 
@@ -52,6 +54,26 @@ export class DockerRuntimeAdapter implements DockerRuntime {
     this.image = options.image;
     this.docker = options.docker ?? new Docker({ socketPath: options.socketPath ?? '/var/run/docker.sock' });
     this.stopTimeoutMs = options.stopTimeoutMs ?? 30_000;
+  }
+  async testProxy(proxy: RuntimeProxy) {
+    const env = runtimeEnvironment({ id: randomUUID(), engine: 'claude-code' }, proxy)
+      .filter(value => /^(HTTPS_PROXY|https_proxy)=/.test(value));
+    try {
+      const result = await this.oneShot({
+        name: `cindy-proxy-test-${randomUUID()}`, Image: this.image, User: '1000:1000',
+        Entrypoint: ['node'], Cmd: ['-e', PROXY_PROBE], Env: env,
+        Labels: { [OWNER]: '1', [`${OWNER}.role`]: 'proxy-test' },
+        HostConfig: { NetworkMode: 'bridge', Mounts: [], LogConfig: { Type: 'none', Config: {} } },
+      }, true);
+      if (result.code !== 0) throw new Error();
+      const value = JSON.parse(result.output);
+      if (typeof value.ip !== 'string' || !isIP(value.ip)) throw new Error();
+      const location = (key: string): string => typeof value[key] === 'string'
+        ? value[key].replace(/[\x00-\x1f\x7f]/g, '').slice(0, 100) : '';
+      return { ip: value.ip, country: location('country'), region: location('region'), city: location('city') };
+    } catch {
+      throw new RuntimeError('PROXY_TEST_FAILED', 'Proxy test failed. Check the address, authentication and connectivity.');
+    }
   }
   private async safe<T>(action: () => Promise<T>): Promise<T> {
     try { return await action(); } catch (error) { if (error instanceof RuntimeError) throw error; throw new RuntimeError('DOCKER_FAILED'); }

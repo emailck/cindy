@@ -23,8 +23,12 @@ RUN mkdir -p /runtime/dist /runtime/codex /runtime/claude \
     && cp apps/claude-code-bin/linux-$(node -p process.arch)/claude /runtime/claude/claude
 
 FROM node:22.22.0-bookworm-slim
-RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates git libsecret-1-0 \
+RUN apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends ca-certificates git libsecret-1-0 locales tzdata \
+    && printf 'en_US.UTF-8 UTF-8\n' > /etc/locale.gen && locale-gen \
+    && ln -snf /usr/share/zoneinfo/America/Los_Angeles /etc/localtime \
+    && printf 'America/Los_Angeles\n' > /etc/timezone \
     && rm -rf /var/lib/apt/lists/*
+ENV TZ=America/Los_Angeles LANG=en_US.UTF-8 LANGUAGE=en_US:en LC_ALL=en_US.UTF-8
 WORKDIR /opt/cindy-host
 COPY --from=build /runtime ./
 RUN printf '#!/bin/sh\nexec node /opt/cindy-host/dist/cli.cjs "$@"\n' > /usr/local/bin/cindy-host \

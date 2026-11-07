@@ -9,7 +9,9 @@ export interface Instance {
   id: string;
   name: string;
   engine: "codex" | "claude-code";
-  proxyMode: "none" | "default";
+  proxyMode: "none" | "default" | "custom";
+  proxyUrl?: string;
+  proxyAuthConfigured?: boolean;
   createdAt: string;
   state: "stopped" | "running" | "busy" | "error" | "missing";
   error?: string;

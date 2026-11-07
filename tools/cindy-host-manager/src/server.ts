@@ -19,6 +19,7 @@ const runtimeErrors: Record<string, [
     INSTANCE_STOPPED: [409, 'Start the instance before managing sharing.'],
     INSTANCE_MISSING: [409, 'Instance container is missing. Start it to recreate the container.'],
     RESOURCE_NOT_OWNED: [409, 'Docker resource ownership does not match this instance.'],
+    PROXY_TEST_FAILED: [502, 'Proxy test failed. Check the address, authentication and connectivity.'],
     INVALID_PROXY: [400, 'Only HTTP CONNECT proxy URLs are supported.'],
     INVALID_SHARE: [400, 'Invalid share member, pairing code or setting.'],
     INVALID_LOGIN: [400, 'Invalid native login options.'],
@@ -106,6 +107,10 @@ export function createManagerServer({ service, auth, origin, webDirectory }: Ser
             const current = session(req);
             if (method !== 'GET')
                 writeGuard(req, current);
+            if (path === '/api/proxy/test' && method === 'POST') {
+                json(res, 200, await service.testProxy(await body(req)));
+                return;
+            }
             if (path === '/api/settings' && method === 'GET') {
                 json(res, 200, service.settings());
                 return;

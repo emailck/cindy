@@ -13,7 +13,7 @@ import type { RuntimeInstance } from './runtime-types.js';
 const instance: RuntimeInstance = { id: '12345678-1234-4234-8234-123456789abc', engine: 'codex' };
 class FakeDocker {
   containers = new Map<string, FakeContainer>(); volumes = new Map<string, { Labels: Record<string,string> }>();
-  created: Docker.ContainerCreateOptions[] = []; killed: string[] = []; nativeCode = 0; nativeOutput: string | undefined; nativeInitFails = false; sticky = false; attachFails = false;
+  created: Docker.ContainerCreateOptions[] = []; killed: string[] = []; nativeCode = 0; nativeOutput: string | undefined; nativeInitFails = false; proxyProbeOutput = '{"ip":"203.0.113.7","country":"Fixture","region":"Region","city":"City"}'; proxyProbeCode = 0; sticky = false; attachFails = false;
   statusRuntime: Record<string,unknown> = {savedAuthentication:true}; refreshedRuntime: Record<string,unknown> | undefined; refreshCode = 1; refreshStoredRuntime: Record<string,unknown> | undefined; accountProbeOutput = 'null'; nativeExecCommands: string[][] = [];
   modem = { demuxStream: (stream: PassThrough, stdout: PassThrough) => stream.pipe(stdout) };
   getVolume(name: string) { return { inspect: async () => { if (!this.volumes.has(name)) throw { statusCode: 404 }; return this.volumes.get(name)!; } }; }
@@ -33,6 +33,7 @@ class FakeContainer {
     this.running = true;
     const argv = [...this.options.Entrypoint as string[], ...this.options.Cmd as string[]];
     if (this.options.Labels?.['io.cindy.host-manager.role'] === 'native-setup' && this.docker.nativeInitFails) { queueMicrotask(()=>this.finish(1)); return; }
+    if (this.options.Labels?.['io.cindy.host-manager.role'] === 'proxy-test') { queueMicrotask(()=>this.finish(this.docker.proxyProbeCode,this.docker.proxyProbeOutput)); return; }
     if (argv.includes('serve') || argv.includes('--device-auth') || argv.includes('--claudeai') || argv.includes('--social')) return;
     if (argv[0] === 'node' && this.options.Labels?.['io.cindy.host-manager.role'] === 'check') { queueMicrotask(()=>this.finish(0,this.docker.accountProbeOutput)); return; }
     if (argv.includes('status')) queueMicrotask(() => {
@@ -58,6 +59,24 @@ class FakeContainer {
 }
 const fixture = () => { const docker = new FakeDocker(); return { docker, runtime: new DockerRuntimeAdapter({ image: 'cindy-host:test', docker: docker as unknown as Docker, stopTimeoutMs: 0 }) }; };
 describe('managed Docker runtime', () => {
+  // Unit: the real adapter must run proxy probes without mounting account data,
+  // return only validated IP/location, and clean the container on failure as well.
+  it('tests proxy egress in an isolated disposable container and sanitizes failures', async () => {
+    const {docker,runtime}=fixture();
+    const proxy={url:'http://proxy.invalid:8080',username:'fake',password:'invalid-probe-secret'};
+    expect(await runtime.testProxy(proxy)).toEqual({ip:'203.0.113.7',country:'Fixture',region:'Region',city:'City'});
+    const options=docker.created.at(-1)!;
+    expect(options.HostConfig?.Mounts).toEqual([]);
+    expect(options.HostConfig?.NetworkMode).toBe('bridge');
+    expect(options.HostConfig?.LogConfig?.Type).toBe('none');
+    expect(options.Cmd?.join(' ')).not.toContain(proxy.password);
+    expect(docker.containers.size).toBe(0);
+    docker.proxyProbeOutput='secret upstream error';
+    await expect(runtime.testProxy(proxy)).rejects.toMatchObject({code:'PROXY_TEST_FAILED'});
+    expect(docker.containers.size).toBe(0);
+    docker.proxyProbeCode=2;
+    await expect(runtime.testProxy(proxy)).rejects.toMatchObject({code:'PROXY_TEST_FAILED'});
+  });
   it('creates two owned private volumes per instance and starts service only after one-shot config', async () => {
     const { docker, runtime } = fixture();
     await runtime.create(instance);

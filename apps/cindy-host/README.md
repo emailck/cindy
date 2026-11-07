@@ -12,6 +12,11 @@ see [Cindy CLI Host Manager](../../tools/cindy-host-manager/README.md). It creat
 isolated Codex or Claude Code instances and exposes native login and existing
 sharing operations; it does not run Desktop or Electron in containers.
 
+The Docker runtime defaults to Los Angeles time (`America/Los_Angeles`, including
+automatic daylight-saving transitions) and US English UTF-8 (`en_US.UTF-8`). These
+settings control process date and locale defaults, not the assistant's response
+language. Recreate existing containers from the updated image to apply new defaults.
+
 ## Build and inspect
 
 From the repository root after installing workspace dependencies:
@@ -83,6 +88,38 @@ credentials. For API usage, choose `CINDY_HOST_CLAUDE_AUTH=api-key` and supply
 `ANTHROPIC_API_KEY` through your trusted process/service secret manager. An optional
 `ANTHROPIC_BASE_URL` applies to API mode. Do not place secrets in command arguments,
 shell history, repository files or `config.json`.
+
+### Claude network proxy
+
+Configure `HTTP_PROXY` and `HTTPS_PROXY` in the environment used to start both the
+native Claude login and `cindy-host serve`. The Docker host manager supplies these
+automatically when the instance uses its configured proxy. Use an HTTP CONNECT
+proxy and keep local communication excluded, for example:
+
+```sh
+export HTTP_PROXY=http://127.0.0.1:7890
+export HTTPS_PROXY=http://127.0.0.1:7890
+export NO_PROXY=localhost,127.0.0.1,::1
+```
+
+In Docker, the proxy address must be reachable **from the container**; `127.0.0.1`
+refers to that container, not the Docker host. Pass proxy credentials through your
+service's secret manager, never a repository file or command argument.
+
+Native Claude inherits this environment for login, model discovery, inference,
+token refresh and quota queries. Host-side API-key model discovery also explicitly
+uses the proxy, including pagination; unsupported proxy addresses and proxy failures
+produce an error rather than a direct retry. Local endpoints and explicit `NO_PROXY`
+exceptions still bypass the proxy, so do not exempt Anthropic endpoints if all Claude
+service traffic must use it. This does not install a global proxy for Cindy's own
+authentication or Device Link connections.
+
+Verify with proxy connection logs while exercising login, a model request and quota
+refresh. Stop the proxy and start fresh requests to check that Claude fails instead
+of changing its network route. A login page opened in a separate browser uses that
+browser's network settings; the CLI environment does not configure it. These are
+application proxy settings, not an OS firewall guarantee for arbitrary tools run by
+Claude.
 
 ## Codex provider
 

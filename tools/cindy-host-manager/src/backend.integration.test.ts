@@ -28,6 +28,7 @@ class FakeLogin implements RuntimeLogin {
     exit() { this.exits.forEach(fn => fn(0)); }
 }
 class FakeRuntime implements DockerRuntime {
+    async testProxy(proxy: RuntimeProxy) { this.proxies.push(proxy); return { ip: '203.0.113.7', country: 'Fixture', region: 'Region', city: 'City' }; }
     states = new Map<string, RuntimeInspection['state']>();
     logins: FakeLogin[] = [];
     failCreate = false;
@@ -118,6 +119,44 @@ describe('host manager production HTTP and login security', () => {
         expect(f.runtime.proxies.at(-1)?.password).toBe(proxy.proxyPassword);
         await f.call('PUT', '/api/settings', { proxyUrl: null }, h);
         expect(f.service.settings().proxyConfigured).toBe(false);
+    });
+    // Integration: production HTTP routes + encrypted SQLite. A custom proxy must
+    // survive reopen, stay isolated from defaults/other instances, and reach runtime
+    // operations without returning credentials. Existing tests cover only the global proxy.
+    it('isolates custom proxies, preserves blank credentials and tests drafts without saving', async () => {
+        const f = await fixture(), h = await f.signIn();
+        const missing = await f.call('POST', '/api/proxy/test', { proxyMode: 'default' }, h);
+        expect(missing.status).toBe(400);
+        expect(missing.body.error.code).toBe('PROXY_NOT_CONFIGURED');
+        const first = await f.call('POST', '/api/instances', { name: 'Custom', engine: 'claude-code', proxyMode: 'custom',
+            proxyUrl: 'http://first.invalid:8080', proxyUsername: 'fixture-user', proxyPassword: 'invalid-custom-secret' }, h);
+        expect(first.status).toBe(201);
+        const id = first.body.instance.id;
+        expect(first.body.instance).toMatchObject({ proxyMode: 'custom', proxyUrl: 'http://first.invalid:8080', proxyAuthConfigured: true });
+        expect(JSON.stringify(first.body)).not.toContain('invalid-custom-secret');
+        expect(readFileSync(join(f.directory, 'manager.sqlite')).includes(Buffer.from('invalid-custom-secret'))).toBe(false);
+        const reopened = new Store(f.directory);
+        try { expect(reopened.proxy(id)?.password).toBe('invalid-custom-secret'); expect(reopened.proxy()).toBeNull(); }
+        finally { reopened.close(); }
+        await f.call('PUT', '/api/settings', { proxyUrl: 'http://default.invalid:8080' }, h);
+        const other = await f.create(h);
+        await f.call('POST', `/api/instances/${id}/actions`, { action: 'start' }, h);
+        expect(f.runtime.proxies.at(-1)?.password).toBe('invalid-custom-secret');
+        expect((await f.call('PATCH', `/api/instances/${id}`, { proxyUrl: 'http://changed.invalid' }, h)).status).toBe(409);
+        const draft = { proxyMode: 'custom', instanceId: id, proxyUrl: 'http://first.invalid:8080', proxyPassword: '' };
+        expect((await f.call('POST', '/api/proxy/test', draft, h)).body.ip).toBe('203.0.113.7');
+        expect(f.runtime.proxies.at(-1)?.password).toBe('invalid-custom-secret');
+        expect((await f.call('POST', '/api/proxy/test', draft, { Cookie: h.Cookie!, Origin: h.Origin! })).status).toBe(403);
+        await f.call('POST', '/api/proxy/test', { ...draft, proxyUrl: 'http://draft.invalid:8080' }, h);
+        expect(f.runtime.proxies.at(-1)?.password).toBeUndefined();
+        expect(f.service.store.proxy(id)?.url).toBe('http://first.invalid:8080');
+        await f.call('POST', `/api/instances/${id}/actions`, { action: 'stop' }, h);
+        await f.call('PATCH', `/api/instances/${id}`, { proxyPassword: '' }, h);
+        expect(f.service.store.proxy(id)?.password).toBe('invalid-custom-secret');
+        await f.call('PATCH', `/api/instances/${id}`, { proxyClearAuth: true }, h);
+        expect(f.service.store.proxy(id)).toEqual({ url: 'http://first.invalid:8080' });
+        await f.call('POST', `/api/instances/${other}/actions`, { action: 'start' }, h);
+        expect(f.runtime.proxies.at(-1)).toBeNull();
     });
     it('keeps the new login lock after cancelling an old completed login', async () => {
         const f = await fixture(), h = await f.signIn(), id = await f.create(h);

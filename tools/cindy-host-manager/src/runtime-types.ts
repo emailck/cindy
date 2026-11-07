@@ -17,7 +17,9 @@ export interface RuntimeLogin {
   onOutput(listener: (data: string) => void): () => void;
   onExit(listener: (code: number) => void): () => void;
 }
+export interface ProxyTestResult { ip: string; country: string; region: string; city: string }
 export interface DockerRuntime {
+  testProxy(proxy: RuntimeProxy): Promise<ProxyTestResult>;
   create(instance: RuntimeInstance, proxy?: RuntimeProxy | null): Promise<void>;
   inspect(instance: RuntimeInstance): Promise<RuntimeInspection>;
   start(instance: RuntimeInstance, proxy?: RuntimeProxy | null): Promise<void>;

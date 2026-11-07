@@ -11,6 +11,7 @@ import {
   render,
   screen,
   waitFor,
+  within,
 } from "@testing-library/react";
 import { App } from "./App";
 const terminalEvents = vi.hoisted(() => ({
@@ -60,6 +61,9 @@ let omitAuthentication = false;
 let accountSnapshots: Record<string, unknown> = {};
 let includeOther = false;
 let authenticated = true;
+let savedProxyUrl: string | null = null;
+let proxyTestFails = false;
+let proxyTestGate: Promise<void> | undefined;
 beforeEach(() => {
   calls.length = 0;
   state = "stopped";
@@ -72,6 +76,9 @@ beforeEach(() => {
   accountSnapshots = {};
   includeOther = false;
   authenticated = true;
+  savedProxyUrl = null;
+  proxyTestFails = false;
+  proxyTestGate = undefined;
   terminalEvents.autoExit = null;
   terminalEvents.lastExit = undefined;
   Object.defineProperty(navigator, "language", {
@@ -106,7 +113,12 @@ beforeEach(() => {
         if (method === "DELETE") authenticated = false;
         data = { authenticated, csrfToken: "test-csrf" };
       } else if (path === "/api/settings")
-        data = { image: "test-image", proxyConfigured: false, proxyUrl: null };
+        data = { image: "test-image", proxyConfigured: !!savedProxyUrl, proxyUrl: savedProxyUrl };
+      else if (path === "/api/proxy/test") {
+        if (proxyTestGate) await proxyTestGate;
+        if (proxyTestFails) return { ok: false, status: 502, json: async () => ({ error: { code: "PROXY_TEST_FAILED" } }) };
+        data = { ip: '203.0.113.7', country: 'Fixture', region: 'Region', city: 'City' };
+      }
       else if (path === "/api/instances" && method === "POST") {
         created = true;
         data = {
@@ -268,6 +280,10 @@ it("preserves saved authentication from check and submits recipient pairing code
       ),
     ).toBe(true),
   );
+  fireEvent.click(screen.getByRole("button", { name: /Back to instances/ }));
+  expect(
+    screen.getByText("Select an instance to manage its accounts and sharing."),
+  ).toBeTruthy();
 });
 
 // Tier: unit. Native exit is not proof of saved provider login. The real parent
@@ -554,4 +570,65 @@ it("shows only API Key login method and clears the account when authentication d
   fireEvent.click(screen.getByRole("button", { name: "Sign out" }));
   await screen.findByRole("button", { name: "Sign in" });
   expect(screen.queryByText("Account information unavailable")).toBeNull();
+});
+
+// Unit: custom-proxy creation and draft testing are user-visible behaviors absent
+// from the original default-only form. Testing must not create/save an instance.
+it("lets a new instance test and save its own proxy without changing the default", async () => {
+  render(<App />);
+  await screen.findByText("My CLI");
+  const createButton = screen.getByRole("button", { name: "Create instance", hidden: true });
+  const form = createButton.closest("form")!;
+  fireEvent.change(within(form).getByLabelText("HTTP Proxy"), { target: { value: "custom" } });
+  fireEvent.change(within(form).getByLabelText("Proxy URL for this instance"), { target: { value: "http://fixture.invalid:8080" } });
+  fireEvent.change(within(form).getByLabelText("Proxy username"), { target: { value: "fake" } });
+  fireEvent.change(within(form).getByLabelText("Proxy password"), { target: { value: "invalid-secret" } });
+  fireEvent.click(within(form).getByRole("button", { name: "Test Proxy", hidden: true }));
+  await waitFor(() => expect(within(form).getByRole("status", { hidden: true }).textContent).toContain("203.0.113.7"));
+  expect(calls.find(c => c.path === "/api/proxy/test")?.body).toMatchObject({ proxyMode: "custom", proxyUrl: "http://fixture.invalid:8080", proxyPassword: "invalid-secret" });
+  expect(calls.some(c => c.path === "/api/settings" && c.method === "PUT")).toBe(false);
+  fireEvent.change(within(form).getByLabelText("Name"), { target: { value: "Custom CLI" } });
+  fireEvent.submit(form);
+  await waitFor(() => expect(calls.find(c => c.path === "/api/instances" && c.method === "POST")?.body).toMatchObject({ proxyMode: "custom", proxyUrl: "http://fixture.invalid:8080" }));
+});
+
+// Regression: choosing the default gave no explanation of which address was used
+// or that none had been saved. Cover observable feedback on the real creation form.
+it.each([null, "http://saved-proxy.invalid:8080"])("shows the selected default %s and the test outcome", async (url) => {
+  savedProxyUrl = url;
+  render(<App />);
+  await screen.findByText("My CLI");
+  const form = screen.getByRole("button", { name: "Create instance", hidden: true }).closest("form")!;
+  fireEvent.change(within(form).getByLabelText("HTTP Proxy"), { target: { value: "default" } });
+  if (url) expect(within(form).getByText(url, { exact: false })).toBeTruthy();
+  else expect(within(form).getByText("No default Proxy saved. Enter its address in Settings and save first.")).toBeTruthy();
+  fireEvent.click(within(form).getByRole("button", { name: "Test Proxy", hidden: true }));
+  if (url) {
+    await waitFor(() => expect(within(form).getByRole("status", { hidden: true }).textContent).toContain("203.0.113.7"));
+    expect(calls.find(c => c.path === "/api/proxy/test")?.body).toEqual({ proxyMode: "default" });
+    proxyTestFails = true;
+    fireEvent.click(within(form).getByRole("button", { name: "Test Proxy", hidden: true }));
+    await waitFor(() => expect(within(form).getByRole("alert", { hidden: true }).textContent).toContain("Proxy test failed"));
+  } else {
+    expect(within(form).getByRole("alert", { hidden: true }).textContent).toContain("Configure the selected Proxy first");
+    expect(calls.some(c => c.path === "/api/proxy/test")).toBe(false);
+  }
+});
+
+// Left Settings reports progress while the network is pending and tests its draft
+// without requiring Save. The default-only selector tests do not cover this form.
+it("shows progress and the result when testing an unsaved default in left Settings", async () => {
+  let finish!: () => void;
+  proxyTestGate = new Promise<void>(resolve => { finish = resolve; });
+  render(<App />);
+  await screen.findByText("My CLI");
+  const input = screen.getByLabelText("Default Proxy URL");
+  const form = input.closest("form")!;
+  fireEvent.change(input, { target: { value: "http://draft.invalid:17890" } });
+  fireEvent.click(within(form).getByRole("button", { name: "Test Proxy", hidden: true }));
+  expect(within(form).getByRole("status", { hidden: true }).textContent).toContain("Checking the Proxy exit");
+  expect(calls.find(c => c.path === "/api/proxy/test")?.body).toEqual({ proxyMode: "default", proxyUrl: "http://draft.invalid:17890" });
+  await act(async () => { finish(); });
+  await waitFor(() => expect(within(form).getByRole("status", { hidden: true }).textContent).toContain("203.0.113.7"));
+  expect(calls.some(c => c.path === "/api/settings" && c.method === "PUT")).toBe(false);
 });

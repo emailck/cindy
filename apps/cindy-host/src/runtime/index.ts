@@ -38,7 +38,8 @@ const allowlistHash = createHash('sha256').update([...channels].sort().join('\n'
 
 /** Relay-only same-account provider. All project tools run through the shared host's reverse tunnel. */
 export async function createCliHost(context: HostCommandContext, options: CliHostOptions): Promise<HostLifecycle> {
-  const logger = quietRuntimeLogger(startupDiagnostics(line => context.error(line), context.dataDir));
+  const diagnostics = startupDiagnostics(line => context.error(line), context.dataDir);
+  const logger = quietRuntimeLogger(diagnostics);
   if (!await options.auth.getToken()) throw new Error('Sign in to Cindy before starting serve.');
   const owner = options.auth.captureOwner();
   const storageScope = options.auth.storageScope();
@@ -226,7 +227,7 @@ export async function createCliHost(context: HostCommandContext, options: CliHos
     if (shareTimer) clearInterval(shareTimer);
     signal?.removeEventListener('abort', abort);
     off(); offIssue(); admitted.clear(); replies.clear(); client.stop();
-    const disposal = Promise.resolve(stopControl?.()).finally(() => host.dispose()).finally(() => provider.dispose()).finally(() => ledger.flush()).finally(resolveStopped);
+    const disposal = Promise.resolve(stopControl?.()).finally(() => host.dispose()).finally(() => provider.dispose()).finally(() => ledger.flush()).finally(() => diagnostics.flush()).finally(resolveStopped);
     stopped = disposal;
     return disposal;
   }

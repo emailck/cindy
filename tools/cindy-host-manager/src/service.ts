@@ -1,6 +1,6 @@
 import { randomUUID } from 'node:crypto';
 import { Store, type InstanceRecord } from './store.js';
-import type { DockerRuntime, LoginRequest, RuntimeInspection, RuntimeLogin, ShareRequest } from './runtime-types.js';
+import type { DockerRuntime, LoginRequest, RuntimeInspection, RuntimeLogin, RuntimeProxy, ShareRequest } from './runtime-types.js';
 export class ApiError extends Error {
     constructor(readonly status: number, readonly code: string, message: string) { super(message); }
 }
@@ -11,9 +11,11 @@ export function object(body: unknown, keys: string[]): Record<string, unknown> {
 }
 export function text(value: unknown, max = 200): string { if (typeof value !== 'string' || !value.trim() || value.length > max || /[\x00-\x1f\x7f]/.test(value))
     throw new ApiError(400, 'INVALID_BODY', 'Invalid text value.'); return value; }
-function proxyMode(value: unknown): 'none' | 'default' { if (value !== 'none' && value !== 'default')
+function proxyMode(value: unknown): InstanceRecord['proxyMode'] { if (value !== 'none' && value !== 'default' && value !== 'custom')
     throw new ApiError(400, 'INVALID_BODY', 'Invalid proxy mode.'); return value; }
 export interface InstanceView extends InstanceRecord {
+    proxyUrl?: string;
+    proxyAuthConfigured?: boolean;
     state: RuntimeInspection['state'] | 'busy' | 'error';
     error?: string;
     authentication?: RuntimeInspection['authentication'];
@@ -42,7 +44,12 @@ export class ManagerService {
     constructor(readonly store: Store, readonly runtime: DockerRuntime, readonly image: string, readonly loginTimeoutMs = 10 * 60 * 1000) { }
     private record(id: string) { const instance = this.store.instance(id); if (!instance)
         throw new ApiError(404, 'NOT_FOUND', 'Instance not found.'); return instance; }
-    private proxy(instance: InstanceRecord) { return instance.proxyMode === 'default' ? this.store.proxy() : null; }
+    private proxy(instance: InstanceRecord) {
+        if (instance.proxyMode === 'none') return null;
+        const proxy = this.store.proxy(instance.proxyMode === 'custom' ? instance.id : undefined);
+        if (!proxy) throw new ApiError(400, 'PROXY_NOT_CONFIGURED', 'Configure the selected proxy first.');
+        return proxy;
+    }
     private async locked<T>(id: string, run: (instance: InstanceRecord) => Promise<T>): Promise<T> {
         const instance = this.record(id);
         if (this.busy.has(id))
@@ -63,7 +70,9 @@ export class ManagerService {
         }
     }
     async view(id: string): Promise<InstanceView> {
-        const instance = this.record(id);
+        const record = this.record(id);
+        const proxy = record.proxyMode === 'custom' ? this.store.proxy(id) : null;
+        const instance = { ...record, ...(proxy ? { proxyUrl: proxy.url, proxyAuthConfigured: !!(proxy.username || proxy.password) } : {}) };
         if (this.busy.has(id))
             return { ...instance, state: 'busy' };
         try {
@@ -77,22 +86,31 @@ export class ManagerService {
     }
     async list() { return Promise.all(this.store.list().map(instance => this.view(instance.id))); }
     async create(body: unknown) {
-        const data = object(body, ['name', 'engine', 'proxyMode']);
+        const data = object(body, ['name', 'engine', 'proxyMode', 'proxyUrl', 'proxyUsername', 'proxyPassword', 'proxyClearAuth']);
         if (data.engine !== 'codex' && data.engine !== 'claude-code')
             throw new ApiError(400, 'INVALID_BODY', 'Invalid engine.');
         const instance: InstanceRecord = { id: randomUUID(), name: text(data.name, 100).trim(), engine: data.engine, proxyMode: proxyMode(data.proxyMode), createdAt: new Date().toISOString() };
-        this.store.insert(instance);
+        const custom = instance.proxyMode === 'custom' ? this.parseProxy(data) : null;
+        if (instance.proxyMode === 'default') this.proxy(instance);
+        this.store.transaction(() => { this.store.insert(instance); if (custom) this.store.setProxy(custom, instance.id); });
         await this.locked(instance.id, async (record) => this.runtime.create(record, this.proxy(record)));
         return this.view(instance.id);
     }
     async patch(id: string, body: unknown) {
-        const data = object(body, ['name', 'proxyMode']);
+        const data = object(body, ['name', 'proxyMode', 'proxyUrl', 'proxyUsername', 'proxyPassword', 'proxyClearAuth']);
         await this.locked(id, async (instance) => {
             const name = data.name === undefined ? instance.name : text(data.name, 100).trim();
             const mode = data.proxyMode === undefined ? instance.proxyMode : proxyMode(data.proxyMode);
-            if (mode !== instance.proxyMode && (await this.runtime.inspect(instance)).state === 'running')
+            const previous = this.store.proxy(id);
+            const custom = mode === 'custom' ? this.parseProxy(data, previous) : null;
+            if (mode === 'default') this.proxy({ ...instance, proxyMode: mode });
+            const changed = mode !== instance.proxyMode || (mode === 'custom' && JSON.stringify(custom) !== JSON.stringify(previous));
+            if (changed && (await this.runtime.inspect(instance)).state === 'running')
                 throw new ApiError(409, 'STOP_REQUIRED', 'Stop this instance before changing its proxy.');
-            this.store.update({ ...instance, name, proxyMode: mode });
+            this.store.transaction(() => {
+                this.store.update({ ...instance, name, proxyMode: mode });
+                if (mode === 'custom') this.store.setProxy(custom, id);
+            });
         });
         return this.view(id);
     }
@@ -116,13 +134,7 @@ export class ManagerService {
         return check ? { ...view, ...check } : view;
     }
     settings() { const proxy = this.store.proxy(); return { image: this.image, proxyConfigured: !!proxy, proxyUrl: proxy?.url ?? null }; }
-    updateSettings(body: unknown) {
-        const data = object(body, ['proxyUrl', 'proxyUsername', 'proxyPassword']);
-        if (data.proxyUrl === null) {
-            this.store.setProxy(null);
-            return this.settings();
-        }
-        const previous = this.store.proxy();
+    private parseProxy(data: Record<string, unknown>, previous: RuntimeProxy | null = null): RuntimeProxy {
         const raw = data.proxyUrl === undefined ? previous?.url : data.proxyUrl;
         if (typeof raw !== 'string' || raw.length > 2048)
             throw new ApiError(400, 'INVALID_PROXY', 'Provide an HTTP proxy URL.');
@@ -138,9 +150,29 @@ export class ManagerService {
         for (const key of ['proxyUsername', 'proxyPassword'])
             if (data[key] !== undefined && (typeof data[key] !== 'string' || (data[key] as string).length > 1024 || /[\x00-\x1f\x7f]/.test(data[key] as string)))
                 throw new ApiError(400, 'INVALID_PROXY', 'Invalid proxy credentials.');
+        if (data.proxyClearAuth !== undefined && typeof data.proxyClearAuth !== 'boolean')
+            throw new ApiError(400, 'INVALID_PROXY', 'Invalid proxy authentication option.');
         const same = previous?.url === url.origin;
-        this.store.setProxy({ url: url.origin, username: data.proxyUsername as string | undefined ?? (same ? previous?.username : undefined), password: data.proxyPassword as string | undefined ?? (same ? previous?.password : undefined) });
+        if (data.proxyClearAuth === true) return { url: url.origin };
+        return { url: url.origin,
+            username: (data.proxyUsername as string | undefined) || (same ? previous?.username : undefined),
+            password: (data.proxyPassword as string | undefined) || (same ? previous?.password : undefined) };
+    }
+    updateSettings(body: unknown) {
+        const data = object(body, ['proxyUrl', 'proxyUsername', 'proxyPassword', 'proxyClearAuth']);
+        this.store.setProxy(data.proxyUrl === null ? null : this.parseProxy(data, this.store.proxy()));
         return this.settings();
+    }
+    async testProxy(body: unknown) {
+        const data = object(body, ['proxyMode', 'instanceId', 'proxyUrl', 'proxyUsername', 'proxyPassword', 'proxyClearAuth']);
+        const mode = proxyMode(data.proxyMode);
+        if (mode === 'default' && data.proxyUrl === undefined && !this.store.proxy())
+            throw new ApiError(400, 'PROXY_NOT_CONFIGURED', 'Configure the selected proxy first.');
+        const previous = data.instanceId === undefined ? null : this.store.proxy(this.record(text(data.instanceId)).id);
+        const proxy = mode === 'custom' ? this.parseProxy(data, previous)
+            : mode === 'default' ? this.parseProxy(data, this.store.proxy()) : null;
+        if (!proxy) throw new ApiError(400, 'PROXY_NOT_CONFIGURED', 'Configure the selected proxy first.');
+        return this.runtime.testProxy(proxy);
     }
     async share(id: string, body: unknown) {
         const data = object(body, ['action', 'id', 'code']);

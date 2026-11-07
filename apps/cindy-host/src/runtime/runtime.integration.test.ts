@@ -27,7 +27,7 @@ import { HOST_ENDPOINTS } from '../config';
 import { createCliHost } from './index';
 import { mapCodexModels, createNativeCodexAuth, createCodexProvider } from './codex';
 import type { CodexModelListItem } from '@cindy/maker-core';
-import { quietRuntimeLogger, mapClaudeModels, createNativeClaudeSharing, type createClaudeProvider } from './claude';
+import { quietRuntimeLogger, mapClaudeModels, createNativeClaudeSharing, createClaudeProvider } from './claude';
 import { startupDiagnostics } from './startupDiagnostics';
 
 class Socket implements WsLike {
@@ -136,7 +136,7 @@ describe('Node provider host', () => {
     } finally { await rm(dir, { recursive: true, force: true }); }
   });
   // A pre-existing diagnostic path must never write through a symbolic or hard link.
-  it.each(['symlink', 'hardlink'])('refuses a %s at the diagnostic file path', async (kind, context) => {
+  it.each(['symlink', 'hardlink'])('refuses a %s at the diagnostic file path', async (kind) => {
     const dir = await mkdtemp(path.join(os.tmpdir(), 'cindy-startup-link-'));
     const target = path.join(dir, 'unrelated.txt');
     try {
@@ -144,7 +144,7 @@ describe('Node provider host', () => {
       try {
         await (kind === 'symlink' ? symlink(target, path.join(dir, 'startup-timing.jsonl')) : link(target, path.join(dir, 'startup-timing.jsonl')));
       } catch (error) {
-        if (kind === 'symlink' && ['EPERM', 'ENOTSUP'].includes((error as NodeJS.ErrnoException).code ?? '')) { context.skip(); return; }
+        if (kind === 'symlink' && ['EPERM', 'ENOTSUP'].includes((error as NodeJS.ErrnoException).code ?? '')) return;
         throw error;
       }
       const diagnostics = startupDiagnostics(() => {}, dir);
@@ -216,6 +216,72 @@ describe('Node provider host', () => {
       expect(await runShareControl(dir, ['list'])).toEqual({ action: 'list' });
       await expect(runShareControl(dir, ['approve', 'request', 'bad'])).rejects.toThrow();
     } finally { await stop(); await rm(dir, { recursive: true, force: true }); }
+  });
+
+  // Regression: host-side API model discovery used fetch without a proxy, although
+  // native Claude inherited HTTP(S)_PROXY. Production entry: createClaudeProvider;
+  // observable result: models arrive through the proxy, including pagination.
+  // Minimal input: an unresolvable API host and a local proxy returning a catalog.
+  // Existing native-sharing tests do not cover API discovery. Tier: integration (real sockets).
+  // Standalone focused run: 10.35s wall, 9.87s shared-module collection, 71ms test;
+  // keep in the existing integration tier rather than adding another heavy import graph.
+  it('discovers Claude API models through the configured proxy and rejects proxy failures', async () => {
+    const requests: Array<{ url?: string; auth?: string; key?: string }> = [];
+    const tunnels: string[] = [];
+    let status = 200;
+    const proxy = createServer((req, res) => {
+      requests.push({ url: req.url, auth: req.headers['proxy-authorization'], key: req.headers['x-api-key'] as string });
+      res.writeHead(status, { 'content-type': 'application/json', ...(status === 302 ? { location: '/redirected' } : {}) });
+      const second = req.url?.includes('after_id=');
+      res.end(JSON.stringify({ data: [{ id: second ? 'claude-sonnet-4-6' : 'claude-opus-4-7' }],
+        has_more: !second, last_id: 'claude-opus-4-7' }));
+    });
+    proxy.on('connect', (req, socket) => {
+      tunnels.push(req.url!);
+      socket.end('HTTP/1.1 502 Bad Gateway\r\nConnection: close\r\n\r\n');
+    });
+    await new Promise<void>(resolve => proxy.listen(0, '127.0.0.1', resolve));
+    const port = (proxy.address() as { port: number }).port;
+    for (const name of ['HTTP_PROXY', 'HTTPS_PROXY']) vi.stubEnv(name, `http://fake:invalid-secret@127.0.0.1:${port}`);
+    for (const name of ['NO_PROXY', 'no_proxy', 'ALL_PROXY', 'all_proxy']) vi.stubEnv(name, '');
+    const dir = await mkdtemp(path.join(os.tmpdir(), 'cindy-claude-proxy-'));
+    const settings = { CINDY_HOST_CLAUDE_BINARY: process.execPath, CINDY_HOST_CLAUDE_AUTH: 'api-key',
+      ANTHROPIC_API_KEY: 'invalid-fixture-api-key', ANTHROPIC_BASE_URL: 'http://claude-api.invalid' };
+    try {
+      const provider = await createClaudeProvider(dir, quietRuntimeLogger(), settings);
+      try { expect([...provider.modelIds]).toEqual(['claude-opus-4-7', 'claude-sonnet-4-6']); }
+      finally { await provider.dispose(); }
+      expect(requests.map(req => req.url)).toEqual(['http://claude-api.invalid/v1/models?limit=100',
+        'http://claude-api.invalid/v1/models?limit=100&after_id=claude-opus-4-7']);
+      expect(requests.every(req => req.auth === `Basic ${Buffer.from('fake:invalid-secret').toString('base64')}`
+        && req.key === 'invalid-fixture-api-key')).toBe(true);
+      status = 407;
+      await expect(createClaudeProvider(dir, quietRuntimeLogger(), settings)).rejects.toThrow('Anthropic model discovery failed');
+      expect(requests).toHaveLength(3);
+      await expect(createClaudeProvider(dir, quietRuntimeLogger(), { ...settings,
+        ANTHROPIC_BASE_URL: 'https://claude-api.invalid' })).rejects.toThrow('Anthropic model discovery failed');
+      expect(tunnels).toEqual(['claude-api.invalid:443']);
+      vi.stubEnv('HTTP_PROXY', 'unsupported://fake:invalid-secret@proxy.invalid');
+      await expect(createClaudeProvider(dir, quietRuntimeLogger(), settings)).rejects.toThrow('Unsupported Claude outbound proxy');
+      expect(requests).toHaveLength(3);
+      // Local API gateways must remain reachable even with an unusable external proxy.
+      status = 200;
+      const localSettings = { ...settings, ANTHROPIC_BASE_URL: `http://127.0.0.1:${port}` };
+      const local = await createClaudeProvider(dir, quietRuntimeLogger(), localSettings);
+      try { expect(local.modelIds.size).toBe(2); } finally { await local.dispose(); }
+      expect(requests.slice(3).map(req => ({ url: req.url, auth: req.auth }))).toEqual([
+        { url: '/v1/models?limit=100', auth: undefined },
+        { url: '/v1/models?limit=100&after_id=claude-opus-4-7', auth: undefined },
+      ]);
+      status = 302;
+      await expect(createClaudeProvider(dir, quietRuntimeLogger(), localSettings)).rejects.toThrow('Anthropic model discovery failed');
+      expect(requests).toHaveLength(6); // No request follows the redirect carrying the API key.
+    } finally {
+      vi.unstubAllEnvs();
+      proxy.closeAllConnections();
+      await new Promise<void>(resolve => proxy.close(() => resolve()));
+      await rm(dir, { recursive: true, force: true });
+    }
   });
 
   // Native config resolution + the same proxy component Desktop uses. Only fake

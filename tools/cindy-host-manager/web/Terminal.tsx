@@ -172,76 +172,118 @@ export function LoginTerminal({
       tail = "";
     };
   }, [id]);
+  const dotClass =
+    status === "connected" || status === "completed"
+      ? "ok"
+      : status === "failed" || status === "interrupted"
+        ? "err"
+        : "busy";
   return (
     <section className="login-terminal" aria-label={t("terminal")}>
-      <div className="toolbar">
-        <h3>{t("terminal")}</h3>
-        <button
-          disabled={!hasSelection}
-          onClick={() => copySelection.current()}
-        >
-          {t("copySelected")}
-        </button>
-        <button onClick={onClose}>{t("close")}</button>
+      <div className="terminal-header">
+        <div className="terminal-title-group">
+          <h3>{t("terminal")}</h3>
+          <p className="badge" role="status">
+            <span className={`dot ${dotClass}`} />
+            {t(status)}
+          </p>
+        </div>
+        <div className="toolbar">
+          <button
+            className="sm"
+            disabled={!hasSelection}
+            onClick={() => copySelection.current()}
+          >
+            {t("copySelected")}
+          </button>
+          <button className="sm danger-outline" onClick={onClose}>
+            {t("close")}
+          </button>
+        </div>
       </div>
-      <p role="status">{t(status)}</p>
-      {notice && <p role="status">{t(notice)}</p>}
-      <div className="terminal" ref={node} />
-      <details>
-        <summary>{t("loginAnswer")}</summary>
-        <p>{t("loginAnswerNote")}</p>
-        <form
-          onSubmit={(event) => {
-            event.preventDefault();
-            const input = event.currentTarget.elements.namedItem(
-              "answer",
-            ) as HTMLInputElement;
-            const value = input.value;
-            input.value = "";
-            if (
-              !value ||
-              value.length > 4096 ||
-              /[\x00-\x1f\x7f]/.test(value)
-            ) {
-              setNotice("answerInvalid");
-              return;
-            }
-            setNotice(
-              submitAnswer.current(value) ? "answerSent" : "answerNotSent",
-            );
-          }}
-        >
-          <label>
-            {t("loginAnswerValue")}
-            <input
-              ref={answerField}
-              name="answer"
-              type="password"
-              autoComplete="off"
-              maxLength={4096}
-              required
-              disabled={status !== "connected"}
-            />
-          </label>
-          <button disabled={status !== "connected"}>{t("submitAnswer")}</button>
-        </form>
-      </details>
+      {notice && (
+        <p className="terminal-notice" role="status">
+          {t(notice)}
+        </p>
+      )}
       {links.length > 0 && (
-        <nav aria-label={t("loginLinks")}>
+        <nav className="oauth-link-banner" aria-label={t("loginLinks")}>
           {links.map((url, index) => (
-            <p key={url}>
+            <div className="oauth-link-row" key={url}>
               <a
+                className="btn sm primary-cta-link"
                 href={url}
                 target="_blank"
                 rel="noopener noreferrer"
                 referrerPolicy="no-referrer"
               >
-                {t("openLogin")} {index + 1} · {new URL(url).host}
+                ↗ {t("openLogin")} {index + 1} · {new URL(url).host}
               </a>
-            </p>
+              <button
+                type="button"
+                className="btn sm"
+                onClick={() => {
+                  try {
+                    void navigator.clipboard.writeText(url).then(
+                      () => setNotice("copied"),
+                      () => setNotice("copyFailed"),
+                    );
+                  } catch {
+                    setNotice("copyFailed");
+                  }
+                }}
+              >
+                {t("copy")}
+              </button>
+            </div>
           ))}
         </nav>
       )}
+      <div className="terminal" ref={node} />
+      <div className="terminal-footer">
+        <details>
+          <summary>{t("loginAnswer")}</summary>
+          <p>{t("loginAnswerNote")}</p>
+          <form
+            className="terminal-answer-row"
+            onSubmit={(event) => {
+              event.preventDefault();
+              const input = event.currentTarget.elements.namedItem(
+                "answer",
+              ) as HTMLInputElement;
+              const value = input.value;
+              input.value = "";
+              if (
+                !value ||
+                value.length > 4096 ||
+                /[\x00-\x1f\x7f]/.test(value)
+              ) {
+                setNotice("answerInvalid");
+                return;
+              }
+              setNotice(
+                submitAnswer.current(value) ? "answerSent" : "answerNotSent",
+              );
+            }}
+          >
+            <label>
+              {t("loginAnswerValue")}
+              <input
+                ref={answerField}
+                name="answer"
+                type="password"
+                autoComplete="off"
+                maxLength={4096}
+                required
+                disabled={status !== "connected"}
+              />
+            </label>
+            <button className="primary" disabled={status !== "connected"}>
+              {t("submitAnswer")}
+            </button>
+          </form>
+        </details>
+      </div>
     </section>
   );
 }
