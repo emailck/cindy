@@ -17,6 +17,9 @@ git lfs version
 
 ## 安装
 
+以下是完整 Desktop / Mobile 开发环境。仅构建命令行版本时，使用下文的
+[仅构建 CLI](#仅构建-cli)，无需安装 Electron。
+
 ```bash
 git clone https://github.com/makecindy/cindy.git
 cd cindy
@@ -43,8 +46,8 @@ correctly`。`pnpm test:unit` 等 workspace 测试开跑前也会只读检查一
 未就绪时以 `DEPENDENCY_SETUP_INCOMPLETE` 直接给出处置命令，不再让几十个测试文件各自报错。
 
 新 worktree 不共享 `node_modules`。确认 checkout 已完成且根 `package.json` 存在后，
-在该 worktree 内重新运行 `pnpm install`；不要加 `--ignore-scripts`，上述补装都在安装
-脚本里完成。
+在该 worktree 内重新运行所选模式的安装命令（完整开发使用 `pnpm install`，CLI 使用下文
+的过滤安装）；不要加 `--ignore-scripts`，原生依赖及上述补装都在安装脚本里完成。
 
 Mobile 的 Global / CN 开发与打包只需仓内公开端点清单，不要求本机存在
 `config/endpoint.dev.json`。Metro 在这两个区域将私有 dev 清单排除出依赖图；不能靠从
@@ -65,6 +68,72 @@ Cindy Make 的设置入口和指令前置弹窗共用源码准备流程：切到
 `pnpm install --frozen-lockfile --prefer-offline --prod=false` 优先复用
 准备阶段填充的 pnpm store 缓存，并执行必要的安装脚本；各 worktree 仍保留独立的 `node_modules`，不复制或
 链接个人分支的依赖目录。安装失败或取消可在现有 checkout 上重试，不重置个人分支。
+
+## 仅构建 CLI
+
+适用于只构建 `@cindy/host`（远程 Agent provider）和 `cindy-headless`（评测 CLI）的
+机器。保留完整源码 checkout：Headless 构建仍会读取 Desktop 中的共享 prompt 源，不能
+把 `apps/desktop` 源码目录一起删除。CLI 不需要 Electron、桌面打包工具或 Mobile 依赖；
+共享 Agent SDK、SQLite、图片处理等依赖仍需保留。
+
+在仓库根目录执行以下安装命令。Node.js / pnpm 版本要求仍以根与对应 app 的 manifest 为准：
+
+```bash
+CI=1 ELECTRON_SKIP_BINARY_DOWNLOAD=1 XDT_SKIP_AGENT_BIN_INSTALL=1 \
+  pnpm --filter '@cindy/host...' --filter 'cindy-headless...' install \
+  --frozen-lockfile --prefer-offline --prod=false \
+  --config.node-linker=isolated --shamefully-hoist
+```
+
+- `...` 包含 CLI 的共享 workspace 依赖；`--prod=false` 保留构建和类型检查工具。
+- 必须覆盖仓库默认的 `node-linker=hoisted`：在当前 pnpm 中，只加 `--filter` 而保留
+  hoisted 布局，仍可能安装整仓锁文件中的依赖。`isolated` 限制安装范围；
+  `--shamefully-hoist` 只提升所选依赖，兼容 Headless 对共享 `better-sqlite3` 的解析。
+- 两个环境变量跳过 Electron 和 Agent 可执行程序的自动下载；安装生命周期仍执行，
+  不使用 `--ignore-scripts`。运行 Agent 时再按需执行 `pnpm install:codex`、
+  `pnpm install:claude` 或 `pnpm install:pi`，不修改仓库版本 pin。
+- 从完整安装切换时，pnpm 会重建依赖布局，先结束使用该 checkout 的开发服务与并行构建。
+  `CI=1` 允许非交互重建。已有桌面或移动端依赖目录若仍残留，可在确认无需使用后清理；
+  不删除源码、运行数据或其他项目的依赖。
+
+### 进一步只保留本机平台
+
+根 `package.json` 的 `pnpm.supportedArchitectures` 默认包含 Windows、macOS、Linux
+及 x64、ARM64。过滤 CLI workspace 不会自动取消这些配置，Agent SDK 等仍可能安装多个
+平台的二进制包。Linux x64 / glibc 构建机可以在**执行上述安装命令期间**将该字段临时设为：
+
+```json
+{
+  "os": ["linux"],
+  "cpu": ["x64"],
+  "libc": ["glibc"]
+}
+```
+
+修改前记录该字段的原值，安装完成或失败后均恢复原值；不要提交这项机器专用设置，
+也不要用整文件 `git checkout` 覆盖已有改动。期间不要并行修改 manifest 或安装依赖。
+当前 pnpm 10.33.2 的 workspace 安装会再次读取根 manifest，单独传入 `--os` / `--cpu`
+不能可靠覆盖这项配置。其他架构应使用实际目标值；本流程已在 Linux x64 / glibc 验证。
+
+### 构建、验证与后续更新
+
+依赖已就位后直接构建，无需每次重新安装：
+
+```bash
+pnpm --filter '@cindy/host' --filter 'cindy-headless' build
+pnpm --filter '@cindy/host' --filter 'cindy-headless' typecheck
+node apps/cindy-host/dist/cli.cjs --version
+node apps/cindy-headless/dist/cli.cjs version
+```
+
+不要用根级 `pnpm build`：它会准备并构建 Desktop。以后锁文件变化需要补装时，继续使用
+上述过滤安装命令；普通 `pnpm install` 会重新安装 Desktop / Mobile 依赖。要恢复完整
+桌面开发环境，则在未设置两个跳过下载变量的终端中重新执行 `pnpm install --frozen-lockfile`。
+
+CLI 依赖精简不会自动缩小已有 Docker 镜像，也不自动清理 pnpm store。store 与项目依赖
+可能共享硬链接，不能把各目录大小简单相加；清理缓存时只回收不再被项目引用的文件。
+正式 Headless 出包继续遵循[出包手册](../../apps/cindy-headless/UPDATE_AND_PACKAGE.zh-CN.md)，
+上述构建和类型检查不代表已完成正式分发验证。
 
 ## macOS：iOS 模拟器构建工具链
 

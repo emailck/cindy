@@ -77,7 +77,7 @@ git lfs version
 预期分别为 `v22.22.0`、`10.33.2` 与可用的 Git LFS。新登录终端需重新配置上述
 Node/pnpm PATH；可以在自己的 shell 配置中保存这些**非秘密路径**。
 
-## 3. 克隆 fork 分支、完整安装与构建
+## 3. 克隆 fork 分支、仅安装 CLI 依赖并构建
 
 使用当前实现所在的 fork 分支；HTTPS 示例不需要把 GitHub token 写进 URL。
 若仓库不可公开读取，使用用户已配置的正常 Git 认证，不在命令行中嵌入秘密。
@@ -89,7 +89,10 @@ cd "$HOME/src/cindy"
 git lfs pull
 git branch --show-current
 git rev-parse HEAD
-pnpm install --frozen-lockfile
+CI=1 ELECTRON_SKIP_BINARY_DOWNLOAD=1 XDT_SKIP_AGENT_BIN_INSTALL=1 \
+  pnpm --filter '@cindy/host...' --filter 'cindy-headless...' install \
+  --frozen-lockfile --prefer-offline --prod=false \
+  --config.node-linker=isolated --shamefully-hoist
 pnpm --filter @cindy/host typecheck
 pnpm --filter @cindy/host build
 node apps/cindy-host/dist/cli.cjs help
@@ -97,8 +100,10 @@ node apps/cindy-host/dist/cli.cjs --version
 ```
 
 记录实际 commit，便于更新与回退。安装失败就停在该步修复，不加 `--ignore-scripts`，
-不只安装 `apps/cindy-host` 子目录，也不更改锁文件绕过失败。完整安装会准备本仓其它
-应用的依赖与 runtime 下载，可能占用较多磁盘和时间；**不需要启动 Electron 窗口**。
+不只安装 `apps/cindy-host` 子目录，也不更改锁文件绕过失败。上述命令保留两个 CLI 入口
+及共享依赖，不安装 Desktop / Mobile 工具链。仅保留本机架构、从完整安装切换及后续补装的
+说明见[仅构建 CLI](../../docs/dev-rules/environment-setup.md#仅构建-cli)。Agent 可执行程序
+按下文所选 provider 单独安装。
 已知构建可能出现既有 `image-resizer.ts` direct-eval 提示；其它错误不能直接忽略。
 
 显式确保当前平台的仓库固定 Claude 二进制就绪，版本由 `tools/claude/latest.json`
@@ -336,7 +341,10 @@ cd "$HOME/src/cindy"
 git fetch origin feature/cli-provider-host
 git merge --ff-only origin/feature/cli-provider-host
 git lfs pull
-pnpm install --frozen-lockfile
+CI=1 ELECTRON_SKIP_BINARY_DOWNLOAD=1 XDT_SKIP_AGENT_BIN_INSTALL=1 \
+  pnpm --filter '@cindy/host...' --filter 'cindy-headless...' install \
+  --frozen-lockfile --prefer-offline --prod=false \
+  --config.node-linker=isolated --shamefully-hoist
 pnpm install:claude
 pnpm --filter @cindy/host typecheck
 pnpm --filter @cindy/host build

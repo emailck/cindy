@@ -19,7 +19,12 @@ language. Recreate existing containers from the updated image to apply new defau
 
 ## Build and inspect
 
-From the repository root after installing workspace dependencies:
+For a CLI-only build machine, follow [仅构建 CLI](../../docs/dev-rules/environment-setup.md#仅构建-cli)
+to install the CLI workspace dependencies without Electron or Desktop/Mobile build tools.
+Use that filtered installation again when dependencies change; plain `pnpm install`
+restores the full workspace dependencies.
+
+From the repository root after installing the required dependencies:
 
 ```sh
 pnpm --filter @cindy/host build

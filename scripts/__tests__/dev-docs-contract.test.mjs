@@ -17,6 +17,8 @@ const COMMAND_CHECKED_DOCS = [...CHECKED_DOCS, "apps/desktop/README.md"];
 const WORKSPACES = new Map([
 	["desktop", "apps/desktop/package.json"],
 	["mobile", "apps/mobile/package.json"],
+	["@cindy/host", "apps/cindy-host/package.json"],
+	["cindy-headless", "apps/cindy-headless/package.json"],
 ]);
 const PNPM_BUILTINS = new Set(["install", "--version"]);
 
@@ -57,25 +59,36 @@ function shellLines(relativePath) {
 }
 
 function assertPnpmCommandExists(line, rootPackage) {
-	const tokens = line.split(/\s+/);
+	const tokens = line.split(/\s+/).map((token) => token.replace(/^(['"])(.*)\1$/, "$2"));
 	if (tokens[1] === "--filter") {
-		const selector = tokens[2];
-		const command = tokens[3];
-		const workspaceManifest = WORKSPACES.get(selector);
-		assert.ok(workspaceManifest, `unknown workspace selector in documented command: ${line}`);
-		const workspacePackage = readJson(workspaceManifest);
-		if (command === "exec") {
-			const binary = tokens[4];
-			assert.ok(
-				workspacePackage.dependencies?.[binary] || workspacePackage.devDependencies?.[binary],
-				`documented binary '${binary}' is not declared by ${workspaceManifest}: ${line}`,
-			);
-			return;
+		// CLI installation selects multiple workspace dependency closures. Validate
+		// every named workspace rather than treating a second --filter as a script.
+		const manifests = [];
+		let index = 1;
+		while (tokens[index] === "--filter") {
+			const selector = (tokens[index + 1] ?? "").replace(/\.\.\.$/, "");
+			const manifest = WORKSPACES.get(selector);
+			assert.ok(manifest, `unknown workspace selector in documented command: ${line}`);
+			manifests.push(manifest);
+			index += 2;
 		}
-		assert.ok(
-			workspacePackage.scripts?.[command],
-			`documented script '${command}' is missing from ${workspaceManifest}: ${line}`,
-		);
+		const command = tokens[index];
+		if (PNPM_BUILTINS.has(command)) return;
+		for (const workspaceManifest of manifests) {
+			const workspacePackage = readJson(workspaceManifest);
+			if (command === "exec") {
+				const binary = tokens[index + 1];
+				assert.ok(
+					workspacePackage.dependencies?.[binary] || workspacePackage.devDependencies?.[binary],
+					`documented binary '${binary}' is not declared by ${workspaceManifest}: ${line}`,
+				);
+				continue;
+			}
+			assert.ok(
+				workspacePackage.scripts?.[command],
+				`documented script '${command}' is missing from ${workspaceManifest}: ${line}`,
+			);
+		}
 		return;
 	}
 
