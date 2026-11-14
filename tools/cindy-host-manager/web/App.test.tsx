@@ -632,3 +632,254 @@ it("shows progress and the result when testing an unsaved default in left Settin
   await waitFor(() => expect(within(form).getByRole("status", { hidden: true }).textContent).toContain("203.0.113.7"));
   expect(calls.some(c => c.path === "/api/settings" && c.method === "PUT")).toBe(false);
 });
+
+// FED-004, tier unit: mount the production App to protect central routing, node
+// isolation and offline recovery. Existing standalone tests cannot expose two
+// computers with the same instance ID. Minimal input: A/B, ID=test, delayed A
+// authentication followed by selecting B. Enrollment fixture values are fake.
+function centralFixture() {
+  const nodes = [
+    {
+      id: "alpha",
+      name: "Alpha computer",
+      online: true,
+      lastSeen: null as string | null,
+    },
+    {
+      id: "beta",
+      name: "Beta computer",
+      online: true,
+      lastSeen: null as string | null,
+    },
+  ];
+  const requests: {
+    path: string;
+    method: string;
+    body?: any;
+    csrf?: string;
+  }[] = [];
+  let failAlphaInventory = false;
+  let waitForAlpha: Promise<void> | undefined;
+  let signedIn = true;
+  const base = (node: string) => ({
+    id: "test",
+    name: `${node} instance`,
+    engine: "codex",
+    state: "stopped",
+    proxyMode: "none",
+    createdAt: "2026-01-01",
+  });
+  vi.stubGlobal(
+    "fetch",
+    vi.fn(async (path: string, options: RequestInit) => {
+      const method = options.method ?? "GET";
+      const body = options.body ? JSON.parse(String(options.body)) : undefined;
+      requests.push({
+        path,
+        method,
+        body,
+        csrf: (options.headers as Record<string, string>)["X-CSRF-Token"],
+      });
+      let data: unknown;
+      if (path === "/api/session") {
+        if (method === "DELETE") signedIn = false;
+        data = {
+          authenticated: signedIn,
+          mode: "central",
+          csrfToken: "fake-central-csrf",
+        };
+      } else if (path === "/api/federation/nodes") {
+        data =
+          method === "POST"
+            ? {
+                node: {
+                  id: "new",
+                  name: body.name,
+                  online: false,
+                  lastSeen: null,
+                },
+                enrollmentToken: "fake-one-time-token",
+                expiresAt: new Date(Date.now() + 60_000).toISOString(),
+              }
+            : { nodes: nodes.map((node) => ({ ...node })) };
+      } else if (
+        path === "/api/federation/nodes/alpha" &&
+        method === "DELETE"
+      ) {
+        nodes.splice(
+          nodes.findIndex((node) => node.id === "alpha"),
+          1,
+        );
+        data = {};
+      } else {
+        const match = path.match(
+          /^\/api\/federation\/nodes\/(alpha|beta)\/api(.*)$/,
+        );
+        if (!match) throw new Error(`Unexpected central route ${path}`);
+        const [, node, route] = match;
+        if (route === "/instances" && node === "alpha" && failAlphaInventory)
+          return { ok: false, status: 503, json: async () => ({ error: { code: "NODE_OFFLINE" } }) };
+        if (route === "/instances") data = { instances: [base(node)] };
+        else if (route === "/settings")
+          data = { image: "fake", proxyConfigured: false, proxyUrl: null };
+        else if (route.endsWith("/actions")) {
+          if (node === "alpha" && waitForAlpha) await waitForAlpha;
+          data = {
+            instance: {
+              ...base(node),
+              authentication: { cindy: "stored", provider: "authenticated" },
+              accounts: {
+                cindy: { displayName: `${node} owner` },
+                provider: null,
+              },
+            },
+          };
+        } else if (route === "/proxy/test")
+          data = {
+            ip: "203.0.113.8",
+            country: "Fixture",
+            region: "",
+            city: "",
+          };
+        else if (route.endsWith("/login")) data = { loginId: "fake-login" };
+        else throw new Error(`Unexpected scoped route ${route}`);
+      }
+      return { ok: true, json: async () => data };
+    }),
+  );
+  return {
+    nodes,
+    requests,
+    failAlphaInventory: () => { failAlphaInventory = true; },
+    delayAlpha: (promise: Promise<void>) => {
+      waitForAlpha = promise;
+    },
+  };
+}
+
+it("binds real account and Proxy pages using central CSRF despite a peer inventory failure", async () => {
+  const fixture = centralFixture();
+  fixture.failAlphaInventory();
+  render(<App />);
+  await screen.findByText("Instance overview unavailable. Refresh to check again.");
+  const management = await screen.findAllByRole("button", {
+    name: "Manage computer",
+  });
+  fireEvent.click(management[1]);
+  const manager = screen.getByRole("region", {
+    name: "Manage computer · Beta computer",
+  });
+  await within(manager).findByText("beta instance");
+  const proxy = within(manager).getByLabelText("Default Proxy URL");
+  fireEvent.change(proxy, { target: { value: "http://fixture.invalid:8080" } });
+  fireEvent.click(
+    within(proxy.closest("form")!).getByRole("button", {
+      name: "Test Proxy",
+      hidden: true,
+    }),
+  );
+  await waitFor(() =>
+    expect(
+      within(manager).getByRole("status", { hidden: true }).textContent,
+    ).toContain("203.0.113.8"),
+  );
+  expect(
+    fixture.requests.find((request) => request.path.endsWith("/proxy/test")),
+  ).toMatchObject({
+    path: "/api/federation/nodes/beta/api/proxy/test",
+    csrf: "fake-central-csrf",
+    method: "POST",
+  });
+  expect(
+    fixture.requests.some(
+      (request) =>
+        request.path === "/api/settings" ||
+        request.path.includes("/api/session", 5),
+    ),
+  ).toBe(false);
+  fireEvent.click(within(manager).getByRole("button", { name: /Manage/ }));
+  await within(manager).findByText("beta owner");
+  expect(
+    fixture.requests.find((request) => request.path.endsWith("/actions")),
+  ).toMatchObject({
+    path: "/api/federation/nodes/beta/api/instances/test/actions",
+    csrf: "fake-central-csrf",
+  });
+});
+
+it("discards delayed account results when switching computers with the same instance ID", async () => {
+  const fixture = centralFixture();
+  let finish!: () => void;
+  fixture.delayAlpha(
+    new Promise<void>((resolve) => {
+      finish = resolve;
+    }),
+  );
+  render(<App />);
+  fireEvent.click(
+    (await screen.findAllByRole("button", { name: "Manage computer" }))[0],
+  );
+  const alpha = screen.getByRole("region", {
+    name: "Manage computer · Alpha computer",
+  });
+  await within(alpha).findByText("alpha instance");
+  fireEvent.click(within(alpha).getByRole("button", { name: /Manage/ }));
+  fireEvent.click(
+    screen.getAllByRole("button", { name: "Manage computer" })[1],
+  );
+  const beta = screen.getByRole("region", {
+    name: "Manage computer · Beta computer",
+  });
+  await within(beta).findByText("beta instance");
+  fireEvent.click(within(beta).getByRole("button", { name: /Manage/ }));
+  await within(beta).findByText("beta owner");
+  await act(async () => finish());
+  expect(screen.queryByText("alpha owner")).toBeNull();
+  expect(within(beta).getByText("beta owner")).toBeTruthy();
+  fixture.nodes[1].online = false;
+  fireEvent(window, new Event("focus"));
+  await waitFor(() =>
+    expect(within(beta).queryByText("beta owner")).toBeNull(),
+  );
+  expect(within(beta).getByRole("status").textContent).toContain(
+    "may still be running",
+  );
+  fixture.nodes[1].online = true;
+  fireEvent(window, new Event("online"));
+  await within(beta).findByText("beta instance");
+});
+
+it("shows enrollment only in memory and revokes a computer without stopping instances", async () => {
+  const fixture = centralFixture();
+  vi.stubGlobal("confirm", () => true);
+  render(<App />);
+  await screen.findByText("Alpha computer");
+  fireEvent.change(screen.getByLabelText("Computer name"), {
+    target: { value: "New computer" },
+  });
+  fireEvent.click(screen.getByRole("button", { name: "Add computer" }));
+  const token = (await screen.findByLabelText(
+    "One-time connection code",
+  )) as HTMLInputElement;
+  expect(token.value).toBe("fake-one-time-token");
+  expect(
+    fixture.requests.find((request) => request.method === "POST"),
+  ).toMatchObject({
+    path: "/api/federation/nodes",
+    csrf: "fake-central-csrf",
+    body: { name: "New computer" },
+  });
+  fireEvent.click(screen.getByRole("button", { name: "Close" }));
+  expect(screen.queryByDisplayValue("fake-one-time-token")).toBeNull();
+  fireEvent.click(screen.getAllByRole("button", { name: "Revoke access" })[0]);
+  await waitFor(() => expect(screen.queryByText("Alpha computer")).toBeNull());
+  expect(
+    fixture.requests.find((request) => request.method === "DELETE"),
+  ).toMatchObject({
+    path: "/api/federation/nodes/alpha",
+    csrf: "fake-central-csrf",
+  });
+  expect(
+    fixture.requests.some((request) => request.body?.action === "stop"),
+  ).toBe(false);
+});

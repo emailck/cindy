@@ -1147,3 +1147,97 @@ th {
     height: 280px;
   }
 }
+
+/* Fleet controls share standalone semantic colors in both appearance modes. */
+.fleet-page {
+  display: flex;
+  flex-direction: column;
+  gap: 24px;
+}
+.enrollment-form {
+  display: flex;
+  align-items: end;
+  flex-wrap: wrap;
+  gap: 12px;
+}
+.enrollment-form label {
+  flex: 1;
+  min-width: 180px;
+  max-width: 440px;
+}
+.enrollment-panel,
+.machine-card {
+  border: 1px solid var(--border-default);
+  border-radius: 12px;
+  padding: 16px;
+  background: var(--surface-elevated);
+  min-width: 0;
+}
+.enrollment-panel {
+  display: flex;
+  flex-direction: column;
+  align-items: start;
+  gap: 8px;
+}
+.enrollment-panel label {
+  width: 100%;
+}
+.enrollment-panel input {
+  width: 100%;
+}
+.enrollment-command {
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+.fleet-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(min(100%, 300px), 1fr));
+  gap: 16px;
+}
+.machine-heading {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+.machine-heading h3,
+.machine-heading h2 {
+  overflow-wrap: anywhere;
+}
+.machine-card .toolbar {
+  flex-wrap: wrap;
+  margin-top: 16px;
+}
+.fleet-instances {
+  list-style: none;
+  padding: 0;
+  margin: 12px 0;
+}
+.fleet-instances li {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 12px;
+  padding: 8px 0;
+  border-top: 1px solid var(--border-default);
+}
+.fleet-instances li > span:first-child {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+.machine-management {
+  border-top: 1px solid var(--border-default);
+  padding-top: 24px;
+}
+@media (max-width: 640px) {
+  .enrollment-form label {
+    max-width: none;
+  }
+  .enrollment-form > button {
+    width: 100%;
+  }
+  .fleet-page {
+    gap: 16px;
+  }
+}

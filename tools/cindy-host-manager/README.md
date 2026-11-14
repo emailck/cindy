@@ -1,14 +1,16 @@
 # Cindy CLI Host Manager
 
-A single Linux host administrator panel for multiple **cindy-host CLI** containers.
+An administrator panel for **cindy-host CLI** containers. Standalone mode manages
+one Linux Docker host; optional central mode brings multiple independent
+standalone managers into one page.
 Each instance runs either Codex or Claude Code. The containers do not run Desktop,
 Electron, VNC, or a desktop environment. The web page handles creation, native
 account login, start/stop, invitations and sharing approvals. Desktop and Mobile
 remain external Cindy clients that use the running provider.
 
 This is an independent npm package; do not install the repository workspace just
-to run this manager. Requirements: Node.js 24+, npm, a local Docker Engine with a
-Unix socket, and the cindy-host runtime image. Building that image from source
+to run this manager. Requirements: Node.js 24+ and npm. Standalone mode also needs
+a local Docker Engine with a Unix socket and the cindy-host runtime image. Building that image from source
 requires the repository's separate pnpm setup; see [CLI deployment](../../apps/cindy-host/README.md).
 
 ## Install and start
@@ -155,7 +157,84 @@ Configuration: `CINDY_MANAGER_HOST` (default `127.0.0.1`),
 `CINDY_MANAGER_DATA_DIR`, and `CINDY_MANAGER_ORIGIN`.
 Non-loopback binding requires an explicit HTTPS origin behind a TLS proxy.
 Use a service supervisor with the same private data path and image configuration
-for unattended operation. The manager must stay on the Docker host.
+for unattended operation. Each standalone manager stays on its Docker host. A central manager does not
+require Docker; it routes management operations to the selected standalone manager.
+
+## Central management of independent machines
+
+Each machine keeps its existing standalone manager, administrator password,
+instances, Proxy settings, native account credentials and Docker volumes. Local
+and central controls use that machine's same service and instance locks. The
+central manager stores machine registration and credential verification data;
+it does not take ownership of remote instance databases or native accounts.
+Instances keep running if the central manager is unavailable, and local pages
+remain usable. There is no instance migration, scheduling or automatic failover.
+
+Build the same package for both roles. On the central host, choose a **separate
+private data directory**, initialize its administrator with `npm run init`, then
+start with `CINDY_MANAGER_MODE=central`. Set `CINDY_MANAGER_ORIGIN` to the exact
+HTTPS origin using the reverse proxy instructions above. Central mode needs
+Node.js and this package, but no Docker daemon or CLI image. The default mode
+remains `standalone`; existing standalone installations do not change roles.
+
+Sign in to the central page and add a machine. It displays a short-lived,
+one-time enrollment code. On that machine, stop only the standalone **manager
+process**, leaving its CLI containers and volumes intact. Complete any active
+native login first. Use its existing private data directory and service account,
+then enroll with the following Bash example:
+
+```bash
+export CINDY_MANAGER_MODE=standalone
+export CINDY_MANAGER_CENTRAL_ORIGIN=https://manager.example.com
+# CINDY_MANAGER_DATA_DIR must be the standalone manager's existing private directory.
+read -r -s -p 'Enrollment code: ' cindy_enrollment
+printf '\n'
+printf '%s' "$cindy_enrollment" | node dist/main.js connect
+unset cindy_enrollment
+```
+
+The code is read through stdin, not a command argument or shell-history literal.
+Restart the standalone manager normally (`node dist/main.js serve` or its existing
+service supervisor). It connects outbound to the central manager over WSS;
+no inbound Docker or management port needs to be exposed on the machine.
+The connection configuration and machine credential are encrypted with the
+standalone manager's existing private store. The central origin above is an
+example, not a provided public service.
+
+The central page lists machines and their instances. Select a machine to use its
+existing instance, account login, sharing and Proxy controls. Proxy tests run on
+the selected machine. Selecting another machine clears the previous machine's
+login output and sensitive UI state. Machine and overview status are refreshed
+periodically while the central page is open and when it regains focus.
+
+Only explicit manager operations are forwarded. Browser sessions stay on the
+central host; they are not used as machine credentials. Login output and explicit
+single-line answers are forwarded live and are not written into the federation
+operation journal. A central sign-out or expired login lease cancels its remote
+login interactions, not other local interactions or running CLI instances.
+
+An offline machine is not a stopped instance. Central operations are unavailable
+until it reconnects. A lost connection during a write can leave its outcome
+unknown: check the machine's actual state before issuing a new operation. The
+connection does not automatically replay writes; duplicate operation IDs are
+rejected or resolved without executing the mutation again. Native authentication
+and invitation responses are not persisted centrally for replay.
+
+To remove central access, revoke the machine in the central page, or stop its
+standalone manager process and run `node dist/main.js disconnect` with the same
+service account and private data directory, then restart it. This preserves local
+accounts, configuration, containers and volumes. Central revocation prevents
+future connections; it does not mean that remote containers have been stopped.
+
+Federation uses a separate versioned management protocol; incompatible peers
+cannot manage each other. It does not change Cindy Device Link or its relay.
+Older standalone data remains usable without a federation configuration. Rollback
+of a standalone installation retains its original instance database and volumes;
+older binaries ignore the extra metadata. A central data directory is not a
+replacement for any standalone machine's data directory or its backups.
+
+Implementation and acceptance scope: [plan](../../docs/cindy-manager-federation-plan.md)
+and [progress](../../docs/cindy-manager-federation-progress.md).
 
 ## Development and validation
 

@@ -11,6 +11,8 @@
  */
 
 import { appendAutoReviewUserIntent, type AutoReviewUserIntent } from './agents/shared/auto-review-decision.js';
+import { bindSessionSendOwner, readSessionSendTerminalOwner } from './session-send-terminal.js';
+export { markSessionSendTerminal, readSessionSendTerminalStatus } from './session-send-terminal.js';
 import { randomUUID } from 'node:crypto';
 import { ToolLoopGuard } from './agents/shared/loop-guard.js';
 import { AsyncUserQuestions } from './agents/shared/async-user-questions.js';
@@ -959,6 +961,7 @@ export class Session {
     // turnDispatched:handle.send 成功、本次 send 真正成为运行中的 turn。
     let originInstalled = false;
     let turnDispatched = false;
+    let sendOwnerValid = true;
     let dispatchConfirmedUndispatched = false;
     let dispatchUnconfirmed = false;
     let previousTurnOrigin: SendOrigin | null = null;
@@ -1059,11 +1062,15 @@ export class Session {
         const loopIntent = appendAutoReviewUserIntent(previousLoopIntent, autoReviewSourceContent, handleOpts);
         try {
           this.toolLoopUserIntent = loopIntent;
-          await this.handle.send(msg, {
+          await this.handle.send(msg, bindSessionSendOwner({
             ...handleOpts,
             [AUTO_REVIEW_SOURCE_CONTENT]: autoReviewSourceContent,
             signal: reservation.abortController.signal,
-          });
+          }, reservedTurnGeneration, () => {
+            if (!sendOwnerValid || reservedTurnGeneration !== this.turnGeneration) return undefined;
+            return this.terminalEventObservedGeneration === reservedTurnGeneration
+              && this.unsolicitedTurnGeneration !== reservedTurnGeneration ? 'settled' : 'unsettled';
+          }));
         } catch (error) {
           if (this.toolLoopUserIntent === loopIntent) this.toolLoopUserIntent = previousLoopIntent;
           throw error;
@@ -1125,6 +1132,9 @@ export class Session {
       }
       throw e;
     } finally {
+      // Rejected sends may roll back their generation; their context must stay
+      // retired even if the next accepted send reuses that number.
+      if (!turnDispatched) sendOwnerValid = false;
       cleanupExternalAbort();
       if (this.sendReservation === reservation) {
         this.sendReservation = null;
@@ -2677,7 +2687,13 @@ export class Session {
     isBackgroundEvent: boolean,
     isCurrentGeneration: boolean,
   ): boolean {
-    if (isBackgroundEvent || !isCurrentGeneration || !this.isNewTurnProgressEvent(event)) return false;
+    // Claude knows a top-level automatic turn started even when the first
+    // response is only an API-error envelope. Ordinary running/child statuses
+    // are not evidence: they can be leftover activity from the preceding turn.
+    const providerStart = event.source === 'claude-code' && event.type === 'status' &&
+      (event.data as { isRunning?: unknown; providerInitiatedTurn?: unknown } | null)?.isRunning === true &&
+      (event.data as { providerInitiatedTurn?: unknown } | null)?.providerInitiatedTurn === true;
+    if (isBackgroundEvent || !isCurrentGeneration || (!providerStart && !this.isNewTurnProgressEvent(event))) return false;
     const parentUuid = event.agentMeta?.parentUuid;
     if (typeof parentUuid === 'string' && parentUuid.length > 0) return false;
     const generation = this.turnGeneration;
@@ -3601,6 +3617,14 @@ export class Session {
           // held while the send is pending. In-flight start-failure errors still
           // belong to this send.
           observedGeneration = this.turnGeneration;
+        }
+        // Adapter-owned transport terminals name the actual send, even when
+        // next() was waiting on an older turn. Provider fields cannot mint this.
+        const terminalOwner = readSessionSendTerminalOwner(event);
+        if (terminalOwner === null) continue;
+        if (terminalOwner === this.turnGeneration) {
+          event.sessionTurnGeneration = terminalOwner;
+          observedGeneration = terminalOwner;
         }
         if (this.terminationStarted) continue;
         // origin 打标与终态清理都收在 fanOutEvent 里（看门狗合成的事件共用同一语义，

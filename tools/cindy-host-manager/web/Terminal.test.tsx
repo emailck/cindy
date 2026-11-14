@@ -74,9 +74,12 @@ vi.mock("@xterm/addon-fit", () => ({
     fit() {}
   },
 }));
-it("waits for a complete native login URL and cancels when unmounted", () => {
+// FED-004: the same temporary login ID on two computers must open the selected
+// computer's WebSocket; standalone coverage alone cannot protect that boundary.
+it.each(["/api", "/api/federation/nodes/beta/api"])("binds login stream to %s, waits for complete URLs, and cancels on unmount", (apiPrefix) => {
   const sends: unknown[] = [];
   const close = vi.fn();
+  let socketUrl = "";
   class Socket {
     static OPEN = 1;
     readyState = 1;
@@ -88,7 +91,8 @@ it("waits for a complete native login URL and cancels when unmounted", () => {
       sends.push(JSON.parse(data));
     }
     close = close;
-    constructor() {
+    constructor(url: URL) {
+      socketUrl = String(url);
       socket = this;
     }
   }
@@ -102,8 +106,9 @@ it("waits for a complete native login URL and cancels when unmounted", () => {
     },
   );
   const view = render(
-    <LoginTerminal id="login" t={translator("en")} onClose={() => {}} />,
+    <LoginTerminal id="login" apiPrefix={apiPrefix} t={translator("en")} onClose={() => {}} />,
   );
+  expect(new URL(socketUrl).pathname).toBe(`${apiPrefix}/logins/login`);
   act(() => {
     socket.onopen?.();
     socket.onmessage?.({

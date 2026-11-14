@@ -60,6 +60,20 @@ export class Store {
         value: string;
     } | undefined)?.value; }
     set(key: string, value: string) { this.db.prepare('INSERT INTO metadata(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value').run(key, value); }
+    delete(key: string) { this.db.prepare('DELETE FROM metadata WHERE key=?').run(key); }
+    secret<T>(key: string): T | undefined {
+        const encrypted = this.get(key);
+        if (!encrypted) return undefined;
+        const buffer = Buffer.from(encrypted, 'base64');
+        const decipher = createDecipheriv('aes-256-gcm', this.key, buffer.subarray(0, 12));
+        decipher.setAuthTag(buffer.subarray(12, 28));
+        return JSON.parse(Buffer.concat([decipher.update(buffer.subarray(28)), decipher.final()]).toString()) as T;
+    }
+    setSecret(key: string, value: unknown) {
+        const iv = randomBytes(12), cipher = createCipheriv('aes-256-gcm', this.key, iv);
+        const ciphertext = Buffer.concat([cipher.update(JSON.stringify(value)), cipher.final()]);
+        this.set(key, Buffer.concat([iv, cipher.getAuthTag(), ciphertext]).toString('base64'));
+    }
     insert(instance: InstanceRecord) { this.db.prepare('INSERT INTO instances VALUES(?,?,?,?,?)').run(instance.id, instance.name, instance.engine, instance.proxyMode, instance.createdAt); }
     update(instance: InstanceRecord) { this.db.prepare('UPDATE instances SET name=?,proxyMode=? WHERE id=?').run(instance.name, instance.proxyMode, instance.id); }
     list(): InstanceRecord[] { return this.db.prepare('SELECT * FROM instances ORDER BY createdAt,id').all() as unknown as InstanceRecord[]; }

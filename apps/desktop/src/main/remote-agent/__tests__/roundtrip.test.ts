@@ -1701,6 +1701,27 @@ describe('shared startup lease budget', () => {
     if (stage === 'allocate') expect(historyOpenLink).not.toHaveBeenCalled();
   });
 
+  it('reconnects after a queued done and idle reclaim arrive in one poll', async () => {
+    const f = fixture(); f.state.ready = true;
+    const handle = await f.open('historical');
+    const session = new Session({ id: 'historical', agentKind: 'codex', workDir: project,
+      handle, capabilities: {} as never, logger: historyLogger as never, turnStallMs: 0 });
+    try {
+      expect(await session.send('first')).toMatchObject({ accepted: true });
+      const run = [...f.runs.values()].at(-1)!;
+      run.onData(Buffer.from([
+        JSON.stringify({ t: 'event', event: { type: 'done', source: 'codex', data: {} } }),
+        JSON.stringify({ t: 'closed', reason: 'closed', idleReclaimed: true }), '',
+      ].join('\n')), false);
+      await flush();
+      expect(session.getObservedCurrentTurnTerminal()).toMatchObject({ kind: 'done', generation: 1 });
+      expect(f.disposed).toEqual([]);
+      expect(await session.send('second')).toMatchObject({ accepted: true });
+      expect(f.calls.filter(call => call.op === 'open')).toHaveLength(2);
+      expect(f.disposed).toEqual([]);
+    } finally { await session.close(); }
+  });
+
   it('preserves legacy O lookup fallback and missing lifetime, but never substitutes another historical M', async () => {
     const f = fixture();
     historyInvoke.mockRejectedValueOnce(new Error('[REMOTE_AGENT_PEER_TOO_OLD] old O'));
@@ -1735,12 +1756,13 @@ describe('shared startup lease budget upload cancellation', () => {
   function fixture() {
     let reply!: () => void;
     const held = new Promise<void>(resolve => { reply = resolve; });
-    const requests: Array<{ op: string; index?: number }> = [];
+    const requests: Array<{ op: string; index?: number; method?: string; callId?: string }> = [];
     let hold = false;
     const invoke = async (args: unknown[]) => {
-      const request = args[0] as { op: string; index?: number };
+      const request = args[0] as { op: string; index?: number; method?: string; callId?: string };
       requests.push(request);
       if (hold && request.op === 'upload') await held;
+      if (request.op === 'call') client.onData(Buffer.from(JSON.stringify({ t: 'result', callId: request.callId, ok: true }) + '\n'), false);
       return {};
     };
     const client = new RemoteAgentRunClient(randomUUID(), { invoke, unregister() {} } as unknown as RemoteAgentPoller, {
@@ -1771,6 +1793,32 @@ describe('shared startup lease budget upload cancellation', () => {
     f.client.abandon('start-cancelled'); payloadCompression.finish!();
     await expect(starting).rejects.toThrow('REMOTE_AGENT_EXPIRED');
     expect(f.requests).toEqual([]);
+  });
+
+  // Unit: Stop/signal must fence a preparing send without closing this run or
+  // another peer. Existing startup cancellation only covered abandoning the client.
+  it.each(['abort', 'requestGracefulStop', 'signal'] as const)('%s fences send/steer across compression and upload', async stop => {
+    for (const phase of ['compression', 'upload'] as const) {
+      const f = fixture(), sibling = fixture(), abort = new AbortController();
+      payloadCompression.paused = phase === 'compression';
+      if (phase === 'upload') f.hold();
+      const sending = f.client.callWithId(randomUUID(), phase === 'compression' ? 'send' : 'steer', [f.payload], abort.signal);
+      const rejected = expect(sending).rejects.toMatchObject({ name: 'AbortError' });
+      await flush();
+      if (stop === 'signal') abort.abort();
+      else await f.client.call(stop, []);
+      if (phase === 'compression') payloadCompression.finish!();
+      else f.reply();
+      await rejected;
+      expect(f.requests.filter(request => request.method === 'send' || request.method === 'steer')).toEqual([]);
+      expect(f.requests.filter(request => request.op === 'upload')).toHaveLength(phase === 'upload' ? 1 : 0);
+      expect(f.client.hasPendingWork).toBe(false);
+      await expect(f.client.call('send', ['next'])).resolves.toBeUndefined();
+      await expect(sibling.client.call('send', ['independent peer'])).resolves.toBeUndefined();
+      expect(f.requests.filter(request => request.method === 'send')).toHaveLength(1);
+      expect(sibling.requests.filter(request => request.method === 'send')).toHaveLength(1);
+      f.client.abandon('fixture-complete'); sibling.client.abandon('fixture-complete');
+    }
   });
 
   it('completes both chunks when not cancelled and rejects an already-closed payload before compression', async () => {

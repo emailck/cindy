@@ -40,17 +40,21 @@ export class ApiError extends Error {
 }
 export class Api {
   csrf = "";
+  constructor(readonly prefix = "/api") {}
   async request<T>(path: string, method = "GET", body?: unknown): Promise<T> {
-    const response = await fetch(`/api${path}`, {
-      method,
-      credentials: "same-origin",
-      cache: "no-store",
-      headers: {
-        "Content-Type": "application/json",
-        ...(method !== "GET" ? { "X-CSRF-Token": this.csrf } : {}),
+    const response = await fetch(
+      `${path === "/session" ? "/api" : this.prefix}${path}`,
+      {
+        method,
+        credentials: "same-origin",
+        cache: "no-store",
+        headers: {
+          "Content-Type": "application/json",
+          ...(method !== "GET" ? { "X-CSRF-Token": this.csrf } : {}),
+        },
+        ...(body === undefined ? {} : { body: JSON.stringify(body) }),
       },
-      ...(body === undefined ? {} : { body: JSON.stringify(body) }),
-    });
+    );
     const data = await response.json();
     if (!response.ok)
       throw new ApiError(

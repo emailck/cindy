@@ -6,11 +6,13 @@ import type { Key } from "./i18n";
 import "@xterm/xterm/css/xterm.css";
 export function LoginTerminal({
   id,
+  apiPrefix = "/api",
   t,
   onClose,
   onExit,
 }: {
   id: string;
+  apiPrefix?: string;
   t: (key: Key) => string;
   onClose: () => void;
   onExit?: (code: number) => void;
@@ -84,7 +86,10 @@ export function LoginTerminal({
       attributes: true,
       attributeFilter: ["data-theme"],
     });
-    const url = new URL(`/api/logins/${encodeURIComponent(id)}`, location.href);
+    const url = new URL(
+      `${apiPrefix}/logins/${encodeURIComponent(id)}`,
+      location.href,
+    );
     url.protocol = location.protocol === "https:" ? "wss:" : "ws:";
     const socket = new WebSocket(url);
     let ended = false;
@@ -171,7 +176,7 @@ export function LoginTerminal({
       term.dispose();
       tail = "";
     };
-  }, [id]);
+  }, [id, apiPrefix]);
   const dotClass =
     status === "connected" || status === "completed"
       ? "ok"

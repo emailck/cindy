@@ -5,15 +5,21 @@ import { randomBytes } from 'node:crypto';
 import { openSync, closeSync, writeFileSync, fstatSync, lstatSync, unlinkSync } from 'node:fs';
 import { Store } from './store.js';
 import { Auth } from './auth.js';
-import { ManagerService } from './service.js';
+import { ApiError, ManagerService } from './service.js';
 import { createManagerServer } from './server.js';
 import { DockerRuntimeAdapter } from './docker-runtime.js';
+import { FederationHub, FederationConnector, enrollManager, disconnectManager } from './federation.js';
 class StartupError extends Error {
 }
 async function main() {
     process.umask(0o077);
     const directory = process.env.CINDY_MANAGER_DATA_DIR ?? join(homedir(), '.local/share/cindy-host-manager');
     const store = new Store(directory);
+    const command = process.argv[2] ?? 'serve';
+    if (process.argv.length > 3)
+        throw new StartupError('Use init, serve, connect or disconnect; configure deployment with environment variables.');
+    const mode = process.env.CINDY_MANAGER_MODE ?? 'standalone';
+    if (mode !== 'standalone' && mode !== 'central') throw new StartupError('Invalid CINDY_MANAGER_MODE.');
     const lockPath = join(directory, 'manager.lock');
     let lock: number;
     try {
@@ -29,10 +35,32 @@ async function main() {
             unlinkSync(lockPath);
     }
     catch { } closeSync(lock); });
+    if (command === 'connect' || command === 'disconnect') {
+        if (mode !== 'standalone') throw new StartupError('Only standalone managers connect to a central manager.');
+        try {
+            if (command === 'disconnect') {
+                disconnectManager(store);
+                process.stdout.write('Central connection removed. Start the local manager to continue managing instances.\n');
+            } else {
+                const centralOrigin = process.env.CINDY_MANAGER_CENTRAL_ORIGIN;
+                if (!centralOrigin) throw new StartupError('Set CINDY_MANAGER_CENTRAL_ORIGIN.');
+                if (process.stdin.isTTY) throw new StartupError('Pipe the one-time enrollment code to connect via stdin.');
+                const chunks: Buffer[] = [];
+                let size = 0;
+                for await (const chunk of process.stdin) {
+                    size += chunk.length;
+                    if (size > 4096) throw new StartupError('Enrollment input is too long.');
+                    chunks.push(Buffer.from(chunk));
+                }
+                const token = Buffer.concat(chunks).toString().replace(/\r?\n$/, '');
+                await enrollManager(store, centralOrigin, token);
+                process.stdout.write('Central connection saved. The local manager connects while serving.\n');
+            }
+        } finally { store.close(); }
+        return;
+    }
     const auth = new Auth(store);
-    const command = process.argv[2] ?? 'serve';
-    if (process.argv.length > 3)
-        throw new StartupError('Use init or serve; configure deployment with environment variables.');
+
     if (command === 'init') {
         let password: string;
         if (process.stdin.isTTY && !process.stdout.isTTY)
@@ -59,7 +87,7 @@ async function main() {
         return;
     }
     if (command !== 'serve')
-        throw new StartupError('Use init or serve.');
+        throw new StartupError('Use init, serve, connect or disconnect.');
     if (!auth.initialized())
         throw new StartupError('Initialize the administrator locally with init before starting.');
     const host = process.env.CINDY_MANAGER_HOST ?? '127.0.0.1';
@@ -80,15 +108,20 @@ async function main() {
     if (!loopback && (!process.env.CINDY_MANAGER_ORIGIN || publicUrl.protocol !== 'https:'))
         throw new StartupError('Public binding requires an explicit trusted HTTPS origin behind a TLS reverse proxy.');
     const image = process.env.CINDY_MANAGER_IMAGE ?? 'cindy-host:local';
-    const runtime = new DockerRuntimeAdapter({ image, socketPath: process.env.CINDY_MANAGER_DOCKER_SOCKET });
-    const service = new ManagerService(store, runtime, image);
-    const app = createManagerServer({ auth, service, origin, webDirectory: join(dirname(fileURLToPath(import.meta.url)), 'web') });
+    // Central mode never initializes a Docker adapter or exposes local instance routes.
+    const service = mode === 'standalone'
+        ? new ManagerService(store, new DockerRuntimeAdapter({ image, socketPath: process.env.CINDY_MANAGER_DOCKER_SOCKET }), image)
+        : undefined;
+    const hub = mode === 'central' ? new FederationHub(store) : undefined;
+    const connector = service ? new FederationConnector({ service, store }) : undefined;
+    const app = createManagerServer({ auth, service, mode, hub, connector, origin, webDirectory: join(dirname(fileURLToPath(import.meta.url)), 'web') });
     await new Promise<void>((done, reject) => { app.server.once('error', reject); app.server.listen(port, host, done); });
-    process.stdout.write(`Cindy host manager listening at ${origin}\n`);
+    connector?.start();
+    process.stdout.write(`Cindy host manager (${mode}) listening at ${origin}\n`);
     let closing = false;
     const shutdown = () => { if (closing)
         return; closing = true; void app.close().then(() => store.close()).catch(() => { process.stderr.write('Shutdown failed. Check managed login containers before restarting.\n'); process.exitCode = 1; }); };
     process.once('SIGINT', shutdown);
     process.once('SIGTERM', shutdown);
 }
-void main().catch(error => { process.stderr.write((error instanceof StartupError ? error.message : 'Manager could not start. Check configuration, private data directory permissions and administrator initialization.') + '\n'); process.exitCode = 1; });
+void main().catch(error => { process.stderr.write((error instanceof StartupError || error instanceof ApiError ? error.message : 'Manager could not start. Check configuration, private data directory permissions and administrator initialization.') + '\n'); process.exitCode = 1; });

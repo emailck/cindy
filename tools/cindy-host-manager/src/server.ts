@@ -3,9 +3,13 @@ import { readFile, realpath, stat } from 'node:fs/promises';
 import { resolve, extname, sep } from 'node:path';
 import { WebSocketServer, WebSocket } from 'ws';
 import { Auth, type Session } from './auth.js';
-import { ApiError, ManagerService, object } from './service.js';
+import type { FederationHub, FederationConnector } from './federation.js';
+import { ApiError, ManagerService, object, text } from './service.js';
 export interface ServerOptions {
-    service: ManagerService;
+    service?: ManagerService;
+    mode?: 'standalone' | 'central';
+    hub?: FederationHub;
+    connector?: FederationConnector;
     auth: Auth;
     origin: string;
     webDirectory: string;
@@ -51,7 +55,10 @@ async function body(req: IncomingMessage): Promise<unknown> {
         throw new ApiError(400, 'INVALID_JSON', 'Invalid JSON.');
     }
 }
-export function createManagerServer({ service, auth, origin, webDirectory }: ServerOptions) {
+export function createManagerServer({ service, auth, origin, webDirectory, mode = 'standalone', hub, connector }: ServerOptions) {
+    if (mode === 'central' ? (!hub || !!service || !!connector) : (!service || !!hub))
+        throw new Error('Manager mode requires only its matching service.');
+    async function revoke(owner: string) { hub?.revokeOwner(owner); await service?.revoke(owner); }
     const expected = new URL(origin);
     if (expected.origin !== origin || expected.username || expected.password || !['http:', 'https:'].includes(expected.protocol))
         throw new Error('Origin must be an HTTP(S) origin without credentials or a path.');
@@ -70,10 +77,16 @@ export function createManagerServer({ service, auth, origin, webDirectory }: Ser
         Object.entries(securityHeaders).forEach(([name, value]) => res.setHeader(name, value));
         verifyHost(req);
         const url = new URL(req.url ?? '/', origin), path = url.pathname, method = req.method;
+        // Machine enrollment exchanges a one-time secret, never a browser session.
+        if (mode === 'central' && hub && path === '/api/federation/enroll' && method === 'POST') {
+            const data = object(await body(req), ['enrollmentToken', 'credential']);
+            json(res, 200, hub.enroll(text(data.enrollmentToken, 512), data.credential === undefined ? undefined : text(data.credential, 512)));
+            return;
+        }
         if (path === '/api/session') {
             if (method === 'GET') {
                 const current = auth.session(req.headers.cookie);
-                json(res, 200, current ? { authenticated: true, csrfToken: current.csrfToken } : { authenticated: false });
+                json(res, 200, current ? { authenticated: true, csrfToken: current.csrfToken, mode } : { authenticated: false, mode });
                 return;
             }
             if (method === 'POST') {
@@ -87,19 +100,19 @@ export function createManagerServer({ service, auth, origin, webDirectory }: Ser
                 const previous = auth.session(req.headers.cookie);
                 if (previous) {
                     auth.revoke(previous.id);
-                    await service.revoke(previous.id);
+                    await revoke(previous.id);
                 }
                 res.setHeader('Set-Cookie', cookie(current.id, Math.floor(auth.lifetimeMs / 1000)));
-                json(res, 200, { authenticated: true, csrfToken: current.csrfToken });
+                json(res, 200, { authenticated: true, csrfToken: current.csrfToken, mode });
                 return;
             }
             if (method === 'DELETE') {
                 const current = session(req);
                 writeGuard(req, current);
                 auth.revoke(current.id);
-                await service.revoke(current.id);
+                await revoke(current.id);
                 res.setHeader('Set-Cookie', cookie('', 0));
-                json(res, 200, { authenticated: false });
+                json(res, 200, { authenticated: false, mode });
                 return;
             }
         }
@@ -107,6 +120,32 @@ export function createManagerServer({ service, auth, origin, webDirectory }: Ser
             const current = session(req);
             if (method !== 'GET')
                 writeGuard(req, current);
+            if (mode === 'central' && hub) {
+                if (path === '/api/federation/nodes' && method === 'GET') {
+                    json(res, 200, { nodes: hub.listNodes() }); return;
+                }
+                if (path === '/api/federation/nodes' && method === 'POST') {
+                    const data = object(await body(req), ['name']);
+                    json(res, 201, hub.createEnrollment(text(data.name, 100).trim())); return;
+                }
+                const node = path.match(/^\/api\/federation\/nodes\/([a-f0-9-]{36})$/);
+                if (node && method === 'DELETE') {
+                    hub.revoke(node[1]!); json(res, 200, { revoked: true }); return;
+                }
+                const scoped = path.match(/^\/api\/federation\/nodes\/([a-f0-9-]{36})(\/api\/.*)$/);
+                if (scoped) {
+                    const payload = method === 'GET' ? undefined : await body(req);
+                    if (!auth.active(current.id)) throw new ApiError(401, 'UNAUTHENTICATED', 'Sign in to continue.');
+                    const result = await hub.request(scoped[1]!, current.id, method ?? 'GET', scoped[2]!, payload);
+                    if (!auth.active(current.id)) {
+                        hub.revokeOwner(current.id);
+                        throw new ApiError(401, 'UNAUTHENTICATED', 'Sign in to continue.');
+                    }
+                    json(res, result.status, result.body); return;
+                }
+                throw new ApiError(404, 'NOT_FOUND', 'Select a connected manager.');
+            }
+            if (!service) throw new ApiError(404, 'NOT_FOUND', 'Local service unavailable.');
             if (path === '/api/proxy/test' && method === 'POST') {
                 json(res, 200, await service.testProxy(await body(req)));
                 return;
@@ -187,11 +226,59 @@ export function createManagerServer({ service, auth, origin, webDirectory }: Ser
     server.requestTimeout = 30000;
     server.headersTimeout = 10000;
     const wss = new WebSocketServer({ noServer: true, maxPayload: 16384, perMessageDeflate: false });
+    const machines = new WebSocketServer({ noServer: true, maxPayload: 1024 * 1024, perMessageDeflate: false });
     server.on('upgrade', (req, socket, head) => {
+        void (async () => {
         try {
             verifyHost(req);
+            const path = new URL(req.url ?? '/', origin).pathname;
+            if (mode === 'central' && hub && path === '/api/federation/connect') {
+                const nodeId = req.headers['x-cindy-node-id'];
+                const credential = req.headers.authorization?.match(/^Bearer ([A-Za-z0-9_-]+)$/)?.[1];
+                if (typeof nodeId !== 'string' || !credential || !hub.authenticate(nodeId, credential))
+                    throw new ApiError(401, 'UNAUTHENTICATED', 'Machine authentication required.');
+                machines.handleUpgrade(req, socket, head, ws => hub.accept(ws, nodeId, credential));
+                return;
+            }
             verifyOrigin(req);
             const current = session(req);
+            if (mode === 'central' && hub) {
+                const scoped = path.match(/^\/api\/federation\/nodes\/([a-f0-9-]{36})\/api\/logins\/([a-f0-9-]{36})$/);
+                if (!scoped) throw new ApiError(404, 'NOT_FOUND', 'Login not found.');
+                // Validate ownership on the node before acknowledging the browser socket.
+                let browser: WebSocket | undefined;
+                const queued: unknown[] = [];
+                let queuedBytes = 0;
+                let ended = false;
+                const stream = await hub.attachLogin(scoped[1]!, current.id, scoped[2]!, message => {
+                    if (!auth.active(current.id)) { hub.revokeOwner(current.id); browser?.close(1008); return; }
+                    if (!browser) {
+                        queuedBytes += Buffer.byteLength(JSON.stringify(message));
+                        if (queuedBytes > 65536) { ended = true; return; }
+                        queued.push(message); return;
+                    }
+                    if (browser.readyState === WebSocket.OPEN) {
+                        if (browser.bufferedAmount > 262144) browser.close(1009);
+                        else browser.send(JSON.stringify(message));
+                    }
+                }, () => { ended = true; browser?.close(1000); });
+                if (!auth.active(current.id) || socket.destroyed || ended) {
+                    stream.close(); throw new ApiError(401, 'UNAUTHENTICATED', 'Login no longer active.');
+                }
+                try { wss.handleUpgrade(req, socket, head, ws => {
+                    browser = ws;
+                    queued.forEach(message => ws.send(JSON.stringify(message)));
+                    ws.on('message', raw => {
+                        if (!auth.active(current.id)) { hub.revokeOwner(current.id); ws.close(1008); return; }
+                        try { stream.message(JSON.parse(raw.toString())); }
+                        catch { ws.close(1008); }
+                    });
+                    ws.on('close', () => stream.close());
+                    ws.on('error', () => stream.close());
+                }); } catch (error) { stream.close(); throw error; }
+                return;
+            }
+            if (!service) throw new ApiError(404, 'NOT_FOUND', 'Local service unavailable.');
             const match = new URL(req.url ?? '/', origin).pathname.match(/^\/api\/logins\/([a-f0-9-]{36})$/);
             if (!match)
                 throw new ApiError(404, 'NOT_FOUND', 'Login not found.');
@@ -256,6 +343,7 @@ export function createManagerServer({ service, auth, origin, webDirectory }: Ser
                     catch {
                         login.send?.({ type: 'error', message: 'Invalid terminal message.' });
                         ws.close(1008);
+                        cleanup();
                     }
                 });
                 ws.on('close', cleanup);
@@ -267,17 +355,23 @@ export function createManagerServer({ service, auth, origin, webDirectory }: Ser
             socket.write(`HTTP/1.1 ${status} Rejected\r\nConnection: close\r\n\r\n`);
             socket.destroy();
         }
+        })().catch(() => socket.destroy());
     });
-    const sweep = setInterval(() => { auth.prune(); void service.sweep(id => auth.active(id)); }, 1000);
+    const sweep = setInterval(() => {
+        auth.prune(); hub?.sweep(id => auth.active(id));
+        void service?.sweep(id => auth.active(id) || !!connector?.isOwnerActive(id));
+    }, 1000);
     sweep.unref();
     return {
         server,
         async close() {
             clearInterval(sweep);
             let cleanupError:unknown;
-            try {await service.close();} catch(error) {cleanupError=error;}
+            try {hub?.close(); await connector?.close(); await service?.close();} catch(error) {cleanupError=error;}
             for(const client of wss.clients) client.terminate();
             wss.close();
+            for (const client of machines.clients) client.terminate();
+            machines.close();
             await new Promise<void>((done,reject)=>{
                 server.close(error=>error?reject(error):done());
                 server.closeAllConnections();

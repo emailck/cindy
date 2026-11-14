@@ -44,6 +44,7 @@ describe('buildClaudeEnv', () => {
   const originalExploreInheritCap = process.env[EXPLORE_INHERIT_CAP_DISABLE_ENV];
 
   afterEach(() => {
+    vi.unstubAllEnvs();
     if (originalDisableCron === undefined) {
       delete process.env.CLAUDE_CODE_DISABLE_CRON;
     } else {
@@ -69,6 +70,34 @@ describe('buildClaudeEnv', () => {
     const env = await buildClaudeEnv(createAuthAdapter(), {});
 
     expect(env.CLAUDE_CODE_DISABLE_CRON).toBe('1');
+  });
+
+  // Test value: buildClaudeEnv controls the actual CLI spawn environment. SYNC-05
+  // retains privacy defaults even though upstream 2.1.321 ties model feature flags
+  // to telemetry. Existing auth tests did not cover this key. Minimal input:
+  // nativeCliAuth=true without an explicit choice; unit, no CLI/account/network.
+  it('keeps telemetry disabled by default for native subscriptions', async () => {
+    vi.stubEnv('DISABLE_TELEMETRY', undefined);
+    vi.stubEnv('DISABLE_ERROR_REPORTING', undefined);
+    vi.stubEnv('OTEL_SDK_DISABLED', undefined);
+    const env = await buildClaudeEnv(createAuthAdapter(), {}, { nativeCliAuth: true });
+    expect(env.DISABLE_TELEMETRY).toBe('1');
+    expect(env.DISABLE_ERROR_REPORTING).toBe('1');
+    expect(env.OTEL_SDK_DISABLED).toBe('true');
+  });
+
+  it.each(['local', 'remote'] as const)('keeps telemetry disabled for %s gateway sessions', async (mode) => {
+    vi.stubEnv('DISABLE_TELEMETRY', undefined);
+    const env = await buildClaudeEnv(createAuthAdapter(), {}, {
+      mode, nativeCliAuth: mode === 'remote',
+    });
+    expect(env.DISABLE_TELEMETRY).toBe('1');
+  });
+
+  it.each(['1', '0', ''])('preserves explicit native telemetry setting %j', async (value) => {
+    vi.stubEnv('DISABLE_TELEMETRY', value);
+    const env = await buildClaudeEnv(createAuthAdapter(), {}, { nativeCliAuth: true });
+    expect(env.DISABLE_TELEMETRY).toBe(value);
   });
 
   // Anthropic #106458: API credits can be rejected when an SDK request claims a

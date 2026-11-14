@@ -246,6 +246,24 @@ relay 以 close 1013 `inbound backpressure` 主动断连，此时任何「立即
 
 ## 远程 Agent 的拉取与恢复(`maker:remote-agent:v1`)
 
+远程轮次结算（2026-11-13）：共享宿主与控制端按发送归属结算终态，不能用最后一条事件类型或
+忙碌快照代替产品轮次。发送结果不明时保留运行状态；明确的 `TURN_DISPATCH_REJECTED` 恢复
+被拒发送之前的归属，Stop 不被迟到快照重新打开。空闲回收与重启先排空已送达事件，再判断
+是否仍有未完成轮次；Claude 明确的 `providerInitiatedTurn` 状态可以开始自动轮次，普通忙碌、
+后台与子 Agent 状态不能。Session 内部发送身份用 WeakMap 绑定，消费时重验；拒绝导致数字
+generation 复用也不能让旧合成终态结束新轮。
+
+本地 AbortSignal 与 Stop 代次在压缩后、分片上传回包后及最终调用前检查，只阻止尚未发出的
+部分；已交付结果不明的调用不重放、不声称已撤回。没有新增 wire 字段、channel、能力位或
+授权范围；既有错误 code 保留明确拒绝语义，旧运行端未提供此 code 时按不确定失败处理。
+官方与自建中转继续透传现有 result/closed，无需修改内核。故障与恢复只作用于当前 run / 请求，
+不重建共享 poller、link 或 relay；多 run / peer 隔离由 roundtrip 回归验证。
+
+实现为 `packages/remote-agent-host` 与 Desktop 的 `remote-agent/controller`，Session 身份在
+`packages/maker-core/src/session-send-terminal.ts`；生产入口回归为 Desktop
+`remote-agent/__tests__/{groupRelay,roundtrip,proxyHandleClose}.test.ts` 及 maker-core
+`session.origin.test.ts`。本地验证不等于新旧版本双端、真实分享撤销或线上断线恢复已验收。
+
 供应商进程重启（2026-10-29）：已打开的 run 收到 `missing`、`provider-restarting` 或旧端的
 `aborted` 时只释放这条远程连接，保留本机执行器和 MCP 身份。空闲任务下次发送再接回；进行中的
 一轮通过现有供应商组恢复租约、五次有界探测和输入队列自动续跑一次，未归组的供应商也适用。

@@ -9,8 +9,10 @@ import { describe, expect, it, vi } from 'vitest';
 import path from 'node:path';
 
 import { Session } from './session.js';
+import { markSessionSendTerminal, readSessionSendTerminalStatus } from './session-send-terminal.js';
 import {
   MAIN_OWNED_SEND_CONTEXT,
+  TurnDispatchRejectedError,
   AUTO_REVIEW_SOURCE_CONTENT,
   AUTO_REVIEW_USER_INTENT,
   AUTO_REVIEW_DELEGATED_CONTINUATION,
@@ -751,6 +753,74 @@ describe('Session per-turn origin 打标', () => {
     releaseDispatch();
     await second;
     await session.close();
+  });
+
+  // Production entry: Session.send + its provider event stream (unit tier).
+  // Regression 5f8e51f4fd: a transport terminal received by next() from N must
+  // settle N+1 only with N+1's exact host-bound options; provider fields/copies
+  // cannot claim ownership. Existing tests exercise only unmarked provider events.
+  it.each(['current', 'prior', 'copied', 'provider'] as const)('owns synthetic transport terminals only through the %s send context', async owner => {
+    const h = createControllableHandle();
+    const session = makeSession(h.handle);
+    try {
+      await session.send('first');
+      const prior = h.lastSendOptions();
+      await h.emit({ type: 'text', data: { text: 'first progress' } });
+      h.setTurnRunning(false);
+      await session.send('second');
+      const current = h.lastSendOptions();
+      const options = owner === 'current' ? current : owner === 'prior' ? prior : { ...current };
+      await h.emit(markSessionSendTerminal(owner === 'provider' ? undefined : options, {
+        type: 'error', source: 'codex', sessionTurnGeneration: 2,
+        data: { message: 'transport closed', reason: 'remote_agent_closed', isTerminal: true },
+      }));
+      expect(session.getObservedCurrentTurnTerminal()).toMatchObject(owner === 'current'
+        ? { kind: 'error', generation: 2 } : { kind: 'none' });
+    } finally { await session.close(); }
+  });
+
+  // The host reads the status only after queued events drain: pending work is
+  // unsettled, a consumed terminal settles it, and superseded/rejected sends
+  // cannot be used as current-turn evidence. Minimal input: one send + done.
+  it('reports only the current accepted send status after consuming its terminal', async () => {
+    const h = createControllableHandle();
+    const session = makeSession(h.handle);
+    try {
+      await session.send('first');
+      const first = h.lastSendOptions();
+      expect(readSessionSendTerminalStatus(first)).toBe('unsettled');
+      expect(readSessionSendTerminalStatus({ ...first })).toBeUndefined();
+      await h.emit({ type: 'done', data: {} });
+      expect(readSessionSendTerminalStatus(first)).toBe('settled');
+      await session.send('second');
+      expect(readSessionSendTerminalStatus(first)).toBeUndefined();
+      expect(readSessionSendTerminalStatus(h.lastSendOptions())).toBe('unsettled');
+    } finally { await session.close(); }
+  });
+
+  it('does not expose a rejected send as a current unsettled turn', async () => {
+    const h = createControllableHandle({ sendError: new TurnDispatchRejectedError('not accepted') });
+    const send = h.handle.send.bind(h.handle);
+    let queuedTerminal: AgentEvent | undefined;
+    h.handle.send = async (message, options) => {
+      queuedTerminal ??= markSessionSendTerminal(options, { type: 'error', source: 'codex',
+        data: { message: 'late rejected send', isTerminal: true } });
+      return send(message, options);
+    };
+    const session = makeSession(h.handle);
+    try {
+      await expect(session.send('rejected')).resolves.toMatchObject({ accepted: false });
+      const rejectedOptions = h.lastSendOptions();
+      expect(readSessionSendTerminalStatus(rejectedOptions)).toBeUndefined();
+      await expect(session.send('accepted')).resolves.toMatchObject({ accepted: true });
+      expect(readSessionSendTerminalStatus(rejectedOptions)).toBeUndefined();
+      expect(readSessionSendTerminalStatus(h.lastSendOptions())).toBe('unsettled');
+      // Marked while rejected send was still in flight, consumed only after the
+      // next accepted send reused its numeric generation.
+      await h.emit(queuedTerminal!);
+      expect(session.getObservedCurrentTurnTerminal()).toEqual({ kind: 'none' });
+      expect(readSessionSendTerminalStatus(h.lastSendOptions())).toBe('unsettled');
+    } finally { await session.close(); }
   });
 
   it('keeps a leftover terminal on queued generation after handle.send yields', async () => {
@@ -1874,7 +1944,9 @@ describe('Session provider-initiated turns (harness wake-ups)', () => {
     await session.close();
   });
 
-  it('settles a provider-initiated turn that ends in an error as a failure, not as the earlier success', async () => {
+  // A Claude automatic turn may start with only a status/API error (no text).
+  // The previous send's done must not hide that new turn's eventual failure.
+  it.each(['text', 'explicit status'] as const)('settles a provider-initiated turn starting with %s that ends in an error as a failure, not as the earlier success', async start => {
     const h = createControllableHandle({ agentKind: 'claude-code' });
     const session = makeSession(h.handle, 'claude-code');
     const terminals: string[] = [];
@@ -1894,7 +1966,11 @@ describe('Session provider-initiated turns (harness wake-ups)', () => {
     expect(terminals).toEqual(['done']);
 
     h.setTurnRunning(true);
-    await h.emit({ type: 'text', data: { text: 'woke up' } }, { keepRunning: true });
+    await h.emit(start === 'text'
+      ? { type: 'text', data: { text: 'woke up' } }
+      : { type: 'status', source: 'claude-code', data: { isRunning: true, providerInitiatedTurn: true } },
+    { keepRunning: true });
+    expect(readSessionSendTerminalStatus(h.lastSendOptions())).toBe('unsettled');
     await h.emit({ type: 'error', data: { message: 'wake failed' } });
     await h.emit({ type: 'done', data: {} });
     expect(terminals.slice(1, 2)).toEqual(['error']);
@@ -1919,6 +1995,10 @@ describe('Session provider-initiated turns (harness wake-ups)', () => {
     // Background subagent output while the parent is idle is not a wake-up.
     await h.emit({ type: 'text', data: { text: 'subagent' }, agentMeta: { parentUuid: 'toolu_1' } });
     await h.emit({ type: 'status', data: { status: 'idle', isRunning: false } });
+    await h.emit({ type: 'status', source: 'claude-code', data: { isRunning: true } });
+    await h.emit({ type: 'status', source: 'codex', data: { isRunning: true, providerInitiatedTurn: true } });
+    await h.emit({ type: 'status', source: 'claude-code', data: { isRunning: true, providerInitiatedTurn: true },
+      agentMeta: { parentUuid: 'toolu_1' } });
     await h.emit({ type: 'text', data: { text: 'late child' }, turnScope: 'background' });
     expect(wakes).toEqual([]);
 

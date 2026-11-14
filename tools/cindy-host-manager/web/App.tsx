@@ -1,3 +1,4 @@
+import { Federation } from "./Federation";
 import { ProxyFields, proxyFormData } from "./ProxyFields";
 import { lazy, Suspense, useEffect, useRef, useState } from "react";
 import {
@@ -13,7 +14,6 @@ import { translator, errorText, type Key, type Locale } from "./i18n";
 const LoginTerminal = lazy(() =>
   import("./Terminal").then((module) => ({ default: module.LoginTerminal })),
 );
-const api = new Api();
 
 type Share = {
   shareId: string;
@@ -59,15 +59,29 @@ function stateDot(state: Instance["state"]): string {
   return "";
 }
 
-export function App() {
+export function App({
+  boundApi,
+  inheritedLocale,
+  inheritedTheme,
+  onSessionExpired,
+}: {
+  boundApi?: Api;
+  inheritedLocale?: Locale;
+  inheritedTheme?: string;
+  onSessionExpired?: () => void;
+} = {}) {
+  const [api] = useState(() => boundApi ?? new Api());
+  const mounted = useRef(true);
+  const [mode, setMode] = useState<"standalone" | "central">("standalone");
   const [locale, setLocale] = useState<Locale>(
     navigator.language.startsWith("zh") ? "zh-CN" : "en",
   );
-  const t = translator(locale);
+  const activeLocale = inheritedLocale ?? locale;
+  const t = translator(activeLocale);
   const [theme, setTheme] = useState(
     matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light",
   );
-  const [auth, setAuth] = useState<boolean | null>(null);
+  const [auth, setAuth] = useState<boolean | null>(boundApi ? true : null);
   const [error, setError] = useState("");
   const [notice, setNotice] = useState("");
   const [pending, setPending] = useState(false);
@@ -100,15 +114,16 @@ export function App() {
     completed: boolean;
   } | null>(null);
 
-  useEffect(
-    () => () => {
+  useEffect(() => {
+    mounted.current = true;
+    return () => {
+      mounted.current = false;
       generation.current++;
       checkContext.current = null;
       checkRequests.current.clear();
       loginContext.current = null;
-    },
-    [],
-  );
+    };
+  }, []);
 
   const [loginTarget, setLoginTarget] = useState("cindy");
   const [loginMethod, setLoginMethod] = useState("google");
@@ -120,12 +135,12 @@ export function App() {
   const [usage, setUsage] = useState<unknown>(null);
 
   useEffect(() => {
-    document.documentElement.dataset.theme = theme;
-  }, [theme]);
+    document.documentElement.dataset.theme = inheritedTheme ?? theme;
+  }, [theme, inheritedTheme]);
 
   useEffect(() => {
-    document.documentElement.lang = locale;
-  }, [locale]);
+    document.documentElement.lang = activeLocale;
+  }, [activeLocale]);
 
   function clearSensitive(endSession = true) {
     generation.current++;
@@ -155,12 +170,15 @@ export function App() {
     const result = await api.request<{
       authenticated: boolean;
       csrfToken?: string;
+      mode?: "standalone" | "central";
     }>("/session");
     api.csrf = result.csrfToken ?? "";
+    setMode(result.mode ?? "standalone");
     setAuth(result.authenticated);
   }
 
   async function refresh() {
+    if (!mounted.current) return;
     const epoch = generation.current;
     const [data, config] = await Promise.all([
       api.request<{ instances: Instance[] }>("/instances"),
@@ -193,6 +211,7 @@ export function App() {
     try {
       await actionFn();
     } catch (failure) {
+      if (!mounted.current) return;
       if (
         failure instanceof ApiError &&
         failure.status === 401 &&
@@ -200,6 +219,7 @@ export function App() {
       ) {
         clearSensitive();
         setAuth(false);
+        onSessionExpired?.();
         setError(t("sessionExpired"));
       } else
         setError(
@@ -213,21 +233,21 @@ export function App() {
   }
 
   useEffect(() => {
-    void run(session);
+    if (!boundApi) void run(session);
   }, []);
 
   useEffect(() => {
-    if (auth) void run(refresh);
-  }, [auth]);
+    if (auth && mode !== "central") void run(refresh);
+  }, [auth, mode]);
 
   useEffect(() => {
     const focus = () => {
-      if (auth && !pending && !loginChecking && !loginId)
+      if (auth && mode !== "central" && !pending && !loginChecking && !loginId)
         void run(refreshSelected);
     };
     window.addEventListener("focus", focus);
     return () => window.removeEventListener("focus", focus);
-  }, [auth, pending, loginId, loginChecking]);
+  }, [auth, mode, pending, loginId, loginChecking]);
 
   function choose(id: string) {
     clearSensitive(false);
@@ -290,6 +310,7 @@ export function App() {
       if (failure instanceof ApiError && failure.status === 401) {
         clearSensitive();
         setAuth(false);
+        onSessionExpired?.();
         setError(t("sessionExpired"));
       } else {
         setInstances((items) =>
@@ -373,7 +394,8 @@ export function App() {
       const data = result as { shares: Share[]; usage: unknown };
       setShares(data.shares);
       setUsage(data.usage);
-    } else if (actionName === "usage" || actionName === "quota") setUsage(result);
+    } else if (actionName === "usage" || actionName === "quota")
+      setUsage(result);
     else await share("list");
   }
 
@@ -399,55 +421,57 @@ export function App() {
 
   return (
     <>
-      <header className="app-header">
-        <div className="app-brand">
-          <div className="app-logo" aria-hidden="true">
-            &gt;_
+      {!boundApi && (
+        <header className="app-header">
+          <div className="app-brand">
+            <div className="app-logo" aria-hidden="true">
+              &gt;_
+            </div>
+            <div>
+              <h1>{t("title")}</h1>
+              <p>{t(mode === "central" ? "centralSubtitle" : "subtitle")}</p>
+            </div>
           </div>
-          <div>
-            <h1>{t("title")}</h1>
-            <p>{t("subtitle")}</p>
+          <div className="header-controls">
+            <label className="compact">
+              <span>{t("language")}</span>
+              <select
+                value={locale}
+                onChange={(event) => setLocale(event.target.value as Locale)}
+              >
+                <option value="en">English</option>
+                <option value="zh-CN">简体中文</option>
+              </select>
+            </label>
+            <label className="compact">
+              <span>{t("theme")}</span>
+              <select
+                value={theme}
+                onChange={(event) => setTheme(event.target.value)}
+              >
+                <option value="light">{t("light")}</option>
+                <option value="dark">{t("dark")}</option>
+              </select>
+            </label>
+            {auth && (
+              <button
+                disabled={pending}
+                onClick={() =>
+                  void run(async () => {
+                    clearSensitive();
+                    await api.request("/session", "DELETE");
+                    setAuth(false);
+                    setInstances([]);
+                    setSettings(undefined);
+                  })
+                }
+              >
+                {t("signOut")}
+              </button>
+            )}
           </div>
-        </div>
-        <div className="header-controls">
-          <label className="compact">
-            <span>{t("language")}</span>
-            <select
-              value={locale}
-              onChange={(event) => setLocale(event.target.value as Locale)}
-            >
-              <option value="en">English</option>
-              <option value="zh-CN">简体中文</option>
-            </select>
-          </label>
-          <label className="compact">
-            <span>{t("theme")}</span>
-            <select
-              value={theme}
-              onChange={(event) => setTheme(event.target.value)}
-            >
-              <option value="light">{t("light")}</option>
-              <option value="dark">{t("dark")}</option>
-            </select>
-          </label>
-          {auth && (
-            <button
-              disabled={pending}
-              onClick={() =>
-                void run(async () => {
-                  clearSensitive();
-                  await api.request("/session", "DELETE");
-                  setAuth(false);
-                  setInstances([]);
-                  setSettings(undefined);
-                })
-              }
-            >
-              {t("signOut")}
-            </button>
-          )}
-        </div>
-      </header>
+        </header>
+      )}
 
       <div className="feedback toast-layer" aria-live="polite">
         {pending && (
@@ -487,8 +511,10 @@ export function App() {
                 const result = await api.request<{
                   authenticated: boolean;
                   csrfToken: string;
+                  mode?: "standalone" | "central";
                 }>("/session", "POST", { password });
                 api.csrf = result.csrfToken;
+                setMode(result.mode ?? "standalone");
                 setAuth(result.authenticated);
               });
             }}
@@ -508,6 +534,28 @@ export function App() {
             </button>
           </form>
         </main>
+      ) : mode === "central" ? (
+        <Federation
+          api={api}
+          t={t}
+          onSessionExpired={() => {
+            clearSensitive();
+            setAuth(false);
+            setError(t("sessionExpired"));
+          }}
+          renderManager={(nodeApi) => (
+            <App
+              boundApi={nodeApi}
+              inheritedLocale={activeLocale}
+              inheritedTheme={theme}
+              onSessionExpired={() => {
+                clearSensitive();
+                setAuth(false);
+                setError(t("sessionExpired"));
+              }}
+            />
+          )}
+        />
       ) : !instance ? (
         /* ==================== 一级页面：全宽实例列表页 ==================== */
         <main className="page-container list-page">
@@ -849,10 +897,7 @@ export function App() {
             </div>
 
             <div className="breadcrumb-right">
-              <nav
-                className="instance-quick-nav"
-                aria-label={t("instances")}
-              >
+              <nav className="instance-quick-nav" aria-label={t("instances")}>
                 {instances.map((item) => (
                   <button
                     className="instance-pill"
@@ -938,9 +983,7 @@ export function App() {
                     className="modal-details"
                     ref={instanceSettingsDetailsRef}
                   >
-                    <summary className="btn-summary">
-                      ⚙ {t("settings")}
-                    </summary>
+                    <summary className="btn-summary">⚙ {t("settings")}</summary>
                     <div className="modal-scrim">
                       <div className="modal-panel">
                         <div className="modal-head">
@@ -1151,6 +1194,7 @@ export function App() {
               {loginId ? (
                 <Suspense fallback={<p>{t("loading")}</p>}>
                   <LoginTerminal
+                    apiPrefix={api.prefix}
                     id={loginId}
                     t={t}
                     onExit={() => void finishLogin(loginId, instance.id)}

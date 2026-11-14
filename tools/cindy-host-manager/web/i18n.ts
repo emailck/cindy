@@ -1,4 +1,31 @@
 export const en = {
+  operationUncertain:
+    "The operation’s outcome is unknown. Check the computer before trying again; it has not been retried.",
+  centralSubtitle: "Manage independent Cindy CLI Managers across computers.",
+  machines: "Computers",
+  machineName: "Computer name",
+  addMachine: "Add computer",
+  manageMachine: "Manage computer",
+  revokeMachine: "Revoke access",
+  revokeConfirm:
+    "Revoke this computer’s connection? Its instances and local Manager will keep running.",
+  machineOnline: "Online",
+  machineOffline: "Offline",
+  offlineNote:
+    "Computer disconnected. Instance states are unavailable; running instances may still be running.",
+  lastSeen: "Last online",
+  neverConnected: "Not connected yet",
+  noMachines: "Add a computer to connect its independent Manager.",
+  inventoryUnavailable:
+    "Instance overview unavailable. Refresh to check again.",
+  enrollment: "Connect this computer",
+  enrollmentNote:
+    "This code is shown only once. Complete the connection on the computer before it expires. Accounts and settings stay on that computer.",
+  centralAddress: "Central address",
+  enrollmentCommand:
+    "Stop the local Manager service (containers keep running). In Bash, run these commands from its directory with the same data directory, paste the code at the prompt, then restart the service:",
+  enrollmentToken: "One-time connection code",
+
   accountUnavailable: "Account information unavailable",
   accountLoginMethod: "Login method",
   accountPlan: "Plan",
@@ -66,17 +93,22 @@ export const en = {
   engine: "Engine",
   customProxy: "Custom Proxy",
   customProxyUrl: "Proxy URL for this instance",
-  proxyKeepAuth: "Leave username and password blank to keep saved authentication for the same address.",
+  proxyKeepAuth:
+    "Leave username and password blank to keep saved authentication for the same address.",
   proxyClearAuth: "Clear saved authentication",
   testProxy: "Test Proxy",
   testingProxy: "Testing…",
   proxyExit: "Exit IP and location",
   locationUnknown: "Location unavailable",
-  proxyTestNote: "Tests this configuration without saving. IP location is an estimate from ipwho.is.",
-  proxyTestFailed: "Proxy test failed. Check the address, authentication and connectivity.",
+  proxyTestNote:
+    "Tests this configuration without saving. IP location is an estimate from ipwho.is.",
+  proxyTestFailed:
+    "Proxy test failed. Check the address, authentication and connectivity.",
   proxyNotConfigured: "Configure the selected Proxy first.",
-  defaultProxyMissing: "No default Proxy saved. Enter its address in Settings and save first.",
-  proxyTestProgress: "Checking the Proxy exit IP and location… This may take about 20 seconds.",
+  defaultProxyMissing:
+    "No default Proxy saved. Enter its address in Settings and save first.",
+  proxyTestProgress:
+    "Checking the Proxy exit IP and location… This may take about 20 seconds.",
   proxy: "HTTP Proxy",
   none: "No Proxy",
   default: "Use default Proxy",
@@ -157,6 +189,30 @@ export const en = {
 } as const;
 export type Key = keyof typeof en;
 const zh: Record<Key, string> = {
+  operationUncertain:
+    "暂时无法确认操作结果。请先在对应电脑核实，再决定是否重试；系统未自动重试。",
+  centralSubtitle: "集中管理多台电脑上独立运行的 Cindy CLI Manager。",
+  machines: "电脑",
+  machineName: "电脑名称",
+  addMachine: "添加电脑",
+  manageMachine: "管理电脑",
+  revokeMachine: "撤销接入",
+  revokeConfirm: "撤销这台电脑的管理连接？它的实例和本地 Manager 会继续运行。",
+  machineOnline: "在线",
+  machineOffline: "离线",
+  offlineNote:
+    "电脑已断开连接，暂时无法确认实例状态；运行中的实例可能仍在运行。",
+  lastSeen: "最后在线",
+  neverConnected: "尚未接入",
+  noMachines: "添加电脑，接入它独立运行的 Manager。",
+  inventoryUnavailable: "暂时无法读取实例概览，请刷新重试。",
+  enrollment: "接入这台电脑",
+  enrollmentNote:
+    "接入码只显示一次，请在过期前到对应电脑完成接入。账号和设置仍保留在该电脑上。",
+  centralAddress: "中央地址",
+  enrollmentCommand:
+    "先停止单机 Manager 服务（容器会继续运行），在其目录的 Bash 中以相同的数据目录运行以下命令，按提示粘贴接入码，然后重新启动服务：",
+  enrollmentToken: "一次性接入码",
   accountUnavailable: "账号信息不可用",
   accountLoginMethod: "登录方式",
   accountPlan: "套餐",
@@ -313,6 +369,9 @@ export function translator(locale: Locale) {
 
 export function errorText(code: string, t: (key: Key) => string): string {
   const keys: Record<string, Key> = {
+    OPERATION_UNCERTAIN: "operationUncertain",
+    NODE_OFFLINE: "offlineNote",
+    FEDERATION_OFFLINE: "offlineNote",
     LOGIN_FAILED: "loginFailed",
     INSTANCE_BUSY: "busyError",
     STOP_REQUIRED: "stopRequired",

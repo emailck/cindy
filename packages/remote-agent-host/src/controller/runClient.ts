@@ -77,6 +77,8 @@ export class RemoteAgentRunClient implements PolledRun {
   private readonly drained: Promise<void>;
   private markDrained!: () => void;
   private pushSeq = 0;
+  /** Stop invalidates sends still preparing their payload without closing the link. */
+  private sendGeneration = 0;
   /** 在途的 push 批次(含重试中的)。 */
   private pushing = 0;
   /** 正在回答的反向请求(从收到到回包交付完)。 */
@@ -113,9 +115,10 @@ export class RemoteAgentRunClient implements PolledRun {
   }
 
   /** 把一个 JSON 值做成载荷：小的内联，大的 gzip 后分段上传。 */
-  async payload(value: unknown, uploadId = this.newId()): Promise<RemoteAgentPayload> {
+  async payload(value: unknown, uploadId = this.newId(), requireActive?: () => void): Promise<RemoteAgentPayload> {
     const requireOpen = () => {
       if (this.closed) throw new Error('[REMOTE_AGENT_EXPIRED] The task has ended on this computer.');
+      requireActive?.();
     };
     requireOpen();
     const text = JSON.stringify(value ?? null);
@@ -190,13 +193,27 @@ export class RemoteAgentRunClient implements PolledRun {
   }
 
   /** 预先分配的 callId(需要先把回调登记到 callId 上时用)。 */
-  async callWithId(callId: string, method: RemoteAgentMethod, args: unknown[]): Promise<unknown> {
+  async callWithId(callId: string, method: RemoteAgentMethod, args: unknown[], signal?: AbortSignal): Promise<unknown> {
     if (this.closed) throw new Error('[REMOTE_AGENT_EXPIRED] The task has ended on the other computer.');
+    if (method === 'abort' || method === 'requestGracefulStop') this.sendGeneration += 1;
+    const generation = this.sendGeneration;
+    const requireActive = () => {
+      if (this.closed) throw new Error('[REMOTE_AGENT_EXPIRED] The task has ended on this computer.');
+      if (signal?.aborted || ((method === 'send' || method === 'steer') && generation !== this.sendGeneration)) {
+        throw new DOMException('The message was cancelled before delivery to the other computer.', 'AbortError');
+      }
+    };
     const result = new Promise<unknown>((resolve, reject) => {
       this.pendingCalls.set(callId, { resolve, reject });
     });
+    // finish() can reject this while payload preparation is still awaiting.
+    // Observe it now; the public call still returns the original result below.
+    void result.catch(() => undefined);
     try {
-      const payload = await this.payload(args);
+      const payload = await this.payload(args, this.newId(), requireActive);
+      // Stop can overtake gzip or a chunk acknowledgement, including the final
+      // await before dispatch. Never deliver that old send after Stop.
+      requireActive();
       await this.invoke([{ op: 'call', runId: this.runId, callId, method, payload }]);
     } catch (error) {
       this.pendingCalls.delete(callId);
