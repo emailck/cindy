@@ -29,6 +29,8 @@ import { mapCodexModels, createNativeCodexAuth, createCodexProvider } from './co
 import type { CodexModelListItem } from '@cindy/maker-core';
 import { quietRuntimeLogger, mapClaudeModels, createNativeClaudeSharing, createClaudeProvider } from './claude';
 import { startupDiagnostics } from './startupDiagnostics';
+import { createClaudeSubscriptionUsageReader } from './claude-subscription-usage';
+import type { ClaudeRateLimitsRead } from './claude-quota';
 
 class Socket implements WsLike {
   sent: Envelope[] = [];
@@ -201,10 +203,64 @@ describe('Node provider host', () => {
       expect(socket.result('quota-off')).toMatchObject({ ok: true, result: { status: { quota: 'disabled' }, quota: null } });
       guestInvoke('private', 'local-db:sessions:list'); await vi.advanceTimersByTimeAsync(0);
       expect(socket.result('private')).toMatchObject({ ok: false, error: { code: 'CHANNEL_NOT_ALLOWED' } });
+      // The same-account plan reader is not a guest path; guests keep the permissioned insights channel.
+      guestInvoke('own-plan', 'maker:usage:claude-subscription'); await vi.advanceTimersByTimeAsync(0);
+      expect(socket.result('own-plan')).toMatchObject({ ok: false, error: { code: 'CHANNEL_NOT_ALLOWED' } });
       await runShareControl(h.dataDir, ['pause', memberId]);
       guestInvoke('paused', 'maker:provider:list'); await vi.advanceTimersByTimeAsync(0);
       expect(socket.result('paused')).toMatchObject({ ok: false });
     } finally { await h.host.stop(); vi.unstubAllGlobals(); await rm(h.dataDir, { recursive: true, force: true }); }
+  });
+
+  // Bug: own-account Desktop showed no Claude plan quota for a CLI provider; the host allowlist
+  // rejected `maker:usage:claude-subscription` and Desktop cached the host as "old" for 15 minutes.
+  // Production entry: createCliHost dispatch over the fake relay. Observable: Desktop's snapshot
+  // contract, named-provider echo, and IPC_ERROR (never CHANNEL_NOT_ALLOWED) on bad input or failure.
+  // Gap: existing quota tests only cover guests' insights channel. Tier: integration (existing harness).
+  it('answers same-account Claude plan quota reads with the Desktop snapshot contract', async () => {
+    const h = await harness();
+    const read = vi.fn(async () => ({ fiveHour: { utilization: 40, resetsAt: 1 }, sevenDay: null, scoped: [], source: 'oauth-endpoint', updatedAt: 1 }));
+    Object.assign(h.provider, { readSubscriptionUsage: read });
+    try {
+      const socket = h.sockets[0];
+      const invoke = async (id: string, args: unknown[]) => {
+        socket.request('invoke', id, { channel: 'maker:usage:claude-subscription', args });
+        await vi.advanceTimersByTimeAsync(0);
+        return socket.result(id) as { ok: boolean; result?: Record<string, unknown> | null; error?: unknown };
+      };
+      const builtin = await invoke('builtin', []);
+      expect(builtin).toMatchObject({ ok: true, result: { fiveHour: { utilization: 40 } } });
+      expect(builtin.result).not.toHaveProperty('providerId');
+      expect(await invoke('named', ['anthropic', true])).toMatchObject({ ok: true, result: { providerId: 'anthropic', fiveHour: { utilization: 40 } } });
+      expect(await invoke('other', ['anthropic-second'])).toMatchObject({ ok: true, result: null });
+      expect(await invoke('bad', [''])).toMatchObject({ ok: false, error: { code: 'IPC_ERROR' } });
+      read.mockRejectedValueOnce(new Error('native unavailable'));
+      expect(await invoke('failed', [])).toMatchObject({ ok: false, error: { code: 'IPC_ERROR' } });
+      expect(read).toHaveBeenCalledTimes(3);
+    } finally { await h.host.stop(); await rm(h.dataDir, { recursive: true, force: true }); }
+  });
+
+  // Protocol rule: only an authoritative clear evicts a same-account quota cache. The reader must map
+  // the CLI's explicit "no plan limits" to null but keep the last snapshot for unreadable or failed
+  // reads, and share one native process per window. Minimal inputs: snapshot, garbage, failure, empty.
+  it('keeps the last Claude plan snapshot unless the CLI explicitly reports no limits', async () => {
+    let t = 1_000_000;
+    const fetchRaw = vi.fn<() => Promise<ClaudeRateLimitsRead>>()
+      .mockResolvedValueOnce({ rateLimits: { five_hour: { utilization: 25, resets_at: 2_000_000 } }, subscriptionType: 'max' })
+      .mockResolvedValueOnce({ rateLimits: { unexpected: true }, subscriptionType: null })
+      .mockRejectedValueOnce(new Error('native unavailable'))
+      .mockResolvedValueOnce('empty');
+    const reader = createClaudeSubscriptionUsageReader(fetchRaw, () => t);
+    const [first, concurrent] = await Promise.all([reader.read(), reader.read()]);
+    expect(first).toMatchObject({ fiveHour: { utilization: 25 }, subscriptionType: 'max', source: 'oauth-endpoint' });
+    expect(concurrent).toBe(first);
+    expect(fetchRaw).toHaveBeenCalledTimes(1);
+    t += 60_000; expect(await reader.read()).toBe(first); // unrecognized body is not "no limits"
+    t += 60_000; expect(await reader.read()).toBe(first); // failed native read keeps the last snapshot
+    t += 1; expect(await reader.read()).toBe(first); // backoff: no new native process
+    t += 60_000; expect(await reader.read()).toBeNull();
+    expect(fetchRaw).toHaveBeenCalledTimes(4);
+    await expect(createClaudeSubscriptionUsageReader(async () => { throw new Error('x'); }, () => t).read()).rejects.toThrow();
   });
 
   // Local Docker exec management uses the running process, not a second auth refresh.

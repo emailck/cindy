@@ -229,6 +229,14 @@ identity, device IDs and reset credits are excluded. API providers report quota 
 rather than estimating a subscription balance from token usage. Reads share a short
 30-second cache, while disabling visibility invalidates in-flight results immediately.
 
+Your own Desktop (same Cindy account) also shows a native Claude subscription's remaining
+quota in Settings → Model providers. It reads the existing same-account
+`maker:usage:claude-subscription` channel, which only same-account devices may call and the
+share visibility switches above do not control. Each read waits for one native `get_usage`
+(about 60 seconds of reuse between processes, 60 seconds backoff after failure; a failed read keeps
+the last snapshot, and only Claude's explicit "no plan limits" clears it). Codex and API-key
+providers do not answer this channel yet, so their own-account quota still does not appear.
+
 ## Headless Linux without a keyring
 
 Explicitly choose private local files when OS keyring encryption is not required:

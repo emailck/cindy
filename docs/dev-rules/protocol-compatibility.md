@@ -638,6 +638,15 @@ reader 的刷新完成（仍遵守节流/退避），不改变返回结构、授
 仍使用缓存优先读取；旧被控端忽略新增参数，返回其已有快照。自动续跑只使用实际受限窗口的可信
 重置时刻，不把请求成功当成已恢复，也不将远程快照替换为本机账号。无需服务端或 Mobile 原生更新。
 
+CLI 提供端（`apps/cindy-host`）同账号回答该通道（2026-11-13）：原生 Claude 订阅按同一合同返回
+`ClaudeSubscriptionUsageSnapshot | null`，参数 `[providerId?, fresh?]`，具名读取回显 providerId，其它
+providerId、API Key 与 Codex 返回 null；参数非法或读取失败回 `IPC_ERROR`，不回 `CHANNEL_NOT_ALLOWED`
+（否则控制端把它记成旧被控端 15 分钟）。CLI 没有推送，读取在缓存过期时等待一次原生 `get_usage`，
+约 60 秒复用、失败退避 60 秒并保留上次快照，只有 CLI 明确的无套餐余量清空。受邀者对端一律
+`CHANNEL_NOT_ALLOWED`，仍只走 `provider-share:insights:v1`。端点解析副本在
+`@cindy/maker-shared/subscription-usage`，与 Desktop shared 同名函数须同步。不改控制端、wire 格式或服务端；
+旧 CLI 维持原来的不显示。回归见 `apps/cindy-host/src/runtime/runtime.integration.test.ts`。
+
 ## 群内独立头像
 
 Chat Server 的 `/me.capabilities` 新增可选 `groupMemberAvatar: 1`；Desktop 的群投影对应

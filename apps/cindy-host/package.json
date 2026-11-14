@@ -16,6 +16,7 @@
     "@cindy/auth-client": "workspace:*",
     "@cindy/device-link": "workspace:*",
     "@cindy/maker-core": "workspace:*",
+    "@cindy/maker-shared": "workspace:*",
     "@cindy/model-providers": "workspace:*",
     "@cindy/remote-agent-host": "workspace:*",
     "@napi-rs/keyring": "2.1.2",

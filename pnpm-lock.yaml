@@ -116,6 +116,9 @@ importers:
       '@cindy/maker-core':
         specifier: workspace:*
         version: link:../../packages/maker-core
+      '@cindy/maker-shared':
+        specifier: workspace:*
+        version: link:../../packages/maker-shared
       '@cindy/model-providers':
         specifier: workspace:*
         version: link:../../packages/model-providers

@@ -16,6 +16,7 @@ import type { HostLifecycle } from '../lifecycle';
 import { quietRuntimeLogger } from './claude';
 import { startupDiagnostics } from './startupDiagnostics';
 import { createProvider } from './provider';
+import { CLAUDE_SUBSCRIPTION_USAGE_CHANNEL } from './claude-subscription-usage';
 import metadata from '../../package.json';
 
 export interface HostAuthPort {
@@ -33,7 +34,8 @@ export interface CliHostOptions {
   createWebSocket?: DeviceLinkClientOptions['createWebSocket'];
   loadConfig?: () => Promise<HostCommandContext['config']>;
 }
-const channels = [SHARE_INSIGHTS_CHANNEL, REMOTE_AGENT_CHANNEL, 'maker:provider:list', 'maker:list-available-agents', 'maker:get-capabilities', 'maker:agent:status'];
+const channels = [SHARE_INSIGHTS_CHANNEL, REMOTE_AGENT_CHANNEL, 'maker:provider:list', 'maker:list-available-agents', 'maker:get-capabilities', 'maker:agent:status',
+  CLAUDE_SUBSCRIPTION_USAGE_CHANNEL];
 const allowlistHash = createHash('sha256').update([...channels].sort().join('\n')).digest('hex');
 
 /** Relay-only same-account provider. All project tools run through the shared host's reverse tunnel. */
@@ -194,6 +196,24 @@ export async function createCliHost(context: HostCommandContext, options: CliHos
           break;
         }
         case 'maker:agent:status': value = { binaryReady: args[0] === provider.kind, binaryPath: null, authReady: args[0] === provider.kind && authenticated }; break;
+        case CLAUDE_SUBSCRIPTION_USAGE_CHANNEL: {
+          // Same-account only; guests read quota through the permissioned share insights channel.
+          if (isScopedPeer(peer)) {
+            reply(peer, frame.id, { ok: false, error: { code: 'CHANNEL_NOT_ALLOWED', message: 'This channel is unavailable on this host.' } });
+            return;
+          }
+          // Desktop contract: [providerId?, fresh?]; a named read echoes the provider it answered for.
+          const providerId = args[0];
+          if (providerId !== undefined && (typeof providerId !== 'string' || !providerId.trim())) {
+            reply(peer, frame.id, { ok: false, error: { code: 'IPC_ERROR', message: '[INVALID_PARAMS] providerId must be a non-empty string' } });
+            return;
+          }
+          const read = 'readSubscriptionUsage' in provider ? provider.readSubscriptionUsage : undefined;
+          // Failures surface as IPC_ERROR, never CHANNEL_NOT_ALLOWED (that would mark this host old).
+          const snapshot = read && (providerId === undefined || providerId === provider.id) ? await read() : null;
+          value = snapshot && providerId ? { ...snapshot, providerId } : snapshot;
+          break;
+        }
       }
       if (authorized(peer)) reply(peer, frame.id, { ok: true, result: value });
     } catch (error) {

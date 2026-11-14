@@ -1,4 +1,5 @@
-import { readClaudeQuota } from './claude-quota';
+import { readClaudeQuota, readClaudeRateLimits } from './claude-quota';
+import { createClaudeSubscriptionUsageReader } from './claude-subscription-usage';
 import { requestClaudeApiModels } from './claude-api-request';
 import { emptyQuota } from '../share-quota';
 import { randomBytes } from 'node:crypto';
@@ -97,6 +98,10 @@ export async function createClaudeProvider(dataDir: string, logger: Logger, env:
     kind: 'claude-code' as const, id, agent, modelIds,
     sharing: settings.auth === 'native' ? createNativeClaudeSharing(id, modelIds, async () => (await auth.getState()).authenticated) : undefined,
     readQuota: async () => settings.auth === 'native' ? readClaudeQuota(settings.binary, dataDir) : emptyQuota('unsupported'),
+    // Same-account settings/quota cards (Desktop `maker:usage:claude-subscription`); API keys have no plan.
+    readSubscriptionUsage: settings.auth === 'native'
+      ? createClaudeSubscriptionUsageReader(() => readClaudeRateLimits(settings.binary, dataDir)).read
+      : undefined,
     dispose: async () => {},
     async isAuthenticated() { return (await auth.getState()).authenticated; },
     view(enabled: boolean) {

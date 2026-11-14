@@ -4,7 +4,8 @@
  * 这些快照由被控端 desktop 读取(`maker:usage:claude-subscription` /
  * `maker:usage:xai-subscription`),desktop renderer 与 mobile 任务菜单都要按同一套规则
  * 选窗口、判新鲜度 —— 两份实现必然漂移(见 codexUsageBuckets 的同类教训)。
- * 来源解析(端点 / headers 归一化)仍在 desktop shared,只在被控端执行。
+ * 来源解析(端点 / headers 归一化)在 desktop shared,只在被控端执行;CLI 提供端
+ * (apps/cindy-host)用下方 parseClaudeOAuthUsageResponse 的同口径副本。
  */
 
 // ── Claude 订阅 ──────────────────────────────────────────────────────────────
@@ -126,6 +127,155 @@ export function matchScopedWindowForModel(
   const family = claudeModelFamily(modelId);
   if (!family) return null;
   return scoped.find((w) => scopedWindowBelongsToFamily(w, family)) ?? null;
+}
+
+// ── Claude 订阅端点解析 ─────────────────────────────────────────────────────
+// get_usage / GET /api/oauth/usage 的 rate_limits → 快照,供 CLI 提供端(apps/cindy-host)
+// 回答同账号 `maker:usage:claude-subscription`。与 desktop shared/claudeSubscriptionUsage.ts
+// 的同名函数逐字一致;Desktop 暂未改用此处,两边修改须同步(后续可让 Desktop 改为重新导出)。
+
+function isPlainObject(v: unknown): v is Record<string, unknown> {
+  return typeof v === 'object' && v !== null && !Array.isArray(v);
+}
+
+function toFiniteNumber(v: unknown): number | null {
+  // Number(null) / Number('') 都是 0 —— 显式排除, null 语义必须保留为"无数据"。
+  if (v === null || v === undefined || v === '') return null;
+  const n = typeof v === 'number' ? v : Number(v);
+  return Number.isFinite(n) ? n : null;
+}
+
+function clampPercent(v: number): number {
+  return Math.min(100, Math.max(0, v));
+}
+
+/** ISO8601 字符串 / epoch 秒 → epoch 秒;解析不了 → null。 */
+function toEpochSeconds(v: unknown): number | null {
+  if (typeof v === 'number' && Number.isFinite(v) && v > 0) return Math.floor(v);
+  if (typeof v === 'string' && v.length > 0) {
+    const ms = Date.parse(v);
+    if (Number.isFinite(ms) && ms > 0) return Math.floor(ms / 1000);
+  }
+  return null;
+}
+
+function toOptionalString(v: unknown): string | null {
+  return typeof v === 'string' && v.trim().length > 0 ? v.trim() : null;
+}
+
+// ── oauth-endpoint 解析 ──────────────────────────────────────────────────────
+
+/** limits[] 单条 → 窗口(utilization 取 percent 字段,0-100)。 */
+function parseLimitEntryWindow(entry: Record<string, unknown>): ClaudeUsageWindow | null {
+  const percent = toFiniteNumber(entry.percent);
+  if (percent === null) return null;
+  return {
+    utilization: clampPercent(percent),
+    resetsAt: toEpochSeconds(entry.resets_at),
+    severity: toOptionalString(entry.severity),
+  };
+}
+
+/** 旧 schema 顶层键(five_hour 等)→ 窗口(utilization 字段,0-100)。 */
+function parseLegacyWindow(v: unknown): ClaudeUsageWindow | null {
+  if (!isPlainObject(v)) return null;
+  const utilization = toFiniteNumber(v.utilization);
+  if (utilization === null) return null;
+  return {
+    utilization: clampPercent(utilization),
+    resetsAt: toEpochSeconds(v.resets_at),
+  };
+}
+
+function parseExtraUsage(v: unknown): ClaudeExtraUsageSnapshot | null {
+  if (!isPlainObject(v)) return null;
+  const isEnabled = v.is_enabled === true;
+  const utilization = toFiniteNumber(v.utilization);
+  const usedCredits = toFiniteNumber(v.used_credits);
+  const monthlyLimit = toFiniteNumber(v.monthly_limit);
+  if (!isEnabled && utilization === null && usedCredits === null) return null;
+  return {
+    isEnabled,
+    utilization: utilization === null ? null : clampPercent(utilization),
+    usedCredits,
+    monthlyLimit,
+  };
+}
+
+/**
+ * 解析 GET /api/oauth/usage 的响应 JSON。
+ *
+ * 优先走新 schema 的 `limits[]`(带 severity / scoped 模型信息);旧 schema 顶层键兜底。
+ * 未知字段(实验性混淆键等)一律忽略。解析不出任何窗口时返回 null。
+ */
+export function parseClaudeOAuthUsageResponse(
+  data: unknown,
+  now: number,
+): ClaudeSubscriptionUsageSnapshot | null {
+  if (!isPlainObject(data)) return null;
+
+  let fiveHour: ClaudeUsageWindow | null = null;
+  let sevenDay: ClaudeUsageWindow | null = null;
+  const scoped: ClaudeScopedUsageWindow[] = [];
+
+  const limits = Array.isArray(data.limits) ? data.limits : [];
+  for (const raw of limits) {
+    if (!isPlainObject(raw)) continue;
+    const window = parseLimitEntryWindow(raw);
+    if (!window) continue;
+    const kind = toOptionalString(raw.kind);
+    if (kind === 'session') {
+      fiveHour = window;
+    } else if (kind === 'weekly_all') {
+      sevenDay = window;
+    } else if (kind === 'weekly_scoped') {
+      const scope = isPlainObject(raw.scope) ? raw.scope : null;
+      const model = scope && isPlainObject(scope.model) ? scope.model : null;
+      const displayName = model ? toOptionalString(model.display_name) : null;
+      if (displayName) {
+        scoped.push({
+          ...window,
+          modelDisplayName: displayName,
+          modelId: model ? toOptionalString(model.id) : null,
+        });
+      }
+    }
+    // 未知 kind(未来新窗口类型)静默跳过 —— fail-safe。
+  }
+
+  // 旧 schema 兜底:limits[] 没给的窗口再看顶层键。
+  if (!fiveHour) fiveHour = parseLegacyWindow(data.five_hour);
+  if (!sevenDay) sevenDay = parseLegacyWindow(data.seven_day);
+  // 旧 schema 分模型周窗口兜底:按家族补 limits[] 没给 weekly_scoped 的家族,从顶层
+  // seven_day_<model> 键取。不能用 `scoped.length === 0` 整体门控——混合/降级响应里
+  // limits[] 可能只给了部分家族(如只有 Opus),其余家族(Fable)只通过顶层键下发;某家族
+  // 的 weekly_scoped 畸形被跳过时同理。已由 limits[] 给出的家族以 limits[] 为准,不被
+  // legacy 覆盖。家族归属统一走 scopedWindowBelongsToFamily,与 matchScopedWindowForModel
+  // 同一份口径,避免两份 includes 规则漂移。Fable 是较新加的家族,旧兜底原先只列
+  // Opus/Sonnet,走旧端点或降级快照时 Fable 周限丢失(issue #3244);Mythos/Haiku 端点
+  // 目前不下发分模型周窗口,如未来新增在此追加。
+  const legacyScoped: Array<[unknown, string]> = [
+    [data.seven_day_opus, 'Opus'],
+    [data.seven_day_sonnet, 'Sonnet'],
+    [(data as { seven_day_fable?: unknown }).seven_day_fable, 'Fable'],
+  ];
+  for (const [raw, displayName] of legacyScoped) {
+    const family = displayName.toLowerCase();
+    if (scoped.some((w) => scopedWindowBelongsToFamily(w, family))) continue;
+    const window = parseLegacyWindow(raw);
+    if (window) scoped.push({ ...window, modelDisplayName: displayName });
+  }
+
+  if (!fiveHour && !sevenDay && scoped.length === 0) return null;
+
+  return {
+    fiveHour,
+    sevenDay,
+    scoped,
+    extraUsage: parseExtraUsage(data.extra_usage),
+    source: 'oauth-endpoint',
+    updatedAt: now,
+  };
 }
 
 // ── xAI(SuperGrok)订阅 ───────────────────────────────────────────────────────
