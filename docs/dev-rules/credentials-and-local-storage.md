@@ -57,6 +57,9 @@ Secret Service 的 POSIX 主机。此模式不加密，目录 0700、文件 0600
 默认仍为 `keyring`，不能因密钥环失败自动降级；切换模式不迁移、不删除旧凭证，需重新
 登录。该例外不适用于 Desktop、Mobile 或插件。用户可通过取消环境变量恢复默认。
 
+终端客户端 `apps/cindy-cli` 复用同一实现，以 `CINDY_CLI_CREDENTIAL_STORE=file` 显式选择，条件与上文完全相同
+（仅 POSIX、不加密、0700/0600、不自动降级、不迁移）；钥匙串不可用时的报错只提示该选项，不自动切换。
+
 ## Claude 订阅只经 Claude Code 自己的登录
 
 Anthropic 只允许用户用自己的订阅登录**未修改的 Claude Code**；第三方应用不得提供

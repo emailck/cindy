@@ -354,6 +354,24 @@ export default {
       },
     },
     {
+      ...requiredUnitWorkspace('@cindy/cli', 'apps/cindy-cli'),
+      tiers: {
+        unit: {
+          status: 'required',
+          command: unitVitestCommand(),
+          exclude: ['**/*.integration.test.ts'],
+        },
+        integration: {
+          status: 'manual',
+          reason: 'Terminal client tests connect the real controller to the real Node provider host over an in-memory relay and loopback tunnel.',
+          execution: 'exclusive',
+          coverage: 'allowlist',
+          command: vitestBin('run', '--pool=forks', '--maxWorkers=1'),
+          include: ['src/remote.integration.test.ts'],
+        },
+      },
+    },
+    {
       name: 'desktop',
       cwd: 'apps/desktop',
       status: 'required',

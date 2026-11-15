@@ -1,0 +1,459 @@
+/**
+ * Interface language. Terms follow i18n/GLOSSARY.md: session → 任务, provider → 供应商,
+ * chat content → 对话, working directory → 工作目录.
+ */
+export type Language = 'en' | 'zh';
+export const LANGUAGES: readonly Language[] = ['en', 'zh'];
+
+export function isLanguage(value: unknown): value is Language {
+  return value === 'en' || value === 'zh';
+}
+
+/** Explicit override first, then POSIX locale variables, then the runtime locale. */
+export function detectLanguage(env: NodeJS.ProcessEnv = process.env, runtimeLocale = Intl.DateTimeFormat().resolvedOptions().locale): Language {
+  if (isLanguage(env.CINDY_LANG)) return env.CINDY_LANG;
+  const posix = env.LC_ALL || env.LC_MESSAGES || env.LANG;
+  const locale = posix && posix !== 'C' && posix !== 'POSIX' ? posix : runtimeLocale;
+  return /^zh/i.test(locale ?? '') ? 'zh' : 'en';
+}
+
+const en = {
+  'help.text': `Cindy — use remote and shared Agents from your terminal
+
+Usage: cindy [options] [command]
+
+Commands:
+  (none), chat                 Start an interactive task in the current directory
+  -p, --print PROMPT           Send one message, print the answer, and exit
+  -c, --continue               Continue the most recent session in this directory (also with -p)
+  login [options]              Sign in to Cindy
+  logout                       Sign out and remove the saved login
+  status                       Show account, language and data directory
+  models                       List remote models you can use
+  received list                List providers shared with you
+  received join LINK           Request access with a share link
+  received status REQUEST_ID   Check a pending request
+  received withdraw REQUEST_ID Withdraw a pending request
+  received leave MEMBER_ID     Stop using a shared provider
+  config show                  Show settings
+  config set KEY VALUE         Change a setting (language, permissionMode, deviceName)
+  config reset KEY             Restore a setting's default
+  help, version
+
+Options:
+  --data-dir PATH              Data directory (default: per-user application data)
+  --lang en|zh                 Interface language for this run
+  --model ID                   Model for this run
+  --permission-mode MODE       full, normal or plan for this run
+
+Login options: --email EMAIL | --phone PHONE | --org ORGANIZATION | --social PROVIDER.
+Verification codes are always entered interactively, never as arguments.
+In the interactive UI, type /help or ? for all keyboard operations.`,
+  'error.unknownCommand': 'Unknown command. Run cindy help.',
+  'error.unexpectedArgument': 'Unexpected argument. Run cindy help.',
+  'error.missingValue': '{option} requires a value.',
+  'error.duplicateOption': 'Specify {option} only once.',
+  'error.dataDirRelative': 'The data directory must be an absolute path.',
+  'error.dataDirInGit': 'The data directory must be outside Git workspaces.',
+  'error.dataDirUnavailable': 'The data directory cannot be determined. Use --data-dir or CINDY_CLI_DATA_DIR.',
+  'error.profileBusy': 'This data directory is used by another Cindy process. Close it first. If a crash left profile.lock, make sure no Cindy process is running before removing it.',
+  'error.configInvalid': 'The settings file is invalid. It has been kept unchanged: {file}',
+  'error.configBusy': 'Settings are being changed by another process. Try again.',
+  'error.configKey': 'Unknown setting. Available: language, permissionMode, deviceName.',
+  'error.configValue': 'Invalid value for {key}.',
+  'error.terminalRequired': 'This command needs an interactive terminal.',
+  'error.credentialStore': 'Protected credential storage is unavailable. On Linux, install and unlock a Secret Service provider (GNOME Keyring or KWallet); on a server without one you can explicitly set CINDY_CLI_CREDENTIAL_STORE=file (unencrypted, owner-only files in the data directory). On macOS, unlock the login Keychain; on Windows, check Credential Manager.',
+  'error.authRequired': 'Sign in first: cindy login',
+  'error.authFailed': 'Sign-in could not be completed. Check the sign-in method, verification code and network.',
+  'error.captcha': 'This sign-in method requires CAPTCHA. Use a browser sign-in method instead.',
+  'error.loginParams': 'Use login [--email EMAIL | --phone PHONE | --org ORGANIZATION | --social PROVIDER].',
+  'error.cancelled': 'Cancelled.',
+  'error.failed': 'Command failed.',
+  'error.notImplemented': 'This command is not available in this build yet.',
+  'config.saved': 'Setting saved.',
+  'status.title': 'Cindy CLI status',
+  "error.relayUnavailable": "Could not connect to Cindy. Check the network and try again.",
+  "error.accountLost": "You were signed out or this device was removed. Sign in again with cindy login.",
+  "error.shareInvalidLink": "This is not a valid share link.",
+  "error.shareOtherRegion": "This link belongs to Cindy China. Cross-region shares are not supported in the terminal client yet.",
+  "error.shareNotFound": "No such shared provider. Run cindy received list.",
+  "error.shareUnavailable": "The share service is unavailable. Try again later.",
+  "error.sharePaused": "The owner has paused this share.",
+  "error.shareRemoved": "This shared provider is no longer available.",
+  "catalog.sharedBy": "Shared by {name}",
+  "received.none": "No providers are shared with you yet. Ask the owner for a share link, then run cindy received join LINK.",
+  "received.row": "{provider} · Shared by {name} · {status} · member {id}",
+  "received.statusActive": "available",
+  "received.statusPaused": "paused by the owner",
+  "received.hostOffline": "sharer's computer offline",
+  "received.loading": "Reading share link…",
+  "received.askTitle": "{name} wants to share {provider} with you",
+  "received.factRuns": "The Agent runs with {provider} on {name}'s computer or another computer {name} arranges. Usage counts toward {name}'s {provider}, and {name} can see your usage.",
+  "received.factFiles": "Your project files and commands still run on your own computer. Your session permissions still apply.",
+  "received.factPrivacy": "Chat content and files the Agent reads pass through {name}'s computer and are saved on the computer that runs the session. {name}, and owners of other computers who need to agree, only see your nickname and avatar.",
+  "received.factApproval": "After you send the request, it takes effect only once {name} approves. {name} can pause or remove this share at any time.",
+  "received.confirm": "Send the request? [y/N] ",
+  "received.cancelled": "Request not sent. The link stays unused until it expires.",
+  "received.pairing": "Pairing code: {code}",
+  "received.waitDescription": "{name} may ask for the pairing code you see; just tell them these 4 digits. If their computer is offline, they'll see your request once it's back online. Requests expire if not handled within 24 hours.",
+  "received.waiting": "Waiting for {name} to approve… (Ctrl+C stops waiting; the request stays pending)",
+  "received.stillPending": "Still waiting. Check again with cindy received status {id}, or withdraw with cindy received withdraw {id}.",
+  "received.approved": "{name} shared {provider} with you. Choose it with /model in cindy.",
+  "received.rejected": "The request was declined. Ask {name} for a new link to try again.",
+  "received.expired": "The request expired.",
+  "received.withdrawn": "Request withdrawn; the link no longer works.",
+  "received.linkUsed": "Share links work once and expire 5 minutes after they're created. This one was already used or has expired; ask {name} for a new link.",
+  "received.left": "You no longer use this shared provider.",
+  "received.usage": "Use: cindy received list | join LINK | status REQUEST_ID | withdraw REQUEST_ID | leave MEMBER_ID",
+  "credential.notice": "This session uses a shared provider, so what the Agent reads passes through the sharer's computer or another computer they arrange. This step may involve credentials (such as keys or .env) and needs your confirmation. \"Always allow for this session\" skips further shared-provider credential confirmations in this session. Changing its permission mode or Plan mode, or quitting Cindy, requires confirmation again.",
+  "chat.welcome": "Cindy · {cwd}",
+  "chat.hint": "Type a message · / for commands · ? or /help for all keys · Ctrl+C twice exits",
+  "chat.noModel": "No model selected. Choose one with /model.",
+  "chat.noModels": "No remote models are available. On another computer, allow a provider to be invoked remotely, or join a share with cindy received join.",
+  "chat.unavailableSources": "Not reachable right now: {names}",
+  "chat.loadingModels": "Loading models…",
+  "chat.modelSelected": "Model: {model} · {where}",
+  "chat.modelNewSession": "That model runs on another computer; your next message starts a new session.",
+  "chat.modelUnavailable": "Model {model} is not available. Choose one with /model.",
+  "chat.connecting": "Connecting to {where}…",
+  "chat.working": "Working…",
+  "chat.thinking": "Thinking…",
+  "chat.waitingAnswer": "Waiting for your answer",
+  "chat.interrupted": "Interrupted.",
+  "error.proxyUnsupported": "The proxy in HTTPS_PROXY / HTTP_PROXY / ALL_PROXY is not supported. Use http://host:port or socks5://host:port (credentials in the URL are allowed).",
+  "chat.ripgrepMissing": "ripgrep (rg) was not found. The Agent searches with rg, so it will fall back to slower grep/find. Install it (apt install ripgrep / dnf install ripgrep / brew install ripgrep / winget install BurntSushi.ripgrep.MSVC) or set CINDY_CLI_RG.",
+  "chat.gitBashMissing": "Git Bash was not found. The Agent writes bash commands, but they would run in cmd and most would fail. Install Git for Windows, or set CLAUDE_CODE_GIT_BASH_PATH to bash.exe.",
+  "help.titleCommands": "Commands",
+  "help.titleInput": "Typing and sending",
+  "help.titleRunning": "While the Agent is working",
+  "help.titleChoices": "Answering the Agent (confirmations, questions, plans)",
+  "help.titleOther": "Other",
+  "help.send": "Send the message",
+  "help.newline": "New line",
+  "help.history": "Previous / next input",
+  "help.complete": "Type / to list commands, Tab to complete",
+  "help.clearInput": "Clear the input",
+  "help.queue": "Queue: sent in order after the current turn",
+  "help.steer": "Steer: no interrupt, handled first after the current action (empty input steers the first queued message)",
+  "help.keyUpEmpty": "↑ (empty input)",
+  "help.takeBack": "Take the last queued message back to edit",
+  "help.interrupt": "Interrupt the current turn; the queue pauses, Enter on an empty input resumes it",
+  "help.choose": "Move and choose",
+  "help.chooseNumber": "Choose that option directly",
+  "help.keySpace": "Space",
+  "help.toggle": "Toggle an option in a multi-select question",
+  "help.cancelChoice": "Deny a confirmation; go back or close a picker",
+  "help.keyType": "Type text",
+  "help.typeAnswer": "Answer a question in your own words, or give feedback on a plan",
+  "help.cyclePermission": "Switch permission mode: full → normal → plan",
+  "help.keyQuestion": "? (empty input)",
+  "help.showHelp": "Show this help",
+  "help.exit": "Exit",
+  "help.continue": "At startup: continue the latest session in this directory",
+  "chat.queued": "Queued ({count}) — sent in order after the current turn",
+  "chat.queuePaused": "Queue paused ({count}) — press Enter on an empty line to continue sending",
+  "chat.queueHint": "↑ take back the last · Ctrl+S steer the first now",
+  "chat.queueMore": "… {count} more",
+  "chat.steerTag": "steer",
+  "chat.steerFailed": "Could not steer right now; the message was queued instead.",
+  "chat.workingKeys": "Esc interrupt · Enter queue · Ctrl+S steer",
+  "ask.multiHint": "Space toggles · Enter confirms · or type an answer",
+  "ask.planHint": "Choose, or type feedback and press Enter to keep planning",
+  "chat.exitHint": "Press Ctrl+C again to exit.",
+  "chat.startFailed": "The session could not start: {reason}",
+  "chat.error": "Error: {message}",
+  "chat.newSession": "Started a new session.",
+  "chat.resumed": "Resumed: {title}",
+  "chat.resumeNone": "No earlier sessions in this directory.",
+  "chat.resumeUnavailable": "Cannot resume \"{title}\": {model} on {where} is not available right now. Nothing was changed.",
+  "chat.unknownCommand": "Unknown command {name}. Type /help.",
+  "chat.unsupported": "The remote Agent does not support {name}.",
+  "chat.busy": "Wait for the current turn to finish, or press Esc to interrupt.",
+  "chat.noSession": "No session is open yet. Send a message first.",
+  "chat.permission": "Permission mode: {mode}",
+  "chat.planOn": "Plan mode on: the Agent plans without changing anything.",
+  "chat.planOff": "Plan mode off.",
+  "chat.effort": "Reasoning effort: {effort}",
+  "chat.effortNone": "This model has no reasoning effort levels.",
+  "chat.compacting": "Compacting context…",
+  "chat.compacted": "Context compacted.",
+  "chat.compactNoop": "Nothing to compact yet.",
+  "chat.language": "Language: {lang}",
+  "chat.cost": "This session: {tokens} tokens · ${cost}",
+  "chat.context": "Context: {used} / {max} tokens ({percent}%)",
+  "chat.statusAccount": "Account: {account}",
+  "chat.statusWhere": "Agent computer: {where}",
+  "chat.statusModel": "Model: {model}",
+  "chat.statusPermission": "Permission mode: {mode}",
+  "chat.statusCwd": "Working directory: {cwd}",
+  "chat.statusSession": "Session: {state}",
+  "chat.sessionOpen": "open",
+  "chat.sessionNone": "not started",
+  "chat.toolDenied": "Denied.",
+  "perm.full": "full — act without asking",
+  "perm.normal": "normal — ask before risky actions",
+  "perm.plan": "plan — plan only, change nothing",
+  "picker.model": "Select a model",
+  "picker.resume": "Resume a session",
+  "picker.permission": "Permission mode",
+  "picker.effort": "Reasoning effort",
+  "picker.lang": "Language",
+  "picker.hint": "↑/↓ move · Enter choose · Esc cancel",
+  "picker.provider": "Select a provider",
+  "picker.modelOf": "Select a model · {provider}",
+  "picker.modelCount": "{count} models",
+  "picker.current": "current",
+  "picker.unreachable": "not reachable right now",
+  "picker.hintBack": "↑/↓ move · Enter choose · Esc back",
+  "picker.moreAbove": "↑ {count} more",
+  "picker.moreBelow": "↓ {count} more",
+  "ask.permissionTitle": "Allow {tool}?",
+  "ask.allowOnce": "Allow once",
+  "ask.allowSession": "Always allow for this session",
+  "ask.deny": "Deny",
+  "ask.questionHint": "Choose an option, or type an answer and press Enter.",
+  "ask.planTitle": "The Agent proposes this plan:",
+  "ask.planApprove": "Approve and start",
+  "ask.planRevise": "Keep planning",
+  "ask.skip": "Skip",
+  "cmd.help": "Show commands and keyboard operations",
+  "cmd.model": "Choose the provider and model",
+  "cmd.effort": "Set reasoning effort",
+  "cmd.permissions": "Set permission mode (full, normal, plan)",
+  "cmd.plan": "Turn Plan mode on or off",
+  "cmd.compact": "Compact the context",
+  "cmd.clear": "Close this session and start a new one",
+  "cmd.resume": "Resume an earlier session in this directory",
+  "cmd.status": "Show account, computer, model and permissions",
+  "cmd.cost": "Show token usage and cost for this session",
+  "cmd.context": "Show context usage",
+  "cmd.lang": "Switch interface language (en, zh)",
+  "cmd.exit": "Exit",
+} as const;
+
+export type MessageKey = keyof typeof en;
+
+const zh: Record<MessageKey, string> = {
+  'help.text': `Cindy：在终端里使用远程与分享来的 Agent
+
+用法：cindy [选项] [命令]
+
+命令：
+  （无）、chat                 在当前目录开始一个交互任务
+  -p, --print 提示              发送一条消息，打印回答后退出
+  -c, --continue               接着这个目录最近一次的任务（也可与 -p 一起用）
+  login [选项]                 登录 Cindy
+  logout                       退出登录并删除保存的登录信息
+  status                       查看账号、语言与数据目录
+  models                       列出可以使用的远程模型
+  received list                查看分享给我的供应商
+  received join 链接           用分享链接申请使用
+  received status 申请ID       查看申请进度
+  received withdraw 申请ID     撤回申请
+  received leave 成员ID        不再使用某个分享来的供应商
+  config show                  查看设置
+  config set 键 值             修改设置（language、permissionMode、deviceName）
+  config reset 键              恢复某项设置的默认值
+  help、version
+
+选项：
+  --data-dir 路径              数据目录（默认：当前用户的应用数据目录）
+  --lang en|zh                 本次运行的界面语言
+  --model ID                   本次运行使用的模型
+  --permission-mode 档位       本次运行的权限档：full、normal 或 plan
+
+登录选项：--email 邮箱 | --phone 手机号 | --org 组织 | --social 第三方。
+验证码只在交互中输入，不能作为参数传入。
+交互界面里输入 /help 或 ? 查看全部按键操作。`,
+  'error.unknownCommand': '未知命令。运行 cindy help 查看用法。',
+  'error.unexpectedArgument': '参数有误。运行 cindy help 查看用法。',
+  'error.missingValue': '{option} 需要一个值。',
+  'error.duplicateOption': '{option} 只能指定一次。',
+  'error.dataDirRelative': '数据目录必须是绝对路径。',
+  'error.dataDirInGit': '数据目录不能位于 Git 工作区内。',
+  'error.dataDirUnavailable': '无法确定数据目录。请用 --data-dir 或 CINDY_CLI_DATA_DIR 指定。',
+  'error.profileBusy': '这个数据目录正被另一个 Cindy 进程使用，请先关闭它。如果是异常退出留下了 profile.lock，确认没有 Cindy 进程在运行后再删除。',
+  'error.configInvalid': '设置文件无效，已保持原样：{file}',
+  'error.configBusy': '设置正被另一个进程修改，请重试。',
+  'error.configKey': '未知设置。可用：language、permissionMode、deviceName。',
+  'error.configValue': '{key} 的值无效。',
+  'error.terminalRequired': '这个命令需要在交互终端中运行。',
+  'error.credentialStore': '受保护的凭证存储不可用。Linux 请安装并解锁 Secret Service（GNOME Keyring 或 KWallet）；没有它的服务器可以显式设置 CINDY_CLI_CREDENTIAL_STORE=file（不加密，仅当前用户可读的数据目录文件）。macOS 请解锁登录钥匙串；Windows 请检查凭据管理器。',
+  'error.authRequired': '请先登录：cindy login',
+  'error.authFailed': '登录未完成。请检查登录方式、验证码和网络。',
+  'error.captcha': '这种登录方式需要人机验证，请改用浏览器登录方式。',
+  'error.loginParams': '用法：login [--email 邮箱 | --phone 手机号 | --org 组织 | --social 第三方]。',
+  'error.cancelled': '已取消。',
+  'error.failed': '命令失败。',
+  'error.notImplemented': '这个版本暂不支持该命令。',
+  'config.saved': '设置已保存。',
+  'status.title': 'Cindy CLI 状态',
+  "error.relayUnavailable": "无法连接 Cindy 服务。请检查网络后重试。",
+  "error.accountLost": "账号已退出或这台设备已被移除。请运行 cindy login 重新登录。",
+  "error.shareInvalidLink": "这不是有效的分享链接。",
+  "error.shareOtherRegion": "这个链接属于中国大陆版 Cindy。终端版暂不支持跨区域分享。",
+  "error.shareNotFound": "没有这个分享来的供应商。运行 cindy received list 查看。",
+  "error.shareUnavailable": "分享服务暂时不可用，请稍后重试。",
+  "error.sharePaused": "分享者已暂停这个分享。",
+  "error.shareRemoved": "这个分享来的供应商已不可用。",
+  "catalog.sharedBy": "来自 {name} 的分享",
+  "received.none": "还没有分享给你的供应商。请对方生成分享链接，然后运行 cindy received join 链接。",
+  "received.row": "{provider} · 来自 {name} 的分享 · {status} · 成员 {id}",
+  "received.statusActive": "可用",
+  "received.statusPaused": "对方已暂停",
+  "received.hostOffline": "分享者的电脑不在线",
+  "received.loading": "正在读取分享链接…",
+  "received.askTitle": "{name} 想把 {provider} 分享给你",
+  "received.factRuns": "Agent 在 {name} 的电脑或 {name} 安排的其他电脑上用 {provider} 运行。用量计入 {name} 的 {provider}，{name} 能看到你的用量。",
+  "received.factFiles": "你的项目文件和命令仍在你自己的电脑上执行，由你的任务权限把关。",
+  "received.factPrivacy": "对话内容和 Agent 读取的文件内容会经过 {name} 的电脑，并保存在实际运行任务的那台电脑上。{name} 和需要同意你使用的其他电脑主人只会看到你的昵称和头像。",
+  "received.factApproval": "发送申请后，需要 {name} 同意才会生效。{name} 可以随时关闭或删除这个分享。",
+  "received.confirm": "发送申请？[y/N] ",
+  "received.cancelled": "未发送申请。链接在有效期内仍未被使用。",
+  "received.pairing": "配对码：{code}",
+  "received.waitDescription": "{name} 可能会问你看到的配对码，告诉对方这 4 位数字即可。对方的电脑不在线时，会在上线后看到你的申请；申请 24 小时内未处理会自动失效。",
+  "received.waiting": "正在等待 {name} 同意…（按 Ctrl+C 停止等待，申请仍然有效）",
+  "received.stillPending": "仍在等待。可用 cindy received status {id} 再次查看，或用 cindy received withdraw {id} 撤回。",
+  "received.approved": "{name} 已同意分享 {provider}。在 cindy 里用 /model 选择它。",
+  "received.rejected": "对方拒绝了申请。如需再次申请，请联系 {name} 重新生成链接。",
+  "received.expired": "申请已过期。",
+  "received.withdrawn": "申请已撤回，链接已作废。",
+  "received.linkUsed": "链接只能使用一次，并且生成后 5 分钟内有效。它已经被使用或已经过期，请联系 {name} 重新生成链接。",
+  "received.left": "已不再使用这个分享来的供应商。",
+  "received.usage": "用法：cindy received list | join 链接 | status 申请ID | withdraw 申请ID | leave 成员ID",
+  "credential.notice": "这个任务用的是分享来的供应商，Agent 读到的内容会经过分享者或其安排的电脑。这一步可能涉及凭证（如密钥、.env），需要你确认后才继续。选择「本任务总是允许」后，本任务后续凭证操作不再额外确认；切换权限档、计划模式或退出 Cindy 后需再次确认。",
+  "chat.welcome": "Cindy · {cwd}",
+  "chat.hint": "输入消息 · / 查看命令 · ? 或 /help 查看全部操作 · 连按两次 Ctrl+C 退出",
+  "chat.noModel": "还没有选择模型。用 /model 选择。",
+  "chat.noModels": "没有可用的远程模型。请在另一台电脑上为供应商打开「允许被远程调用」，或用 cindy received join 加入分享。",
+  "chat.unavailableSources": "暂时连不上：{names}",
+  "chat.loadingModels": "正在读取模型…",
+  "chat.modelSelected": "模型：{model} · {where}",
+  "chat.modelNewSession": "这个模型在另一台电脑上，下一条消息会开始新任务。",
+  "chat.modelUnavailable": "模型 {model} 不可用。用 /model 选择。",
+  "chat.connecting": "正在连接 {where}…",
+  "chat.working": "正在处理…",
+  "chat.thinking": "正在思考…",
+  "chat.waitingAnswer": "等待你的回答",
+  "chat.interrupted": "已打断。",
+  "error.proxyUnsupported": "HTTPS_PROXY / HTTP_PROXY / ALL_PROXY 中的代理不受支持。请使用 http://主机:端口 或 socks5://主机:端口（可在地址里带用户名密码）。",
+  "chat.ripgrepMissing": "未找到 ripgrep（rg）。Agent 用 rg 搜索文件，没有它会改用较慢的 grep/find。请安装（apt install ripgrep / dnf install ripgrep / brew install ripgrep / winget install BurntSushi.ripgrep.MSVC）或设置 CINDY_CLI_RG。",
+  "chat.gitBashMissing": "未找到 Git Bash。Agent 按 bash 写命令，但会落到 cmd 执行，大多会失败。请安装 Git for Windows，或用 CLAUDE_CODE_GIT_BASH_PATH 指向 bash.exe。",
+  "help.titleCommands": "命令",
+  "help.titleInput": "输入与发送",
+  "help.titleRunning": "任务运行中",
+  "help.titleChoices": "回答 Agent（确认、提问、计划）",
+  "help.titleOther": "其他",
+  "help.send": "发送消息",
+  "help.newline": "换行",
+  "help.history": "上一条 / 下一条输入",
+  "help.complete": "输入 / 列出命令，Tab 补全",
+  "help.clearInput": "清空输入框",
+  "help.queue": "排队：当前回合结束后依次发送",
+  "help.steer": "插话：不打断，当前动作完成后优先处理（输入框为空时插话第一条排队消息）",
+  "help.keyUpEmpty": "↑（输入框为空）",
+  "help.takeBack": "取回最后一条排队消息编辑",
+  "help.interrupt": "立即打断当前回合；排队消息暂停，在空输入框按 Enter 继续发送",
+  "help.choose": "移动并选择",
+  "help.chooseNumber": "直接选择对应项",
+  "help.keySpace": "空格",
+  "help.toggle": "多选题勾选或取消",
+  "help.cancelChoice": "确认框视为拒绝；选择框返回上一步或关闭",
+  "help.keyType": "直接输入",
+  "help.typeAnswer": "用自己的话回答提问，或作为计划的修改意见",
+  "help.cyclePermission": "切换权限档：full → normal → plan",
+  "help.keyQuestion": "?（输入框为空）",
+  "help.showHelp": "显示本帮助",
+  "help.exit": "退出",
+  "help.continue": "启动时接着这个目录最近一次的任务",
+  "chat.queued": "排队中（{count}）——当前回合结束后依次发送",
+  "chat.queuePaused": "队列已暂停（{count}）——在空输入框按 Enter 继续发送",
+  "chat.queueHint": "↑ 取回最后一条编辑 · Ctrl+S 立即插话第一条",
+  "chat.queueMore": "… 还有 {count} 条",
+  "chat.steerTag": "插话",
+  "chat.steerFailed": "暂时无法插话，已改为排队。",
+  "chat.workingKeys": "Esc 打断 · Enter 排队 · Ctrl+S 插话",
+  "ask.multiHint": "空格勾选 · Enter 确认 · 也可以直接输入回答",
+  "ask.planHint": "选择一项，或输入修改意见后按 Enter 继续完善计划",
+  "chat.exitHint": "再按一次 Ctrl+C 退出。",
+  "chat.startFailed": "任务无法开始：{reason}",
+  "chat.error": "出错了：{message}",
+  "chat.newSession": "已开始新任务。",
+  "chat.resumed": "已接回：{title}",
+  "chat.resumeNone": "这个目录下没有之前的任务。",
+  "chat.resumeUnavailable": "无法接回「{title}」：{where} 上的 {model} 暂时不可用。当前任务未改变。",
+  "chat.unknownCommand": "未知命令 {name}。输入 /help 查看。",
+  "chat.unsupported": "远端 Agent 不支持 {name}。",
+  "chat.busy": "请等当前回合结束，或按 Esc 打断。",
+  "chat.noSession": "还没有打开任务。先发送一条消息。",
+  "chat.permission": "权限档：{mode}",
+  "chat.planOn": "计划模式已开启：Agent 只做计划，不做改动。",
+  "chat.planOff": "计划模式已关闭。",
+  "chat.effort": "推理档位：{effort}",
+  "chat.effortNone": "这个模型没有推理档位。",
+  "chat.compacting": "正在压缩上下文…",
+  "chat.compacted": "上下文已压缩。",
+  "chat.compactNoop": "暂无可压缩内容。",
+  "chat.language": "界面语言：{lang}",
+  "chat.cost": "本任务：{tokens} tokens · ${cost}",
+  "chat.context": "上下文：{used} / {max} tokens（{percent}%）",
+  "chat.statusAccount": "账号：{account}",
+  "chat.statusWhere": "Agent 所在电脑：{where}",
+  "chat.statusModel": "模型：{model}",
+  "chat.statusPermission": "权限档：{mode}",
+  "chat.statusCwd": "工作目录：{cwd}",
+  "chat.statusSession": "任务：{state}",
+  "chat.sessionOpen": "已打开",
+  "chat.sessionNone": "未开始",
+  "chat.toolDenied": "已拒绝。",
+  "perm.full": "full：完全访问，不再确认",
+  "perm.normal": "normal：有风险的操作先确认",
+  "perm.plan": "plan：只做计划，不做改动",
+  "picker.model": "选择模型",
+  "picker.resume": "接回任务",
+  "picker.permission": "权限档",
+  "picker.effort": "推理档位",
+  "picker.lang": "界面语言",
+  "picker.hint": "↑/↓ 移动 · Enter 选择 · Esc 取消",
+  "picker.provider": "选择供应商",
+  "picker.modelOf": "选择模型 · {provider}",
+  "picker.modelCount": "{count} 个模型",
+  "picker.current": "当前",
+  "picker.unreachable": "暂时连不上",
+  "picker.hintBack": "↑/↓ 移动 · Enter 选择 · Esc 返回上一步",
+  "picker.moreAbove": "↑ 还有 {count} 项",
+  "picker.moreBelow": "↓ 还有 {count} 项",
+  "ask.permissionTitle": "允许 {tool}？",
+  "ask.allowOnce": "允许这一次",
+  "ask.allowSession": "本任务总是允许",
+  "ask.deny": "拒绝",
+  "ask.questionHint": "选择一项，或直接输入回答后按 Enter。",
+  "ask.planTitle": "Agent 提出了这个计划：",
+  "ask.planApprove": "批准并开始",
+  "ask.planRevise": "继续完善计划",
+  "ask.skip": "跳过",
+  "cmd.help": "查看命令与按键操作",
+  "cmd.model": "选择供应商与模型",
+  "cmd.effort": "设置推理档位",
+  "cmd.permissions": "设置权限档（full、normal、plan）",
+  "cmd.plan": "开启或关闭计划模式",
+  "cmd.compact": "压缩上下文",
+  "cmd.clear": "关闭当前任务并开始新任务",
+  "cmd.resume": "接回这个目录下之前的任务",
+  "cmd.status": "查看账号、电脑、模型与权限",
+  "cmd.cost": "查看本任务的 token 用量与费用",
+  "cmd.context": "查看上下文占用",
+  "cmd.lang": "切换界面语言（en、zh）",
+  "cmd.exit": "退出",
+};
+
+const catalogs: Record<Language, Record<MessageKey, string>> = { en, zh };
+
+export type Translate = (key: MessageKey, vars?: Record<string, string | number>) => string;
+
+export function createTranslator(language: Language): Translate {
+  return (key, vars) => {
+    const template = catalogs[language][key] ?? en[key];
+    return vars ? template.replace(/\{(\w+)\}/g, (match, name: string) => (name in vars ? String(vars[name]) : match)) : template;
+  };
+}

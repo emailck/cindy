@@ -64,6 +64,14 @@
 容器或官方 Server。它使用独立 npm package 与锁文件，部署数据在仓库外；实施计划与
 验收继续见上述 CLI 计划/进度。
 
+### CLI 使用端（终端客户端）
+
+`apps/cindy-cli`（命令 `cindy`）是与提供端分开的终端客户端：用 ink 界面在当前目录使用同账号电脑或其他账号
+分享来的远端 Agent，文件与命令回到本机执行。远端会话、执行器与权限门禁直接引用 Desktop
+`remote-agent/controller`、`executor` 源码（不修改 Desktop），出站链路、分享受邀者流程与界面为自写。
+使用见 [CLI 使用端说明](../../apps/cindy-cli/README.md)，计划与验收见 [使用端计划](../cindy-cli-client-plan.md)、
+[使用端进度](../cindy-cli-client-progress.md)。
+
 `packages/remote-agent-host` 保存 Desktop 与 CLI 共用的远程宿主、事件流和反向隧道；认证、供应商策略与存储由宿主注入。Desktop 原 remote-agent 路径保留兼容导出，既有行为测试仍从 Desktop 入口验证。
 
 ## packages/
