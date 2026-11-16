@@ -26,7 +26,8 @@ export async function runPrint(controller: ChatController, prompt: string, io: {
     flush();
     if (!controller.getSnapshot().model) return 1;
     // -c -p: a session that cannot be continued is an error, not a silent fresh start.
-    if (options.continueLatest && !await controller.continueLatest()) { flush(); return 1; }
+    // The answer printed is the new one: the earlier conversation is not replayed here.
+    if (options.continueLatest && !await controller.continueLatest({ replay: false })) { flush(); return 1; }
     await controller.submit(prompt);
     await controller.waitForTurn();
     flush();

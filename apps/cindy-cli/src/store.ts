@@ -1,9 +1,10 @@
 /**
- * Local task records for /resume. Conversation history stays with the remote Agent's native
- * session; this keeps only what reconnecting needs, per account, in the private data directory.
+ * Local task records for /resume, per account, in the private data directory: what reconnecting needs, and
+ * the task's conversation as it was shown (replayed when the task is picked up again). The remote Agent keeps
+ * its own native session; this copy only serves the terminal.
  */
 import { createHash, randomUUID } from 'node:crypto';
-import { mkdir, open, readFile, rename, unlink } from 'node:fs/promises';
+import { appendFile, mkdir, open, readdir, readFile, rename, stat, unlink } from 'node:fs/promises';
 import path from 'node:path';
 
 export interface TaskRecord {
@@ -39,7 +40,17 @@ function isRecord(value: unknown): value is TaskRecord {
 export interface TaskStore {
   list(workingDir: string): Promise<TaskRecord[]>;
   save(record: TaskRecord): Promise<void>;
+  /** Adds shown transcript entries (JSON values) for the task; oldest first. */
+  appendTranscript?(sessionId: string, entries: readonly unknown[]): Promise<void>;
+  /** The task's saved transcript entries, oldest first; empty when there are none. */
+  readTranscript?(sessionId: string): Promise<unknown[]>;
 }
+
+/** Transcripts are named by the task id; anything else never becomes a file name. */
+const SESSION_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+/** A transcript past this size is cut down to its most recent entries. */
+const TRANSCRIPT_MAX_BYTES = 4 * 1024 * 1024;
+const TRANSCRIPT_KEEP_ENTRIES = 2_000;
 
 /** `storageScope` is the account identity; another account never sees these records. */
 export function createTaskStore(dataDir: string, storageScope: string): TaskStore {
@@ -61,6 +72,22 @@ export function createTaskStore(dataDir: string, storageScope: string): TaskStor
     try { await rename(temporary, file); }
     catch (error) { await unlink(temporary).catch(() => {}); throw error; }
   };
+  const transcripts = path.join(dir, 'transcripts');
+  const transcriptFile = (sessionId: string) => (SESSION_ID.test(sessionId) ? path.join(transcripts, `${sessionId}.jsonl`) : null);
+  const readEntries = async (file: string): Promise<unknown[]> => {
+    let text: string;
+    try { text = await readFile(file, 'utf8'); } catch { return []; }
+    // A line cut short by a crash is skipped, not fatal.
+    return text.split('\n').flatMap(line => { if (!line) return []; try { return [JSON.parse(line) as unknown]; } catch { return []; } });
+  };
+  /** Transcripts of tasks no longer listed (dropped past the record limit, or never recorded) go with them. */
+  const prune = async (kept: readonly TaskRecord[]) => {
+    const ids = new Set(kept.map(record => record.sessionId.toLowerCase()));
+    let names: string[];
+    try { names = await readdir(transcripts); } catch { return; }
+    await Promise.all(names.filter(name => name.endsWith('.jsonl') && !ids.has(name.slice(0, -6).toLowerCase()))
+      .map(name => unlink(path.join(transcripts, name)).catch(() => {})));
+  };
   return {
     async list(workingDir) {
       const target = path.resolve(workingDir);
@@ -71,10 +98,36 @@ export function createTaskStore(dataDir: string, storageScope: string): TaskStor
         const records = (await read()).filter(item => item.sessionId !== record.sessionId);
         records.push(record);
         records.sort((a, b) => b.updatedAt - a.updatedAt);
-        await write(records.slice(0, MAX_RECORDS));
+        const kept = records.slice(0, MAX_RECORDS);
+        await write(kept);
+        await prune(kept);
       });
       queue = next.catch(() => undefined);
       return next;
+    },
+    appendTranscript(sessionId, entries) {
+      const file = transcriptFile(sessionId);
+      if (!file || !entries.length) return Promise.resolve();
+      const next = queue.then(async () => {
+        await mkdir(transcripts, { recursive: true, mode: 0o700 });
+        await appendFile(file, entries.map(entry => `${JSON.stringify(entry)}\n`).join(''), { mode: 0o600 });
+        if ((await stat(file)).size <= TRANSCRIPT_MAX_BYTES) return;
+        const recent = (await readEntries(file)).slice(-TRANSCRIPT_KEEP_ENTRIES);
+        const temporary = path.join(transcripts, `.${randomUUID()}.tmp`);
+        const handle = await open(temporary, 'wx', 0o600);
+        try { await handle.writeFile(recent.map(entry => `${JSON.stringify(entry)}\n`).join('')); await handle.sync(); }
+        finally { await handle.close(); }
+        try { await rename(temporary, file); }
+        catch (error) { await unlink(temporary).catch(() => {}); throw error; }
+      });
+      queue = next.catch(() => undefined);
+      return next;
+    },
+    async readTranscript(sessionId) {
+      const file = transcriptFile(sessionId);
+      if (!file) return [];
+      await queue;
+      return readEntries(file);
     },
   };
 }

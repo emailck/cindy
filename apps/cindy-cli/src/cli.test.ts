@@ -6,7 +6,8 @@
  * - 现有覆盖缺口：新程序，无既有覆盖；cindy-host 的同类测试不经过本入口。
  * - 最小失败输入：语言优先级颠倒、坏设置文件被覆盖、Git 内数据目录被接受、并发登录不报 PROFILE_BUSY；
  *   进程已不在的 profile.lock 挡住下一次启动、关掉终端（SIGHUP）或界面接管前按 Ctrl+C 时进程被直接杀掉而锁留下
- *   （2026-11-16 用户反馈：进程退出后锁还在）；输入历史混入别的项目目录或别的账号、重复输入不去重、文件不是私有权限。
+ *   （2026-11-16 用户反馈：进程退出后锁还在）；输入历史混入别的项目目录或别的账号、重复输入不去重、文件不是私有权限；
+ *   任务对话记录不是私有权限、任意字符串被当成文件名、没有任务记录的对话记录一直留着。
  * - tier：unit（临时目录 + 注入依赖，不访问网络与系统钥匙串）。
  */
 import { EventEmitter } from 'node:events';
@@ -16,7 +17,7 @@ import path from 'node:path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { runCli, type CliDependencies } from './cli';
 import { credentialStore } from './auth';
-import { createHistoryStore } from './store';
+import { createHistoryStore, createTaskStore } from './store';
 
 // Never access the developer's real OS credential store.
 vi.mock('@napi-rs/keyring', () => ({ AsyncEntry: class { constructor() { throw new Error('No test keyring'); } } }));
@@ -146,5 +147,22 @@ describe('cindy command entry', () => {
     expect(await createHistoryStore(dataDir, 'cn:account-b').load('/work/a')).toEqual([]);
     const [account] = await readdir(path.join(dataDir, 'accounts'));
     if (process.platform !== 'win32') expect((await stat(path.join(dataDir, 'accounts', account!, 'history.json'))).mode & 0o777).toBe(0o600);
+  });
+
+  it('keeps each task\'s transcript privately under its id, and drops transcripts of tasks no longer listed', async () => {
+    const tasks = createTaskStore(dataDir, 'cn:account-a');
+    const kept = '11111111-1111-4111-8111-111111111111';
+    const orphan = '22222222-2222-4222-8222-222222222222';
+    await tasks.appendTranscript!(kept, [{ kind: 'user', text: 'hi' }]);
+    await tasks.appendTranscript!(kept, [{ kind: 'assistant', text: 'hello' }]);
+    await tasks.appendTranscript!(orphan, [{ kind: 'user', text: 'never recorded' }]);
+    await tasks.appendTranscript!('../escape', [{ kind: 'user', text: 'x' }]);
+    expect(await tasks.readTranscript!(kept)).toEqual([{ kind: 'user', text: 'hi' }, { kind: 'assistant', text: 'hello' }]);
+    await tasks.save({ sessionId: kept, workingDir: '/work', target: 't', targetLabel: 't', agent: 'claude-code', providerId: 'p', model: 'm', title: 'hi', updatedAt: 1 });
+    expect(await tasks.readTranscript!(orphan)).toEqual([]);
+    const [account] = await readdir(path.join(dataDir, 'accounts'));
+    const files = await readdir(path.join(dataDir, 'accounts', account!, 'transcripts'));
+    expect(files).toEqual([`${kept}.jsonl`]);
+    if (process.platform !== 'win32') expect((await stat(path.join(dataDir, 'accounts', account!, 'transcripts', files[0]!))).mode & 0o777).toBe(0o600);
   });
 });

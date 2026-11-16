@@ -336,6 +336,8 @@ export class ChatController {
   /** `@` completion: project paths, loaded on first use. */
   private files: string[] | null = null;
   private filesLoading = false;
+  /** Lines from here on belong to the open task and are not in its saved transcript yet. */
+  private persisted = 0;
   /** Time spent in turns and how many there were in this task (the exit summary). */
   private workMs = 0;
   private turns = 0;
@@ -930,6 +932,7 @@ export class ChatController {
       if (outcome === 'done' && took >= NOTIFY_AFTER_MS) this.deps.notify?.('done');
     }
     if (wasRunning || this.snapshot.thinking) this.update({ phase: 'idle', thinking: false, turnStartedAt: null });
+    this.saveTranscript();
     for (const waiter of this.turnWaiters.splice(0)) waiter();
     if (outcome !== 'done') {
       if (this.snapshot.queue.length && !this.snapshot.queuePaused) this.update({ queuePaused: true });
@@ -986,6 +989,7 @@ export class ChatController {
     if (this.exitTimer) clearTimeout(this.exitTimer);
     this.cancelPrompt();
     this.localAbort?.abort();
+    this.saveTranscript();
     const handle = this.handle;
     this.handle = null;
     await handle?.close({ reason: 'navigation' }).catch(() => undefined);
@@ -1340,6 +1344,7 @@ export class ChatController {
   }
 
   private async newSession(): Promise<void> {
+    this.saveTranscript();
     const handle = this.handle;
     this.handle = null;
     this.cancelPrompt();
@@ -1366,6 +1371,20 @@ export class ChatController {
     this.workMs = 0;
     this.turns = 0;
     this.update({ live: '', liveCont: false, liveCode: false, phase: 'idle', thinking: false, turnStartedAt: null, usage: null, localPending: 0 });
+    this.persisted = this.snapshot.lines.length;
+  }
+
+  /**
+   * Adds what the open task showed since the last save to its local transcript: messages, replies, tool calls,
+   * thinking, local commands and errors, with long outputs cut. Nothing is saved before the first message.
+   */
+  private saveTranscript() {
+    const lines = this.snapshot.lines;
+    const fresh = lines.slice(this.persisted);
+    this.persisted = lines.length;
+    if (!this.title || !this.deps.tasks.appendTranscript) return;
+    const entries = fresh.flatMap(storedLine);
+    if (entries.length) void this.deps.tasks.appendTranscript(this.sessionId, entries).catch(() => undefined);
   }
 
   private async resumeCommand(): Promise<void> {
@@ -1375,29 +1394,87 @@ export class ChatController {
       async index => { await this.resumeRecord(records[index]!); });
   }
 
-  /** `cindy -c`: continue the most recent session started in this directory. */
-  async continueLatest(): Promise<boolean> {
+  /** `cindy -c`: continue the most recent session started in this directory. Print mode does not replay it. */
+  async continueLatest(options: { replay?: boolean } = {}): Promise<boolean> {
     const [latest] = await this.deps.tasks.list(this.deps.workingDir).catch(() => [] as TaskRecord[]);
     // -c asked for a continuation: say why none happened, also in print mode.
     if (!latest) { this.notice('chat.resumeNone', undefined, 'warn'); return false; }
-    return this.resumeRecord(latest);
+    return this.resumeRecord(latest, options);
   }
 
   /**
    * A native resume id belongs to the computer and provider that created it. Resume only when that
    * exact route is still offered; never hand it to whichever model happens to be selected.
    */
-  private async resumeRecord(record: TaskRecord): Promise<boolean> {
+  private async resumeRecord(record: TaskRecord, options: { replay?: boolean } = {}): Promise<boolean> {
     const model = this.models.find(item => item.target === record.target && item.providerId === record.providerId && item.model === record.model);
     if (!model) { this.notice('chat.resumeUnavailable', { title: record.title, model: record.model, where: record.targetLabel }, 'warn'); return false; }
+    const saved = options.replay === false ? [] : await this.deps.tasks.readTranscript?.(record.sessionId).catch(() => []) ?? [];
     await this.newSession();
     this.sessionId = record.sessionId;
     this.resumeSessionId = record.resumeSessionId;
     this.title = record.title;
     this.update({ model, effort: model.efforts.includes(this.snapshot.effort ?? '') ? this.snapshot.effort : model.defaultEffort });
+    // What the task showed before, as it was shown; the most recent part of a long one.
+    const restored = saved.flatMap(restoreLine);
+    if (restored.length) {
+      const shown = restored.slice(-REPLAY_LINES);
+      const first = shown[0]!;
+      if (first.kind === 'assistant' && first.cont) shown[0] = { ...first, cont: false };
+      const earlier = restored.length - shown.length;
+      this.notice(earlier ? 'chat.replayEarlier' : 'chat.replay', { count: earlier });
+      this.update({ lines: [...this.snapshot.lines, ...shown] });
+    }
     this.notice('chat.resumed', { title: record.title });
+    this.persisted = this.snapshot.lines.length;
     return true;
   }
+}
+
+/** Transcript entries replayed when a task is picked up again; earlier ones are counted. */
+export const REPLAY_LINES = 300;
+
+const SAVED_KINDS = new Set(['user', 'assistant', 'tool', 'group', 'thinking', 'interrupted', 'local', 'notice']);
+
+function cut(text: string, limit: number): string { return text.length > limit ? `${text.slice(0, limit)}\n…` : text; }
+
+/** A transcript line as saved: no id, long outputs cut; notices only when they report an error. */
+export function storedLine(line: Line): Array<Record<string, unknown>> {
+  const { id: _id, ...rest } = line;
+  switch (line.kind) {
+    case 'tool': return [{ ...rest, ...(line.result !== undefined ? { result: cut(line.result, 4_000), ...(line.result.length > 4_000 ? { truncated: true } : {}) } : {}),
+      ...(line.detail?.kind === 'edit' ? { detail: { ...line.detail, rows: line.detail.rows.slice(0, 200) } } : {}) }];
+    case 'group': return [{ ...rest, items: line.items.map(item => (item.result !== undefined ? { ...item, result: cut(item.result, 2_000) } : item)) }];
+    case 'thinking': return [{ ...rest, text: cut(line.text, 8_000) }];
+    case 'local': return [{ ...rest, ...(line.output !== undefined ? { output: cut(line.output, 4_000) } : {}) }];
+    case 'user': case 'assistant': return [{ ...rest, text: cut(line.text, 50_000) }];
+    case 'interrupted': return [rest];
+    case 'notice': return line.tone === 'error' ? [rest] : [];
+    default: return [];
+  }
+}
+
+/**
+ * A saved entry back as a transcript line, with a new id. The file is the user's own, but it is still checked
+ * for shape; calls that never got a result read as interrupted (the task stopped there).
+ */
+export function restoreLine(entry: unknown): Line[] {
+  if (!entry || typeof entry !== 'object') return [];
+  const value = entry as Record<string, unknown>;
+  if (typeof value.kind !== 'string' || !SAVED_KINDS.has(value.kind)) return [];
+  const text = (key: string) => typeof value[key] === 'string';
+  const ok = value.kind === 'user' || value.kind === 'assistant' || value.kind === 'thinking' ? text('text')
+    : value.kind === 'tool' ? text('name') && text('summary')
+      : value.kind === 'group' ? Array.isArray(value.items) && (value.items as unknown[]).every(item => !!item && typeof item === 'object' && typeof (item as GroupItem).name === 'string' && typeof (item as GroupItem).summary === 'string')
+        : value.kind === 'local' ? text('command')
+          : value.kind === 'notice' ? text('text') && (value.tone === 'info' || value.tone === 'warn' || value.tone === 'error')
+            : true;
+  if (!ok) return [];
+  const line = { ...value, id: randomUUID() } as Line;
+  if (line.kind === 'tool' && line.result === undefined && !line.interrupted && line.detail?.kind !== 'todos') return [{ ...line, interrupted: true }];
+  if (line.kind === 'group') return [{ ...line, items: line.items.map(item => (item.result === undefined ? { ...item, interrupted: true } : item)) }];
+  if (line.kind === 'local' && line.running) return [{ ...line, running: false, exitCode: null }];
+  return [line];
 }
 
 /** `@path` and `@"path with spaces"` in a message, without trailing punctuation. */

@@ -5,7 +5,8 @@
  * - Bug／规则依据：docs/cindy-cli-client-plan.md「斜杠命令」「交互确认」（不伪造用户选择，中断按拒绝）；
  *   provider-sharing.md §9 第 7 条（「本任务总是允许」只能来自用户选择，经同一确认通道回传授权建议）。
  * - 现有覆盖缺口：新代码；Desktop 的确认卡与模型选择器在 renderer，不经过这里。
- * - 最小失败输入：长回合结束或运行中等待确认时不响铃、短回合也响铃；退出汇总的轮数与用时不对或 /clear 后仍汇总旧任务；
+ * - 最小失败输入：接回任务只显示第一句话（2026-11-16 用户反馈）、重放的内容被再次存入记录、-p -c 把旧回复也打印出来；
+ *   长回合结束或运行中等待确认时不响铃、短回合也响铃；退出汇总的轮数与用时不对或 /clear 后仍汇总旧任务；
  *   运行中输入被丢弃或立即发送、打断后队列继续自动发送、插话失败丢消息、多选只取一项、计划修改意见丢失；/model 未先选供应商、同名分享无法区分、连不上的来源可被选中；流式增量与最终全文重复显示；流式回复逐行提交后最终全文再次输出或 -p 输出被拆成多段；Ctrl+C 关闭确认被当成允许；换到另一台电脑的模型仍发到旧任务；
  *   /resume 不带原生会话 id；记录里的模型已不可用时仍把旧的原生会话 id 交给当前另一条路由。
  * - tier：unit（假会话句柄、内存任务记录；无网络）。
@@ -310,5 +311,41 @@ describe('ChatController', () => {
 
     await controller.submit('/clear');
     expect(controller.exitSummary()).toBeNull();
+  });
+
+  it('replays what a task showed when it is picked up again, saves nothing twice, and keeps print mode to the new answer', async () => {
+    const transcripts = new Map<string, unknown[]>();
+    const records: TaskRecord[] = [];
+    const tasks: TaskStore = {
+      list: async () => records, save: async record => { records.splice(0, records.length, record); },
+      appendTranscript: async (id, entries) => { transcripts.set(id, [...(transcripts.get(id) ?? []), ...entries]); },
+      readTranscript: async id => transcripts.get(id) ?? [],
+    };
+    const controllerWith = (session: ReturnType<typeof fakeHandle>) => new ChatController({ workingDir: '/project', language: 'en', permission: 'full',
+      catalog: async () => ({ models: [model('vps', 'claude-a')], unavailable: [] }), openTask: async () => session.handle, tasks, now: () => 1 });
+    const first = controllerWith(fakeHandle(push => {
+      push({ type: 'text', data: { text: 'Here is the plan', isFinal: true } });
+      push({ type: 'tool_use', data: { toolUseId: 't', toolName: 'Bash', input: { command: 'ls' } } });
+      push({ type: 'tool_result_full', data: { toolUseId: 't', fullText: 'a.txt' } });
+      push({ type: 'done', data: {} });
+    }));
+    await first.init();
+    await first.submit('hi'); await first.waitForTurn(); await flush();
+    await first.exit();
+
+    const second = controllerWith(fakeHandle(push => push({ type: 'done', data: {} })));
+    await second.init();
+    expect(await second.continueLatest()).toBe(true);
+    const shown = second.getSnapshot().lines.slice(2).map(line => (line.kind === 'notice' ? line.text : line.kind === 'tool' ? `${line.name}:${line.result}` : `${line.kind}:${(line as { text: string }).text}`));
+    expect(shown).toEqual(['── Earlier in this task ──', 'user:hi', 'assistant:Here is the plan', 'Bash:a.txt', 'Resumed: hi']);
+    await second.submit('more'); await second.waitForTurn();
+    await second.exit();
+    const saved = [...transcripts.values()][0]!.map(entry => (entry as { kind: string; text?: string }));
+    expect(saved.filter(entry => entry.kind === 'user').map(entry => entry.text)).toEqual(['hi', 'more']);
+
+    const out: string[] = [];
+    const third = controllerWith(fakeHandle(push => { push({ type: 'text', data: { text: 'answer', isFinal: true } }); push({ type: 'done', data: {} }); }));
+    expect(await runPrint(third, 'again', { output: text => out.push(text), error: () => {} }, { continueLatest: true })).toBe(0);
+    expect(out).toEqual(['answer']);
   });
 });
