@@ -226,7 +226,7 @@ describe('ChatController', () => {
     session.handle.steer.mockRejectedValueOnce(new Error('busy'));
     expect(await controller.steer('')).toBe('queued');
     expect(controller.getSnapshot().queue.map(item => item.text)).toEqual(['later']);
-    expect(controller.popQueued()).toBe('later');
+    expect(controller.popQueued()).toMatchObject({ text: 'later' });
     expect(controller.getSnapshot().queue).toEqual([]);
   });
 

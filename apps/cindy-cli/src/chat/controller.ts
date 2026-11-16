@@ -5,7 +5,8 @@
  * Never fabricates a user decision: aborted prompts resolve as dismissed/deny.
  */
 import { randomUUID } from 'node:crypto';
-import type { AgentEvent, AgentSessionHandle, AskUserQuestionItem, Effort, InteractionDecision, InteractionRequest } from '@cindy/maker-core';
+import path from 'node:path';
+import type { AgentEvent, AgentSessionHandle, AskUserQuestionItem, Effort, InteractionDecision, InteractionRequest, UserContentBlock, UserMessage } from '@cindy/maker-core';
 import { readTokenSpeedSnapshot } from '@cindy/maker-shared/usage-format';
 import type { CatalogModel, CatalogResult, CatalogSource } from '../catalog';
 import { createTranslator, type Language, type MessageKey, type Translate } from '../i18n';
@@ -13,9 +14,25 @@ import type { ModelChoice, PermissionChoice } from '../profile';
 import { permissionOptions } from '../permissions';
 import type { RemoteTaskRequest } from '../session';
 import { taskTitle, type TaskRecord, type TaskStore } from '../store';
-import { fenceAfter } from './markdown';
-import { toolDetail, toolOutput, type ToolDetail } from './tools';
+import { fenceAfter, isTableRow } from './markdown';
+import {
+  builtinName, COMMAND_ROWS, commandText, DETAIL_ROWS, GROUPED_TOOLS, SUBAGENT_TOOLS, toolDetail, toolOutput,
+  type DiffRow, type ReadText, type ToolDetail,
+} from './tools';
 import { isThemeSetting, resolveTheme, THEME_SETTINGS, type ThemeName, type ThemeSetting } from './theme';
+
+/** A tool call a sub-Agent made, shown under the call that started it. */
+export interface ChildTool { id: string; name: string; summary: string; done?: boolean; error?: boolean }
+/** What the host reports about a sub-Agent run (agent_task_update). */
+export interface TaskProgress { toolUses?: number; totalTokens?: number; durationMs?: number }
+/** One read / search call inside a collapsed group. */
+export interface GroupItem { id: string; name: string; summary: string; result?: string; error?: boolean; interrupted?: boolean }
+
+/** An image going with a message: a local file the remote proxy reads and sends along. */
+export interface ImageAttachment { path: string; mimeType: string }
+
+/** A message to send: what goes to the Agent, what the transcript shows, and images going with it. */
+export interface Outgoing { text: string; display?: string; images?: readonly ImageAttachment[] }
 
 export type Line =
   | { id: string; kind: 'user'; text: string; /** Sent into the running turn (插话). */ steer?: boolean }
@@ -24,11 +41,40 @@ export type Line =
    * code: the piece starts inside a code fence opened by an earlier piece.
    */
   | { id: string; kind: 'assistant'; text: string; cont?: boolean; code?: boolean }
-  /** name is the tool's own name; result is its output (bounded), summarized by the renderer. */
-  | { id: string; kind: 'tool'; name: string; summary: string; detail?: ToolDetail; result?: string; error?: boolean }
+  /**
+   * name is the tool's own name; result is its output (bounded, truncated when cut), summarized by the renderer.
+   * interrupted: the turn was interrupted before a result came. Sub-Agent calls keep their last few tool calls
+   * (children), how many there were, and the host's progress figures.
+   */
+  | { id: string; kind: 'tool'; name: string; summary: string; detail?: ToolDetail; result?: string; error?: boolean; truncated?: boolean;
+    interrupted?: boolean; children?: ChildTool[]; childCount?: number; task?: TaskProgress }
+  /** Read / search calls that followed each other, shown as one row. */
+  | { id: string; kind: 'group'; items: GroupItem[] }
+  /** A finished thinking block; its text is shown in the Ctrl+O viewer. */
+  | { id: string; kind: 'thinking'; text: string; durationMs?: number }
+  /** Marks where the user interrupted the turn. */
+  | { id: string; kind: 'interrupted' }
+  /** `!command`: run on this computer by the user; its output goes with the next message. */
+  | { id: string; kind: 'local'; command: string; output?: string; exitCode?: number | null; running?: boolean }
   | { id: string; kind: 'notice'; text: string; tone: 'info' | 'warn' | 'error' }
   /** /help and ?: operations grouped by situation; each row is [keys, what it does]. */
   | { id: string; kind: 'help'; sections: HelpSection[] };
+
+/** Last sub-Agent tool calls kept under the call that started it. */
+export const CHILD_ROWS = 3;
+
+/**
+ * The read / search group still open for more calls: the last group line when only thinking rows follow it.
+ * The view keeps it (and what follows) out of the printed history while the turn runs, so it can still grow.
+ */
+export function openGroupIndex(lines: readonly Line[]): number {
+  for (let index = lines.length - 1; index >= 0; index--) {
+    const line = lines[index]!;
+    if (line.kind === 'group') return index;
+    if (line.kind !== 'thinking') return -1;
+  }
+  return -1;
+}
 
 export interface HelpSection { title: string; rows: Array<[string, string]> }
 
@@ -61,9 +107,21 @@ export function groupModels(models: readonly CatalogModel[]): ProviderGroup[] {
 
 export type Prompt =
   | { kind: 'picker'; title: string; choices: Choice[]; index: number; /** Esc returns to the previous step. */ back?: boolean }
-  | { kind: 'permission'; title: string; summary: string; description?: string; choices: Choice[]; index: number }
+  | { kind: 'permission'; title: string; summary: string; description?: string; preview?: PermissionPreview; choices: Choice[]; index: number }
   | { kind: 'question'; question: AskUserQuestionItem; position: string; choices: Choice[]; index: number; /** Multi-select: toggled option indexes. */ selected: number[] }
   | { kind: 'plan'; plan: string; choices: Choice[]; index: number };
+
+/**
+ * What a confirmation shows of the call before it runs: an edit's diff, the start of a file being written,
+ * or a command in full. `more` counts the rows left out.
+ */
+export type PermissionPreview =
+  | { kind: 'diff'; rows: DiffRow[]; more: number }
+  | { kind: 'write'; rows: string[]; more: number }
+  | { kind: 'command'; rows: string[]; more: number };
+
+/** Rows of an edit diff shown on its confirmation. */
+const PREVIEW_DIFF_ROWS = 20;
 
 export interface ChatSnapshot {
   lines: readonly Line[];
@@ -93,6 +151,10 @@ export interface ChatSnapshot {
   exited: boolean;
   /** Status bar figures for the open task; null until the Agent reports usage. */
   usage: UsageView | null;
+  /** A `!command` is running on this computer (Esc stops it). */
+  localRunning: boolean;
+  /** `!command` results waiting to go with the next message. */
+  localPending: number;
 }
 
 /** Usage shown in the status bar, from the Agent's status events (UsageSnapshot). */
@@ -131,7 +193,13 @@ export function cacheHitRate(tokens: TokenTotals): number | null {
 
 interface SpeedSample { tokens: number; ms: number }
 
-export interface QueuedMessage { id: string; text: string }
+export interface QueuedMessage extends Outgoing { id: string }
+
+/** Output of a `!command`; exitCode is null when it was stopped or could not start. */
+export interface LocalResult { output: string; exitCode: number | null }
+
+/** Where a path in a message points, for `@` mentions. */
+export type PathKind = 'file' | 'dir' | null;
 
 export interface ChatDeps {
   workingDir: string;
@@ -153,7 +221,23 @@ export interface ChatDeps {
   /** False on Windows without Git Bash: warn once at startup. */
   shellAvailable?: boolean;
   now?(): number;
+  /** A local file's text (diff line numbers and context); null when it cannot be read. */
+  readText?: ReadText;
+  /** Whether an absolute local path is a file or a directory (`@` mentions). */
+  statPath?(absolute: string): PathKind;
+  /** Project files and directories relative to the working directory (`@` completion); directories end with /. */
+  listFiles?(): Promise<string[]>;
+  /** Runs a `!command` in the working directory on this computer. */
+  runLocal?(command: string, signal: AbortSignal): Promise<LocalResult>;
+  /** Saves an image on the clipboard to a temporary file; null when the clipboard holds no image. */
+  clipboardImage?(): Promise<ImageAttachment | null>;
 }
+
+/** Image types the Agents accept as message attachments. */
+export const IMAGE_TYPES: Readonly<Record<string, string>> = { '.png': 'image/png', '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg', '.gif': 'image/gif', '.webp': 'image/webp' };
+
+/** A `!command`'s output kept for the transcript and the next message. */
+const LOCAL_OUTPUT_KEEP = 30_000;
 
 export const COMMANDS = ['help', 'model', 'effort', 'permissions', 'plan', 'compact', 'clear', 'resume', 'status', 'cost', 'context', 'lang', 'theme', 'exit', 'quit'] as const;
 type Command = (typeof COMMANDS)[number];
@@ -175,8 +259,12 @@ export function helpSections(t: Translate): HelpSection[] {
     { title: t('help.titleCommands'), rows: COMMANDS.filter(command => command !== 'quit').map(command => [`/${command}`, commandDescription(t, command)]) },
     { title: t('help.titleInput'), rows: [
       row('Enter', 'help.send'), row('\\ + Enter · Ctrl+J', 'help.newline'), row('↑ / ↓', 'help.history'),
-      row('/ · Tab', 'help.complete'), row('Esc · Ctrl+U', 'help.clearInput'),
+      row('/ · Tab', 'help.complete'), row('@', 'help.mention'), row('!', 'help.local'),
+      row('Ctrl+V · Alt+V', 'help.pasteImage'), row('Esc · Ctrl+U', 'help.clearInput'),
       row('Alt+← / → · Ctrl+W · Ctrl+K', 'help.editing'), row('Ctrl+A / Ctrl+E', 'help.lineStart'),
+    ] },
+    { title: t('help.titleView'), rows: [
+      row('Ctrl+O', 'help.expand'), row(t('help.keyViewer'), 'help.viewerKeys'),
     ] },
     { title: t('help.titleRunning'), rows: [
       row('Enter', 'help.queue'), row('Ctrl+S', 'help.steer'), row(t('help.keyUpEmpty'), 'help.takeBack'), row('Esc · Ctrl+C', 'help.interrupt'),
@@ -220,7 +308,17 @@ export class ChatController {
   private resumeSessionId: string | undefined;
   private title = '';
   private pending: Pending | null = null;
-  private tools = new Map<string, string>();
+  /** Tool call id → the transcript line showing it (a group or sub-Agent parent for grouped / child calls). */
+  private tools = new Map<string, { line: string; role: 'tool' | 'group' | 'child' }>();
+  /** The thinking block being streamed: its text so far and when it started. */
+  private thinkingText = '';
+  private thinkingStarted: number | null = null;
+  /** `!command` outputs not sent yet, and the one running. */
+  private localContext: string[] = [];
+  private localAbort: AbortController | null = null;
+  /** `@` completion: project paths, loaded on first use. */
+  private files: string[] | null = null;
+  private filesLoading = false;
   private models: CatalogModel[] = [];
   private exitTimer: ReturnType<typeof setTimeout> | undefined;
   private exitWaiters: Array<() => void> = [];
@@ -250,7 +348,7 @@ export class ChatController {
     this.snapshot = { lines: [], live: '', liveCont: false, liveCode: false, phase: 'idle', thinking: false, turnStartedAt: null, prompt: null, model: null,
       permission: deps.permission, effort: null, language: deps.language, queue: [],
       theme: resolveTheme(deps.theme?.setting ?? 'auto', { background: deps.theme?.background ?? null, depth: deps.theme?.depth ?? null }),
-      themeSetting: deps.theme?.setting ?? 'auto', queuePaused: false, exitArmed: false, exited: false, usage: null };
+      themeSetting: deps.theme?.setting ?? 'auto', queuePaused: false, exitArmed: false, exited: false, usage: null, localRunning: false, localPending: 0 };
   }
 
   subscribe = (listener: () => void) => { this.listeners.add(listener); return () => { this.listeners.delete(listener); }; };
@@ -291,27 +389,33 @@ export class ChatController {
 
   // ─── Input ──────────────────────────────────────────────────────────
 
-  async submit(raw: string): Promise<void> {
+  /**
+   * Typed input. `extra` carries what the input box resolved: the text the transcript shows (pasted text stays
+   * a placeholder there) and images pasted into the message.
+   */
+  async submit(raw: string, extra: { display?: string; images?: readonly ImageAttachment[] } = {}): Promise<void> {
     const text = raw.trim();
-    if (!text) { if (!this.pending) this.resumeQueue(); return; }
+    if (!text && !extra.images?.length) { if (!this.pending) this.resumeQueue(); return; }
     if (this.pending?.kind === 'question') { this.answerQuestion(text); return; }
     if (this.pending?.kind === 'plan') { this.planFeedback(text); return; }
     if (this.pending) return;
     if (text.startsWith('/')) { await this.command(text); return; }
+    if (text.startsWith('!')) { await this.runLocal(text.slice(1).trim()); return; }
+    const message: Outgoing = { text, ...(extra.display && extra.display.trim() !== text ? { display: extra.display.trim() } : {}), ...(extra.images?.length ? { images: extra.images } : {}) };
     // Typing during a turn queues the message (Desktop 「排队发送」); Ctrl+S steers instead.
-    if (this.snapshot.phase !== 'idle') { this.enqueue(text); return; }
-    await this.send(text);
+    if (this.snapshot.phase !== 'idle') { this.enqueue(message); return; }
+    await this.send(message);
   }
 
-  private enqueue(text: string) { this.update({ queue: [...this.snapshot.queue, { id: randomUUID(), text }] }); }
+  private enqueue(message: Outgoing) { this.update({ queue: [...this.snapshot.queue, { ...message, id: randomUUID() }] }); }
 
-  /** ↑ on an empty line: take the last queued message back into the editor. */
-  popQueued(): string | null {
+  /** ↑ on an empty line: take the last queued message back into the editor (as it was shown). */
+  popQueued(): QueuedMessage | null {
     const queue = this.snapshot.queue;
     const last = queue.at(-1);
     if (!last) return null;
     this.update({ queue: queue.slice(0, -1), ...(queue.length === 1 ? { queuePaused: false } : {}) });
-    return last.text;
+    return last;
   }
 
   /** Sends the next queued message when idle and not paused. */
@@ -324,7 +428,7 @@ export class ChatController {
     const [next, ...rest] = this.snapshot.queue;
     if (!next || this.snapshot.queuePaused || this.snapshot.phase !== 'idle' || this.pending || this.snapshot.exited) return;
     this.update({ queue: rest });
-    void this.send(next.text);
+    void this.send(next);
   }
 
   /**
@@ -332,23 +436,23 @@ export class ChatController {
    * after its current action. Empty input steers the first queued message. When nothing is running,
    * the message is simply sent.
    */
-  async steer(raw: string): Promise<'steered' | 'sent' | 'queued' | 'none'> {
-    let text = raw.trim();
-    const queued = !text ? this.snapshot.queue[0] : undefined;
-    if (queued) text = queued.text;
-    if (!text || this.pending) return 'none';
-    if (text.startsWith('/')) { await this.submit(text); return 'sent'; }
+  async steer(raw: string, extra: { display?: string; images?: readonly ImageAttachment[] } = {}): Promise<'steered' | 'sent' | 'queued' | 'none'> {
+    const typed = raw.trim();
+    const queued = !typed && !extra.images?.length ? this.snapshot.queue[0] : undefined;
+    const message: Outgoing = queued ?? { text: typed, ...(extra.display && extra.display.trim() !== typed ? { display: extra.display.trim() } : {}), ...(extra.images?.length ? { images: extra.images } : {}) };
+    if ((!message.text && !message.images?.length) || this.pending) return 'none';
+    if (message.text.startsWith('/') || message.text.startsWith('!')) { await this.submit(message.text); return 'sent'; }
     if (queued) this.update({ queue: this.snapshot.queue.slice(1) });
     const handle = this.handle;
-    if (this.snapshot.phase !== 'running' || !handle) { await this.send(text); return 'sent'; }
+    if (this.snapshot.phase !== 'running' || !handle) { await this.send(message); return 'sent'; }
     try {
-      await handle.steer({ type: 'user', content: text });
+      await handle.steer(this.userMessage(message));
       this.commitLive();
-      this.push({ kind: 'user', text, steer: true });
+      this.push({ kind: 'user', text: message.display ?? message.text, steer: true });
       return 'steered';
     } catch {
       // Never lose the message: it goes to the front of the queue.
-      this.update({ queue: [{ id: randomUUID(), text }, ...this.snapshot.queue] });
+      this.update({ queue: [{ ...message, id: randomUUID() }, ...this.snapshot.queue] });
       this.notice('chat.steerFailed', undefined, 'warn');
       return 'queued';
     }
@@ -361,22 +465,132 @@ export class ChatController {
     await this.setPermission(order[(order.indexOf(this.snapshot.permission) + 1) % order.length]!);
   }
 
-  private async send(text: string): Promise<void> {
-    if (this.snapshot.phase !== 'idle') { this.enqueue(text); return; }
+  /**
+   * What the Agent receives: earlier `!command` results first, then the text; `@path` mentions of existing project
+   * paths and pasted images go along as blocks (the remote proxy maps paths and sends image bytes, as for Desktop).
+   * Plain text stays a string.
+   */
+  private userMessage(message: Outgoing): UserMessage {
+    const context = this.localContext.splice(0);
+    if (context.length) this.update({ localPending: 0 });
+    const text = [...context, message.text].filter(Boolean).join('\n\n');
+    const blocks: UserContentBlock[] = [];
+    const seen = new Set<string>();
+    for (const mention of mentionPaths(message.text)) {
+      const absolute = path.resolve(this.deps.workingDir, mention);
+      const kind = this.deps.statPath?.(absolute) ?? null;
+      if (!kind || seen.has(absolute)) continue;
+      seen.add(absolute);
+      blocks.push({ type: 'mention', name: path.basename(absolute) || absolute, path: absolute, kind });
+    }
+    for (const image of message.images ?? []) blocks.push({ type: 'image', path: image.path, mimeType: image.mimeType });
+    return { type: 'user', content: blocks.length ? [{ type: 'text', text }, ...blocks] : text };
+  }
+
+  private async send(message: Outgoing): Promise<void> {
+    if (this.snapshot.phase !== 'idle') { this.enqueue(message); return; }
     const model = this.snapshot.model;
     if (!model) { this.notice('chat.noModel', undefined, 'warn'); return; }
-    this.push({ kind: 'user', text });
-    if (!this.title) this.title = taskTitle(text);
+    this.push({ kind: 'user', text: message.display ?? message.text });
+    if (!this.title) this.title = taskTitle(message.display ?? message.text);
     const handle = await this.ensureHandle(model);
     if (!handle) return;
     // A new request: the last turn counts toward the average, its own speed is no longer "this turn".
     this.foldSpeed();
     const usage = this.snapshot.usage;
     this.update({ phase: 'running', thinking: false, turnStartedAt: (this.deps.now ?? Date.now)(), ...(usage ? { usage: { ...usage, turnRate: null } } : {}) });
-    try { await handle.send({ type: 'user', content: text }); }
+    try { await handle.send(this.userMessage(message)); }
     catch (error) {
       this.notice('chat.error', { message: errorText(error) }, 'error');
       this.finishTurn('error');
+    }
+  }
+
+  // ─── Local commands, mentions, pasted images ────────────────────────
+
+  /** `!command`: runs here in the working directory; the output is shown and goes with the next message. */
+  private async runLocal(command: string): Promise<void> {
+    if (!command) return;
+    const run = this.deps.runLocal;
+    if (!run) { this.notice('chat.unsupported', { name: '!' }, 'warn'); return; }
+    if (this.localAbort) { this.notice('chat.localBusy', undefined, 'warn'); return; }
+    const lineId = randomUUID();
+    this.update({ lines: [...this.snapshot.lines, { id: lineId, kind: 'local', command, running: true }], localRunning: true });
+    const abort = new AbortController();
+    this.localAbort = abort;
+    let result: LocalResult;
+    try { result = await run(command, abort.signal); }
+    catch (error) { result = { output: errorText(error), exitCode: null }; }
+    finally { this.localAbort = null; }
+    const output = result.output.replace(/\s+$/, '');
+    const kept = output.length > LOCAL_OUTPUT_KEEP ? `${output.slice(0, LOCAL_OUTPUT_KEEP)}\n…` : output;
+    this.localContext.push([
+      'The user ran this command on their own computer, in the project directory, before writing the message below:',
+      `$ ${command}`, kept || '(no output)', result.exitCode === null ? '(stopped before it finished)' : `(exit code ${result.exitCode})`,
+    ].join('\n'));
+    this.update({
+      lines: this.snapshot.lines.map(line => (line.id === lineId && line.kind === 'local' ? { id: lineId, kind: 'local', command, output: kept, exitCode: result.exitCode } : line)),
+      localRunning: false, localPending: this.localContext.length,
+    });
+  }
+
+  /** Esc while a `!command` runs: stop it. */
+  stopLocal(): boolean {
+    if (!this.localAbort) return false;
+    this.localAbort.abort();
+    return true;
+  }
+
+  /**
+   * `@` completion: project paths matching `query`, best first (name starts with it, name contains it, path
+   * contains it, then its letters in order). The list loads on first use; the view updates once it has.
+   */
+  fileSuggestions(query: string, limit = 8): string[] {
+    if (!this.files) {
+      if (!this.filesLoading && this.deps.listFiles) {
+        this.filesLoading = true;
+        void this.deps.listFiles().then(files => { this.files = files; }, () => { this.files = []; })
+          .finally(() => { this.filesLoading = false; this.update({}); });
+      }
+      return [];
+    }
+    const needle = query.toLowerCase();
+    const scored: Array<[number, string]> = [];
+    for (const file of this.files) {
+      const lower = file.toLowerCase();
+      const name = lower.replace(/\/$/, '').split('/').pop()!;
+      const score = !needle ? 3 : name.startsWith(needle) ? 0 : name.includes(needle) ? 1 : lower.includes(needle) ? 2 : subsequence(lower, needle) ? 3 : -1;
+      if (score >= 0) scored.push([score, file]);
+    }
+    scored.sort((a, b) => a[0] - b[0] || a[1].length - b[1].length || a[1].localeCompare(b[1]));
+    return scored.slice(0, limit).map(([, file]) => file);
+  }
+
+  /** A pasted or dropped path to an image file: the image to attach, or null when it is not one. */
+  imageFromPath(raw: string): ImageAttachment | null {
+    let value = raw.trim();
+    if (!value || value.includes('\n')) return null;
+    value = value.replace(/^(['"])(.*)\1$/, '$2');
+    if (value.startsWith('file://')) { try { value = decodeURIComponent(new URL(value).pathname); } catch { return null; } }
+    // Terminals escape spaces in dropped paths.
+    value = value.replace(/\\ /g, ' ');
+    const mimeType = IMAGE_TYPES[path.extname(value).toLowerCase()];
+    if (!mimeType) return null;
+    const absolute = path.resolve(this.deps.workingDir, value);
+    return this.deps.statPath?.(absolute) === 'file' ? { path: absolute, mimeType } : null;
+  }
+
+  /** Ctrl+V / Alt+V: the clipboard's image, or a notice that there is none. */
+  async pasteImage(): Promise<ImageAttachment | null> {
+    const read = this.deps.clipboardImage;
+    if (!read) { this.notice('chat.noClipboardImage', undefined, 'warn'); return null; }
+    try {
+      const image = await read();
+      if (!image) this.notice('chat.noClipboardImage', undefined, 'warn');
+      return image;
+    } catch (error) {
+      this.notice('chat.clipboardFailed', { reason: errorText(error) }, 'warn');
+      return null;
     }
   }
 
@@ -435,7 +649,15 @@ export class ChatController {
     }
     this.streamed += text;
     const cut = this.streamed.lastIndexOf('\n');
-    const end = cut < 0 ? 0 : this.streamed.slice(0, cut).trimEnd().length;
+    let end = cut < 0 ? 0 : this.streamed.slice(0, cut).trimEnd().length;
+    // A table is committed once complete, so its columns can be aligned: hold back trailing table rows.
+    const complete = end > this.flushed ? this.streamed.slice(this.flushed, end) : '';
+    if (complete && !fenceAfter(complete, this.fence)) {
+      const rows = complete.split('\n');
+      let keep = rows.length;
+      while (keep > 0 && isTableRow(rows[keep - 1]!)) keep--;
+      if (keep < rows.length) end = this.flushed + rows.slice(0, keep).join('\n').trimEnd().length;
+    }
     const raw = end > this.flushed ? this.streamed.slice(this.flushed, end) : '';
     const piece = this.flushed ? raw.replace(/^[ \t]*\n/, '') : raw;
     if (piece.trim()) {
@@ -461,33 +683,70 @@ export class ChatController {
 
   apply(event: AgentEvent): void {
     const data = (event.data && typeof event.data === 'object' ? event.data : {}) as Record<string, unknown>;
+    const parent = event.agentMeta && typeof (event.agentMeta as { parentUuid?: unknown }).parentUuid === 'string'
+      ? (event.agentMeta as { parentUuid: string }).parentUuid : null;
     switch (event.type) {
       case 'text': {
-        if (event.agentMeta && typeof (event.agentMeta as { parentUuid?: unknown }).parentUuid === 'string') return; // subagent text
+        if (parent) return; // a sub-Agent's text: its result comes back to the call that started it
         const text = typeof data.text === 'string' ? data.text : '';
         this.streamText(text, data.isFinal === true);
         return;
       }
-      case 'thinking': this.update({ thinking: data.stage !== 'final' && data.stage !== 'redacted' }); return;
+      case 'thinking': {
+        if (parent) return;
+        this.applyThinking(data);
+        return;
+      }
       case 'tool_use': {
-        this.commitLive();
         const id = typeof data.toolUseId === 'string' ? data.toolUseId : randomUUID();
+        const name = builtinName(String(data.toolName ?? 'tool'));
+        const summary = this.relative(toolSummary(data.input));
+        const owner = parent ? this.tools.get(parent) : undefined;
+        if (owner && owner.role === 'tool') { this.addChild(owner.line, { id, name, summary }); return; }
+        this.commitLive();
+        if (GROUPED_TOOLS.has(name)) { this.addGrouped({ id, name, summary }); return; }
         const lineId = randomUUID();
-        this.tools.set(id, lineId);
-        const name = String(data.toolName ?? 'tool');
-        const detail = toolDetail(name, data.input);
+        this.tools.set(id, { line: lineId, role: 'tool' });
+        const detail = toolDetail(name, data.input, this.deps.readText);
         if (detail && detail.kind !== 'todos') detail.path = this.relative(detail.path);
-        this.update({ thinking: false, lines: [...this.snapshot.lines, { id: lineId, kind: 'tool', name, summary: this.relative(toolSummary(data.input)), ...(detail ? { detail } : {}) }] });
+        this.update({ thinking: false, lines: [...this.snapshot.lines, { id: lineId, kind: 'tool', name, summary, ...(detail ? { detail } : {}) }] });
         return;
       }
       case 'tool_result_full': {
-        const lineId = typeof data.toolUseId === 'string' ? this.tools.get(data.toolUseId) : undefined;
-        if (!lineId || typeof data.fullText !== 'string') return;
-        const { output, error } = toolOutput(data.fullText);
-        this.update({ lines: this.snapshot.lines.map(line => (line.id === lineId && line.kind === 'tool' ? { ...line, result: output, ...(error || data.isError === true ? { error: true } : {}) } : line)) });
+        const owner = typeof data.toolUseId === 'string' ? this.tools.get(data.toolUseId) : undefined;
+        if (!owner || typeof data.fullText !== 'string') return;
+        const { output, error: tagged, truncated } = toolOutput(data.fullText);
+        const error = tagged || data.isError === true;
+        const toolUseId = data.toolUseId as string;
+        this.update({ lines: this.snapshot.lines.map(line => {
+          if (line.id !== owner.line) return line;
+          if (owner.role === 'child' && line.kind === 'tool') {
+            return { ...line, children: (line.children ?? []).map(child => (child.id === toolUseId ? { ...child, done: true, ...(error ? { error: true } : {}) } : child)) };
+          }
+          if (owner.role === 'group' && line.kind === 'group') {
+            return { ...line, items: line.items.map(item => (item.id === toolUseId ? { ...item, result: output, ...(error ? { error: true } : {}) } : item)) };
+          }
+          if (line.kind === 'tool') return { ...line, result: output, ...(error ? { error: true } : {}), ...(truncated ? { truncated: true } : {}) };
+          return line;
+        }) });
+        return;
+      }
+      case 'agent_task_update': {
+        const owner = typeof data.parentToolUseId === 'string' ? this.tools.get(data.parentToolUseId) : undefined;
+        if (!owner || owner.role !== 'tool') return;
+        const usage = (data.usage && typeof data.usage === 'object' ? data.usage : {}) as Record<string, unknown>;
+        const figure = (value: unknown) => (typeof value === 'number' && Number.isFinite(value) && value > 0 ? value : undefined);
+        const task: TaskProgress = {};
+        const toolUses = figure(usage.toolUses); const totalTokens = figure(usage.totalTokens); const durationMs = figure(usage.durationMs);
+        if (toolUses) task.toolUses = toolUses;
+        if (totalTokens) task.totalTokens = totalTokens;
+        if (durationMs) task.durationMs = durationMs;
+        if (!Object.keys(task).length) return;
+        this.update({ lines: this.snapshot.lines.map(line => (line.id === owner.line && line.kind === 'tool' ? { ...line, task: { ...line.task, ...task } } : line)) });
         return;
       }
       case 'error': {
+        if (parent) return;
         this.commitLive();
         const message = typeof data.message === 'string' ? data.message : 'error';
         this.push({ kind: 'notice', text: this.t('chat.error', { message }), tone: 'error' });
@@ -499,6 +758,46 @@ export class ChatController {
       case 'done': this.commitLive(); this.finishTurn(); void this.record(); return;
       default: return;
     }
+  }
+
+  /** Thinking streams as start → delta… → final; the finished block becomes a transcript row. */
+  private applyThinking(data: Record<string, unknown>) {
+    const now = (this.deps.now ?? Date.now)();
+    if (data.stage === 'start' || (data.stage === 'delta' && this.thinkingStarted === null)) this.thinkingStarted = now;
+    if (data.stage === 'delta' && typeof data.text === 'string') this.thinkingText += data.text;
+    if (data.stage !== 'final' && data.stage !== 'redacted') { if (!this.snapshot.thinking) this.update({ thinking: true }); return; }
+    const text = (typeof data.text === 'string' && data.text ? data.text : this.thinkingText).trim();
+    const reported = typeof data.durationMs === 'number' && Number.isFinite(data.durationMs) && data.durationMs >= 0 ? data.durationMs : undefined;
+    const durationMs = reported ?? (this.thinkingStarted !== null ? now - this.thinkingStarted : undefined);
+    this.thinkingText = '';
+    this.thinkingStarted = null;
+    if (data.stage === 'final' && text) {
+      this.commitLive();
+      this.push({ kind: 'thinking', text, ...(durationMs !== undefined ? { durationMs } : {}) });
+    }
+    this.update({ thinking: false });
+  }
+
+  /** A sub-Agent's tool call: counted under the call that started it; only the last few are kept. */
+  private addChild(lineId: string, child: ChildTool) {
+    this.tools.set(child.id, { line: lineId, role: 'child' });
+    this.update({ lines: this.snapshot.lines.map(line => (line.id === lineId && line.kind === 'tool'
+      ? { ...line, children: [...(line.children ?? []), child].slice(-CHILD_ROWS), childCount: (line.childCount ?? 0) + 1 } : line)) });
+  }
+
+  /** Read / search calls join the open group (see openGroupIndex), or start one. */
+  private addGrouped(item: GroupItem) {
+    const lines = this.snapshot.lines;
+    const open = this.snapshot.phase === 'running' ? openGroupIndex(lines) : -1;
+    if (open >= 0) {
+      const group = lines[open] as Extract<Line, { kind: 'group' }>;
+      this.tools.set(item.id, { line: group.id, role: 'group' });
+      this.update({ thinking: false, lines: lines.map((line, index) => (index === open ? { ...group, items: [...group.items, item] } : line)) });
+      return;
+    }
+    const lineId = randomUUID();
+    this.tools.set(item.id, { line: lineId, role: 'group' });
+    this.update({ thinking: false, lines: [...lines, { id: lineId, kind: 'group', items: [item] }] });
   }
 
   /**
@@ -615,7 +914,15 @@ export class ChatController {
     if (this.snapshot.phase !== 'running' || !this.handle) return;
     void this.handle.abort().catch(() => undefined);
     this.commitLive();
-    this.notice('chat.interrupted', undefined, 'warn');
+    // Calls still waiting for a result will not get one: mark them, then where the turn stopped.
+    this.update({ lines: this.snapshot.lines.map(line => {
+      if (line.kind === 'tool' && line.result === undefined && !line.interrupted && line.detail?.kind !== 'todos') return { ...line, interrupted: true };
+      if (line.kind === 'group' && line.items.some(item => item.result === undefined && !item.interrupted)) {
+        return { ...line, items: line.items.map(item => (item.result === undefined ? { ...item, interrupted: true } : item)) };
+      }
+      return line;
+    }) });
+    this.push({ kind: 'interrupted' });
     this.finishTurn('interrupted');
   }
 
@@ -633,6 +940,7 @@ export class ChatController {
     if (this.snapshot.exited) return;
     if (this.exitTimer) clearTimeout(this.exitTimer);
     this.cancelPrompt();
+    this.localAbort?.abort();
     const handle = this.handle;
     this.handle = null;
     await handle?.close({ reason: 'navigation' }).catch(() => undefined);
@@ -733,8 +1041,11 @@ export class ChatController {
         decisions.push({ kind: 'permission', behavior: 'deny' });
         choices.push({ label: this.t('ask.deny') });
         this.pending = { kind: 'permission', decisions, resolve: settle };
-        this.update({ prompt: { kind: 'permission', title: this.t('ask.permissionTitle', { tool: request.displayName ?? request.toolName }),
-          summary: toolSummary(request.input), ...(request.description ? { description: request.description } : {}), choices, index: 0 } });
+        const preview = this.permissionPreview(builtinName(request.toolName), request.input);
+        this.update({ prompt: { kind: 'permission', title: this.t('ask.permissionTitle', { tool: request.displayName ?? builtinName(request.toolName) }),
+          // A command shown in full needs no one-line summary above it. Paths stay absolute: this is a decision.
+          summary: preview?.kind === 'command' ? '' : toolSummary(request.input),
+          ...(request.description ? { description: request.description } : {}), ...(preview ? { preview } : {}), choices, index: 0 } });
       } else if (request.kind === 'ask_user_question') {
         this.pending = { kind: 'question', queue: [...request.questions], answers: {}, resolve: settle };
         this.nextQuestion();
@@ -743,6 +1054,19 @@ export class ChatController {
         this.update({ prompt: { kind: 'plan', plan: request.plan, choices: [{ label: this.t('ask.planApprove') }, { label: this.t('ask.planRevise') }], index: 0 } });
       }
     });
+  }
+
+  /** What the confirmation shows of the call: the edit's diff, the file's first lines, or the whole command. */
+  private permissionPreview(name: string, input: unknown): PermissionPreview | undefined {
+    const command = commandText(name, input);
+    if (command) {
+      const rows = command.split('\n');
+      return { kind: 'command', rows: rows.slice(0, COMMAND_ROWS), more: Math.max(0, rows.length - COMMAND_ROWS) };
+    }
+    const detail = toolDetail(name, input, this.deps.readText);
+    if (detail?.kind === 'edit') return { kind: 'diff', rows: detail.rows.slice(0, PREVIEW_DIFF_ROWS), more: Math.max(0, detail.rows.length - PREVIEW_DIFF_ROWS) };
+    if (detail?.kind === 'write') return { kind: 'write', rows: detail.preview.slice(0, DETAIL_ROWS), more: Math.max(0, detail.lines - DETAIL_ROWS) };
+    return undefined;
   }
 
   private nextQuestion() {
@@ -978,7 +1302,11 @@ export class ChatController {
     this.tokenEpoch = null;
     this.tokenModels = new Map();
     this.tokenBase = NO_TOKENS;
-    this.update({ live: '', liveCont: false, liveCode: false, phase: 'idle', thinking: false, turnStartedAt: null, usage: null });
+    this.thinkingText = '';
+    this.thinkingStarted = null;
+    // `!command` output belongs to the task it was meant for.
+    this.localContext = [];
+    this.update({ live: '', liveCont: false, liveCode: false, phase: 'idle', thinking: false, turnStartedAt: null, usage: null, localPending: 0 });
   }
 
   private async resumeCommand(): Promise<void> {
@@ -1011,6 +1339,29 @@ export class ChatController {
     this.notice('chat.resumed', { title: record.title });
     return true;
   }
+}
+
+/** `@path` and `@"path with spaces"` in a message, without trailing punctuation. */
+export function mentionPaths(text: string): string[] {
+  const found: string[] = [];
+  for (const match of text.matchAll(/(?:^|\s)@(?:"([^"\n]+)"|([^\s"]+))/g)) {
+    const value = match[1] ?? match[2]!.replace(/[,;:!?)\]}。，；：！？）]+$/u, '');
+    if (value) found.push(value);
+  }
+  return found;
+}
+
+/** The input's mention completion token: `@` and what follows it up to the cursor, if the cursor is in one. */
+export function mentionAt(value: string, cursor: number): { start: number; query: string } | null {
+  const match = /(?:^|\s)@("?)([^\s"]*)$/.exec(value.slice(0, cursor));
+  if (!match) return null;
+  return { start: cursor - match[2]!.length - match[1]!.length - 1, query: match[2]! };
+}
+
+function subsequence(text: string, needle: string): boolean {
+  let at = 0;
+  for (const char of text) if (char === needle[at] && ++at === needle.length) return true;
+  return false;
 }
 
 function errorText(error: unknown): string {

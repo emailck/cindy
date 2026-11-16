@@ -26,6 +26,8 @@ export interface ClientRuntime {
   searchAvailable: boolean;
   /** Windows: Git Bash found (always true elsewhere). */
   shellAvailable: boolean;
+  /** The ripgrep the Agent uses; `@` completion lists project files with it too. */
+  rgPath: string;
   /** Same-account computers plus active shares; unreachable sources are reported, not hidden. */
   catalog(): Promise<CatalogResult>;
   /** Resolves when the account is lost (signed out elsewhere, device removed). */
@@ -64,7 +66,7 @@ export async function startClientRuntime(context: CommandContext, signal: AbortS
     const tools = prepareLocalTools();
     const factory = createRemoteTaskFactory(link.invoke, { rgPath: tools.rgPath });
     return {
-      auth, link: activeLink, shares, factory, account, accountLost, searchAvailable: tools.ripgrep, shellAvailable: tools.gitBash,
+      auth, link: activeLink, shares, factory, account, accountLost, searchAvailable: tools.ripgrep, shellAvailable: tools.gitBash, rgPath: tools.rgPath,
       tasks: createTaskStore(context.dataDir, scope),
       async catalog() {
         const [devices, received] = await Promise.all([

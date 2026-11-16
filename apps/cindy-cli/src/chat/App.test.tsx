@@ -12,11 +12,16 @@
  *   探测期间 Ctrl+C 被吞掉；/theme 选择不生效或不保存；
  *   状态栏：占位 status 帧把上下文清零、新请求仍显示上一轮速度、上一轮测速晚到被重复计入平均、远端进程重启后费用从零算起、
  *   宿主标记测速不可靠时仍显示本轮速度、/clear 后仍显示旧任务的用量；token 行只取一个模型、远端进程重启（新 epoch）后
- *   token 从零算起、缓存命中率与 Desktop 口径不一致（分母漏掉缓存写入）。
+ *   token 从零算起、缓存命中率与 Desktop 口径不一致（分母漏掉缓存写入）；
+ *   折叠与展开（2026-11-16，参考 Claude Code）：思考内容直接倒进记录、连续 Read/Grep 各占一行、Subagent 的工具调用混成顶层行、
+ *   打断后等结果的调用仍显示在运行、Ctrl+O 看不到被折叠的完整输出或 ← 不切到上一项；表格逐行流式到达时各行单独提交（列不对齐）；
+ *   确认框只有一行摘要（看不到 Edit 的 diff 与行号、多行 Bash 命令只剩首行）；
+ *   输入：`!命令` 被当成消息发给 Agent 或其输出没随下一条消息发送、`@` 补全不出现或发送时没有引用块、长粘贴把全文塞进记录、
+ *   粘贴的图片路径当成文字发送而不是图片块。
  * - 状态栏依据：用户需求（上下文占用、本轮与本任务平均 tok/s、预计费用、本任务输入／输出／缓存读写与命中率）；
  *   UsageSnapshot 字段语义见 maker-core types/events.ts，命中率公式见 Desktop shared/turnUsageDetails.ts。
  * - tier：unit（ink-testing-library 内存终端，假会话句柄）。
- * - 实测耗时：App.test.tsx 单独运行 3.89 秒（2026-11-16）。
+ * - 实测耗时：App.test.tsx 单独运行 vitest Duration 4.6–4.8 秒（2026-11-16，14 项；等待由 20 ms 降为 5 ms，只有 Esc 等 Ink 的 20 ms 判定）。
  */
 import type { AgentEvent, AgentSessionHandle, InteractionDecision, InteractionResolver } from '@cindy/maker-core';
 import { render } from 'ink-testing-library';
@@ -31,7 +36,9 @@ import { backgroundTheme, queryBackground } from './theme';
 
 const model = (id: string): CatalogModel => ({ target: 'vps', targetLabel: 'vps', shared: false, providerId: 'anthropic', providerName: 'Anthropic',
   agent: 'claude-code', model: id, modelName: id, efforts: [], defaultEffort: null });
-const tick = () => new Promise(resolve => setTimeout(resolve, 20));
+const tick = () => new Promise(resolve => setTimeout(resolve, 5));
+/** Ink holds a lone Esc for 20 ms (it may start an escape sequence) before delivering it. */
+const pressEscape = async (stdin: { write(data: string): unknown }) => { stdin.write('\u001B'); await new Promise(resolve => setTimeout(resolve, 30)); };
 
 /** A session whose events the test pushes one by one. */
 function streamingHandle() {
@@ -126,9 +133,10 @@ describe('terminal UI', () => {
       setInteractionResolver: (next: InteractionResolver) => { resolver = next; },
       getUsageSnapshot: () => ({ tokenUsage: 0, contextTokens: 0, contextWindow: 0, costUsd: 0 }),
     } as unknown as AgentSessionHandle;
+    const file = 'one\ntwo\nconst a = 1;\nconst b = 2;\nfive';
     const controller = new ChatController({ workingDir: '/project', language: 'en', permission: 'full',
       catalog: async () => ({ models: [model('claude-a'), model('claude-b')], unavailable: [] }), openTask: async () => handle,
-      tasks: { list: async () => [], save: async () => {} } });
+      tasks: { list: async () => [], save: async () => {} }, readText: path => (path === '/project/a.ts' ? file : null) });
     const ui = render(<App controller={controller} header="Cindy" />);
     await controller.init();
     await tick();
@@ -155,14 +163,20 @@ describe('terminal UI', () => {
     await tick();
     expect(ui.lastFrame()).toContain('⎿  out.txt');
 
-    const decision: Promise<InteractionDecision> = resolver!({ kind: 'permission', requestId: 'r', toolName: 'Bash', input: { command: 'rm -rf build' } });
+    // The confirmation shows what the call would do: a command in full, an edit's diff numbered from the local file.
+    const decision: Promise<InteractionDecision> = resolver!({ kind: 'permission', requestId: 'r', toolName: 'Bash', input: { command: 'cd build &&\n  rm -rf out' } });
     await tick();
     expect(ui.lastFrame()).toContain('Allow Bash?');
+    expect(ui.lastFrame()).toMatch(/cd build &&[ │]*\n[ │]*rm -rf out/);
     ui.stdin.write('2');
     expect(await decision).toEqual({ kind: 'permission', behavior: 'deny' });
-
-    ui.stdin.write('\u001B');
+    const edit = resolver!({ kind: 'permission', requestId: 'e', toolName: 'mcp__cindy_exec__Edit', input: { file_path: '/project/a.ts', old_string: 'const a = 1;', new_string: 'const a = 2;' } });
     await tick();
+    for (const text of ['Allow Edit?', '2   two', '3 - const a = 1;', '3 + const a = 2;', '4   const b = 2;']) expect(ui.lastFrame()).toContain(text);
+    ui.stdin.write('2');
+    expect(await edit).toEqual({ kind: 'permission', behavior: 'deny' });
+
+    await pressEscape(ui.stdin);
     expect(abort).toHaveBeenCalledOnce();
     ui.unmount();
   });
@@ -255,10 +269,10 @@ describe('terminal UI', () => {
     await controller.init();
     await controller.submit('go');
     await tick();
-    // The code fence opens in one streamed piece and closes in a later one.
-    const reply = 'Intro **bold** and `code`\n```js\nconst a = 2**3;\n**not bold**\n```\n# Done';
-    push({ type: 'text', data: { text: reply.slice(0, 40), isFinal: false } });
-    push({ type: 'text', data: { text: reply.slice(40), isFinal: false } });
+    const reply = 'Intro **bold** and `code`\n```js\nconst a = 2**3;\n**not bold**\n```\n# Done\n| Name | Count |\n|---|--:|\n| alpha | 1 |\n| **beta** | 22 |\nSee [docs](https://x.y).';
+    // One source line per streamed piece: each finished line is committed as it arrives, except table rows,
+    // which wait for the whole table.
+    for (const piece of reply.split(/(?<=\n)/)) push({ type: 'text', data: { text: piece, isFinal: false } });
     push({ type: 'text', data: { text: reply, isFinal: true } });
     const tool = (id: string, toolName: string, input: unknown, fullText: string) => {
       push({ type: 'tool_use', data: { toolUseId: id, toolName, input } });
@@ -275,6 +289,9 @@ describe('terminal UI', () => {
     for (const text of ['⏺ Intro bold and code', 'const a = 2**3;', '**not bold**', 'Done', 'Read(src/a.ts)', 'Read 3 lines', 'Update(src/a.ts)',
       'Updated src/a.ts (+1 −1)', '- old', '+ new', 'n4', '… +6 lines', 'boom', '☒ first step', '◼ second step', '☐ third step']) expect(frame).toContain(text);
     expect(frame.indexOf('- old')).toBeLessThan(frame.indexOf('+ new'));
+    // The table streamed row by row is printed once complete, columns aligned (right-aligned Count).
+    for (const text of ['│ Name  │ Count │', '│ alpha │     1 │', '│ beta  │    22 │', 'See docs (https://x.y)']) expect(frame).toContain(text);
+    expect(frame).not.toContain('|---|');
     for (const text of ['```', '# Done', 'three', 'n5', '<tool_use_error>', 'content']) expect(frame).not.toContain(text);
     ui.unmount();
   });
@@ -296,16 +313,16 @@ describe('terminal UI', () => {
     status({ contextTokens: 50_000, contextWindow: 200_000, costUsd: 0.2, tokenSpeed: speed(300, 10_000, 42, true),
       requestUsage: receipt('p1', ['a', 1000, 300, 6000, 1000], ['b', 1000, 200, 0, 1000]) });
     await tick();
-    expect(ui.lastFrame()).toContain('Context 25% (50k/200k) · This turn 42 tok/s · Avg 30 tok/s · This task ≈ $0.200');
+    expect(ui.lastFrame()).toContain('Context ███░░░░░░░ 25% 50k/200k  │  This turn 42 tok/s · Avg 30 tok/s  │  This task ≈ $0.200');
     // Hit rate = cache read / (input + cache read + cache write), Desktop's formula: 6k / 10k.
-    expect(ui.lastFrame()).toContain('Input 2k · Output 500 · Cache read 6k · Cache write 2k · Cache hit rate 60%');
+    expect(ui.lastFrame()).toContain('↑ In 2k   ↓ Out 500  │  Cache read 6k · write 2k · hit 60%');
     // Turn end: this turn shows its own average. A placeholder frame with zeros keeps the last known figures.
     status({ contextTokens: 170_000, contextWindow: 200_000, costUsd: 0.2, tokenSpeed: speed(300, 10_000, 42, false) });
     status({ isRunning: false, contextTokens: 0, contextWindow: 0, costUsd: 0 });
     push({ type: 'done', data: {} });
     await tick();
-    expect(ui.lastFrame()).toContain('Context 85% (170k/200k) · This turn 30 tok/s · Avg 30 tok/s');
-    expect(ui.lastFrame()).toContain('Input 2k · Output 500 · Cache read 6k');
+    expect(ui.lastFrame()).toContain('Context █████████░ 85% 170k/200k  │  This turn 30 tok/s · Avg 30 tok/s');
+    expect(ui.lastFrame()).toContain('↑ In 2k   ↓ Out 500  │  Cache read 6k');
     // Next request: no stale "this turn"; a late repeat of the last turn's meter is not counted twice.
     await controller.submit('two');
     await tick();
@@ -317,8 +334,8 @@ describe('terminal UI', () => {
     // Its receipts start over too (new epoch): tokens keep counting on top of the earlier process's.
     status({ costUsd: 0.05, tokenSpeed: speed(100, 10_000, 10, true), requestUsage: receipt('p2', ['a', 1000, 500, 1000, 0]) });
     await tick();
-    expect(ui.lastFrame()).toContain('This turn 10 tok/s · Avg 20 tok/s · This task ≈ $0.250');
-    expect(ui.lastFrame()).toContain('Input 3k · Output 1k · Cache read 7k · Cache write 2k · Cache hit rate 58.3%');
+    expect(ui.lastFrame()).toContain('This turn 10 tok/s · Avg 20 tok/s  │  This task ≈ $0.250');
+    expect(ui.lastFrame()).toContain('↑ In 3k   ↓ Out 1k  │  Cache read 7k · write 2k · hit 58.3%');
     status({ generationReliable: false });
     await tick();
     expect(ui.lastFrame()).not.toContain('This turn');
@@ -327,7 +344,7 @@ describe('terminal UI', () => {
     await controller.submit('/clear');
     await tick();
     expect(ui.lastFrame()).not.toContain('Context');
-    expect(ui.lastFrame()).not.toContain('Input');
+    expect(ui.lastFrame()).not.toContain('↑ In');
     ui.unmount();
   });
 
@@ -345,9 +362,9 @@ describe('terminal UI', () => {
     await type('\u0001'); await type('\u001B[3~'); // Ctrl+A, Delete: removes the character after the cursor
     await type(' one two'); await type('\u0017'); // typed at the line start; Ctrl+W deletes "two" before the cursor
     await type('\r');
-    expect(submit).toHaveBeenLastCalledWith(' one bX\ncd');
+    expect(submit).toHaveBeenLastCalledWith(' one bX\ncd', {});
     await type('/c'); await type('\u001B[B'); await type('\r'); // ↓ highlights the second command, Enter runs it
-    expect(submit).toHaveBeenLastCalledWith('/clear');
+    expect(submit).toHaveBeenLastCalledWith('/clear', {});
     ui.unmount();
   });
 
@@ -398,6 +415,93 @@ describe('terminal UI', () => {
     await tick();
     expect(controller.getSnapshot()).toMatchObject({ theme: 'dark', themeSetting: 'dark' });
     expect(saveTheme).toHaveBeenCalledWith('dark');
+    ui.unmount();
+  });
+
+  it('folds thinking, read / search runs and sub-Agent calls, marks an interrupt, and expands output with Ctrl+O', async () => {
+    const { handle, push } = streamingHandle();
+    const controller = new ChatController({ workingDir: '/project', language: 'en', permission: 'full',
+      catalog: async () => ({ models: [model('claude-a')], unavailable: [] }), openTask: async () => handle,
+      tasks: { list: async () => [], save: async () => {} } });
+    const ui = render(<App controller={controller} header="Cindy" />);
+    await controller.init();
+    await controller.submit('go');
+    await tick();
+    push({ type: 'thinking', data: { stage: 'start' } });
+    push({ type: 'thinking', data: { stage: 'final', text: 'SECRET_PLAN', durationMs: 2_000 } });
+    for (const [id, toolName, input] of [['r1', 'Read', { file_path: '/project/a.ts' }], ['g1', 'Grep', { pattern: 'foo' }], ['r2', 'Read', { file_path: '/project/b.ts' }]] as const) {
+      push({ type: 'tool_use', data: { toolUseId: id, toolName, input } });
+      push({ type: 'tool_result_full', data: { toolUseId: id, fullText: `${id}-content` } });
+    }
+    push({ type: 'tool_use', data: { toolUseId: 'b', toolName: 'Bash', input: { command: 'seq 10' } } });
+    push({ type: 'tool_result_full', data: { toolUseId: 'b', fullText: Array.from({ length: 10 }, (_, index) => `n${index + 1}`).join('\n') } });
+    // A sub-Agent's own calls arrive tagged with the call that started it.
+    push({ type: 'tool_use', data: { toolUseId: 'task', toolName: 'Task', input: { description: 'Explore' } } });
+    for (const id of ['c1', 'c2', 'c3', 'c4']) push({ type: 'tool_use', data: { toolUseId: id, toolName: 'Bash', input: { command: `ls ${id}` } }, agentMeta: { parentUuid: 'task' } } as AgentEvent);
+    await tick(); await tick();
+    let frame = ui.lastFrame()!;
+    for (const text of ['Thought for 2s (Ctrl+O to show)', 'Read 2 files, searched 1 pattern', 'n4', '… +6 lines (Ctrl+O to expand)', 'Task(Explore)', 'Bash(ls c4)', '+1 more tool uses']) expect(frame).toContain(text);
+    for (const text of ['SECRET_PLAN', 'Read(a.ts)', '⏺ Bash(ls c1)', 'n10']) expect(frame).not.toContain(text);
+
+    ui.stdin.write('\u000F'); // Ctrl+O: the latest folded item, in full
+    await tick();
+    frame = ui.lastFrame()!;
+    expect(frame).toContain('Bash(seq 10)');
+    expect(frame).toContain('n10');
+    ui.stdin.write('\u001B[D'); // ←: the item before it
+    await tick();
+    expect(ui.lastFrame()).toContain('r2-content');
+    await pressEscape(ui.stdin);
+    expect(ui.lastFrame()).not.toContain('r2-content');
+
+    await pressEscape(ui.stdin); // Esc interrupts: the sub-Agent call never got its result
+    frame = ui.lastFrame()!;
+    expect(frame).toContain('Interrupted · Tell the Agent what to do instead');
+    expect(frame).toMatch(/Task\(Explore\)\n\s+⎿\s+Interrupted/);
+    ui.unmount();
+  });
+
+  it('sends a local command result, an @ mention, a long paste and a pasted image path with the next message', async () => {
+    const send = vi.fn(async () => {});
+    const handle = {
+      id: 'n', agentKind: 'claude-code', model: 'a', send, steer: vi.fn(), abort: vi.fn(async () => {}), close: vi.fn(async () => {}),
+      events: () => ({ async *[Symbol.asyncIterator]() { await new Promise(() => {}); } }),
+      setInteractionResolver: () => {}, getUsageSnapshot: () => ({ tokenUsage: 0, contextTokens: 0, contextWindow: 0, costUsd: 0 }),
+    } as unknown as AgentSessionHandle;
+    const runLocal = vi.fn(async () => ({ output: 'v1.2', exitCode: 0 }));
+    const controller = new ChatController({ workingDir: '/project', language: 'en', permission: 'full',
+      catalog: async () => ({ models: [model('claude-a')], unavailable: [] }), openTask: async () => handle,
+      tasks: { list: async () => [], save: async () => {} }, runLocal,
+      statPath: path => (path === '/project/src/app.ts' || path === '/project/shot.png' ? 'file' : null),
+      listFiles: async () => ['src/', 'src/app.ts', 'README.md'] });
+    const ui = render(<App controller={controller} header="Cindy" />);
+    await controller.init();
+    const type = async (text: string) => { ui.stdin.write(text); await tick(); };
+    await type('!git describe'); await type('\r'); await tick();
+    expect(runLocal).toHaveBeenCalledWith('git describe', expect.any(AbortSignal));
+    expect(ui.lastFrame()).toContain('v1.2');
+    expect(ui.lastFrame()).toContain('Goes with your next message');
+    expect(send).not.toHaveBeenCalled();
+
+    await type('see @app'); await tick();
+    expect(ui.lastFrame()).toContain('❯ @src/app.ts');
+    await type('\t');
+    const pasted = Array.from({ length: 12 }, (_, index) => `row${index + 1}`).join('\n');
+    await type(`\u001B[200~${pasted}\u001B[201~`);
+    await type('\u001B[200~/project/shot.png\u001B[201~');
+    expect(ui.lastFrame()).toContain('see @src/app.ts [Pasted text #1 +12 lines] [Image #2]');
+    await type('\r'); await tick();
+
+    const message = (send.mock.calls[0] as unknown as [{ content: Array<Record<string, unknown>> }])[0];
+    const [text, ...blocks] = message.content;
+    expect(text!.text).toMatch(/^The user ran this command[^]*\$ git describe\nv1\.2\n\(exit code 0\)\n\nsee @src\/app\.ts row1\n[^]*row12 \[Image #2\]$/);
+    expect(blocks).toEqual([
+      { type: 'mention', name: 'app.ts', path: '/project/src/app.ts', kind: 'file' },
+      { type: 'image', path: '/project/shot.png', mimeType: 'image/png' },
+    ]);
+    // The transcript keeps the placeholder rather than all twelve pasted rows.
+    expect(ui.lastFrame()).toContain('> see @src/app.ts [Pasted text #1 +12 lines] [Image #2]');
+    expect(ui.lastFrame()).not.toContain('row12');
     ui.unmount();
   });
 });

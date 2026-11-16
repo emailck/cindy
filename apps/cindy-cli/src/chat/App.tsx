@@ -4,25 +4,23 @@
  */
 import { createContext, useContext, useEffect, useRef, useState, useSyncExternalStore, type ReactNode } from 'react';
 import { Box, Static, Text, useApp, useInput, usePaste, useWindowSize } from 'ink';
-import { cacheHitRate, commandDescription, commandSuggestions, type ChatController, type Line, type Prompt, type UsageView } from './controller';
+import {
+  cacheHitRate, CHILD_ROWS, commandDescription, commandSuggestions, mentionAt, openGroupIndex,
+  type ChatController, type GroupItem, type ImageAttachment, type Line, type Prompt, type UsageView,
+} from './controller';
 import type { Translate } from '../i18n';
 import { parseMarkdown, type MdLine, type Span } from './markdown';
-import { countLines, DETAIL_ROWS, OUTPUT_ROWS, toolDisplayName } from './tools';
-import { THEMES, type Theme } from './theme';
+import { countLines, DETAIL_ROWS, OUTPUT_ROWS, toolDisplayName, type DiffRow } from './tools';
+import { THEMES, themeFor, type Theme, type Tone } from './theme';
+import { viewItems, wrapView, type ViewRow } from './viewer';
+import { displayWidth } from './width';
+
+export { displayWidth } from './width';
 
 const ThemeContext = createContext<Theme>(THEMES.ansi);
 const useTheme = () => useContext(ThemeContext);
-
-/** Terminal column width: CJK and full-width characters take two columns (help key column alignment). */
-export function displayWidth(text: string): number {
-  let width = 0;
-  for (const char of text) {
-    const code = char.codePointAt(0)!;
-    width += (code >= 0x1100 && code <= 0x115f) || (code >= 0x2e80 && code <= 0xa4cf) || (code >= 0xac00 && code <= 0xd7a3)
-      || (code >= 0xf900 && code <= 0xfaff) || (code >= 0xfe30 && code <= 0xfe4f) || (code >= 0xff00 && code <= 0xff60) || (code >= 0xffe0 && code <= 0xffe6) ? 2 : 1;
-  }
-  return width;
-}
+/** Whether the terminal renders OSC 8 hyperlinks (link text clickable, no URL printed after it). */
+const LinkContext = createContext(false);
 
 /**
  * The last `rows` terminal rows of `text` wrapped at `columns`. Ink clears the screen and rewrites the whole
@@ -57,6 +55,8 @@ const WINDOWS = process.platform === 'win32';
 const DOT = WINDOWS ? '●' : '⏺';
 /** A glyph that grows and shrinks; Windows consoles get braille dots, which every console font has. */
 const SPINNER = WINDOWS ? ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'] : ['·', '✢', '✳', '✶', '✻', '✽', '✻', '✶', '✳', '✢'];
+/** Marks a finished thinking block. */
+const THOUGHT = WINDOWS ? '*' : '∴';
 
 export function elapsedText(ms: number): string {
   const seconds = Math.max(0, Math.floor(ms / 1000));
@@ -64,24 +64,25 @@ export function elapsedText(ms: number): string {
 }
 
 /** `✻ Working… (12s · Esc interrupt …)`: its own timer, so the transcript does not re-render with it. */
-function Status({ text, keys, startedAt }: { text: string; keys?: string; startedAt: number | null }) {
+function Status({ text, keys, startedAt, tone }: { text: string; keys?: string; startedAt: number | null; tone?: Tone }) {
   const [frame, setFrame] = useState(0);
   useEffect(() => {
     const timer = setInterval(() => setFrame(value => value + 1), 120);
     return () => clearInterval(timer);
   }, []);
   const theme = useTheme();
+  const color = tone ?? theme.running;
   const extra = [...(startedAt !== null ? [elapsedText(Date.now() - startedAt)] : []), ...(keys ? [keys] : [])];
   return (
     <Box marginTop={1}>
-      <Text {...theme.running}>{SPINNER[frame % SPINNER.length]}</Text>
-      <Text {...theme.running}>{` ${text}`}</Text>
+      <Text {...color}>{SPINNER[frame % SPINNER.length]}</Text>
+      <Text {...color}>{` ${text}`}</Text>
       {extra.length ? <Text {...theme.faint}>{` (${extra.join(' · ')})`}</Text> : null}
     </Box>
   );
 }
 
-function compactTokens(tokens: number): string {
+export function compactTokens(tokens: number): string {
   if (tokens >= 1_000_000) return `${(tokens / 1_000_000).toFixed(1).replace(/\.0$/, '')}M`;
   if (tokens >= 1_000) return `${(tokens / 1_000).toFixed(1).replace(/\.0$/, '')}k`;
   return String(Math.round(tokens));
@@ -99,56 +100,77 @@ function costText(cost: number): string {
 
 /** Context nearly full: the user may want /compact soon. */
 const CONTEXT_WARN_PERCENT = 80;
-
-/**
- * Status bar under the footer: context use, this turn's and the task's average output speed, and the cost the Agent
- * reports. Each part appears only once the Agent reports it.
- */
-function UsageBar({ usage, t }: { usage: UsageView; t: Translate }) {
-  const theme = useTheme();
-  const percent = usage.contextWindow ? Math.round((usage.contextTokens / usage.contextWindow) * 100) : null;
-  const parts: Array<{ text: string; warn?: boolean }> = [];
-  if (usage.contextTokens) {
-    parts.push(percent !== null
-      ? { text: t('usage.context', { percent, used: compactTokens(usage.contextTokens), max: compactTokens(usage.contextWindow) }), warn: percent >= CONTEXT_WARN_PERCENT }
-      : { text: t('usage.contextTokens', { used: compactTokens(usage.contextTokens) }) });
-  }
-  if (usage.turnRate !== null) parts.push({ text: t('usage.turnRate', { rate: rateText(usage.turnRate) }) });
-  if (usage.averageRate !== null) parts.push({ text: t('usage.averageRate', { rate: rateText(usage.averageRate) }) });
-  if (usage.costUsd > 0) parts.push({ text: t('usage.cost', { cost: costText(usage.costUsd) }) });
-  const tokens = usage.tokens;
-  const hit = tokens ? cacheHitRate(tokens) : null;
-  const tokenParts = tokens ? [
-    t('usage.input', { tokens: compactTokens(tokens.input) }),
-    t('usage.output', { tokens: compactTokens(tokens.output) }),
-    t('usage.cacheRead', { tokens: compactTokens(tokens.cacheRead) }),
-    t('usage.cacheWrite', { tokens: compactTokens(tokens.cacheWrite) }),
-    ...(hit !== null ? [t('usage.cacheHit', { percent: percentText(hit) })] : []),
-  ].map(text => ({ text })) : [];
-  if (!parts.length && !tokenParts.length) return null;
-  const row = (items: Array<{ text: string; warn?: boolean }>) => (
-    <Text wrap="truncate-end">
-      {items.map((part, index) => (
-        <Text key={index}>
-          {index ? <Text {...theme.faint}>{' · '}</Text> : null}
-          <Text {...(part.warn ? theme.warning : theme.faint)}>{part.text}</Text>
-        </Text>
-      ))}
-    </Text>
-  );
-  return (
-    <Box paddingX={2} flexDirection="column">
-      {parts.length ? row(parts) : null}
-      {/* This task's tokens: input excludes cache; hit rate uses Desktop's formula. */}
-      {tokenParts.length ? row(tokenParts) : null}
-    </Box>
-  );
-}
+/** Context past half: worth keeping an eye on. */
+const CONTEXT_NOTICE_PERCENT = 60;
+const METER_CELLS = 10;
 
 /** Desktop rounding: a whole percent when within 0.05 of it, otherwise one decimal. */
 function percentText(rate: number): string {
   const percent = Math.min(100, Math.max(0, rate * 100));
   return Math.abs(percent - Math.round(percent)) < 0.05 ? `${Math.round(percent)}%` : `${percent.toFixed(1)}%`;
+}
+
+/**
+ * Status bar under the footer, two rows, each part only once the Agent reports it:
+ *   Context ███░░░░░░░ 25% 50k/200k │ This turn 42 tok/s · Avg 30 tok/s │ This task ≈ $0.200
+ *   ↑ In 2k  ↓ Out 500 │ Cache read 6k · write 2k · hit 60%
+ * The meter and percent turn amber past 60% and red from 80% (time for /compact); the hit rate is green when high.
+ */
+function UsageBar({ usage, t }: { usage: UsageView; t: Translate }) {
+  const theme = useTheme();
+  const percent = usage.contextWindow ? Math.min(100, Math.round((usage.contextTokens / usage.contextWindow) * 100)) : null;
+  const level = percent === null ? theme.muted : percent >= CONTEXT_WARN_PERCENT ? theme.error : percent >= CONTEXT_NOTICE_PERCENT ? theme.warning : theme.success;
+  const sep = <Text {...theme.faint}>{'  │  '}</Text>;
+  const dot = <Text {...theme.faint}>{' · '}</Text>;
+  const groups: ReactNode[] = [];
+  if (usage.contextTokens) {
+    const filled = percent === null ? 0 : Math.min(METER_CELLS, Math.round(percent / (100 / METER_CELLS)));
+    groups.push(
+      <Text key="context">
+        <Text {...theme.faint}>{`${t('usage.context')} `}</Text>
+        {percent !== null ? (
+          <Text>
+            <Text {...level}>{'█'.repeat(filled)}</Text><Text {...theme.faint}>{'░'.repeat(METER_CELLS - filled)}</Text>
+            <Text {...level} bold>{` ${percent}%`}</Text>
+            <Text {...theme.muted}>{` ${compactTokens(usage.contextTokens)}/${compactTokens(usage.contextWindow)}`}</Text>
+          </Text>
+        ) : <Text {...theme.muted}>{compactTokens(usage.contextTokens)}</Text>}
+      </Text>,
+    );
+  }
+  const speed: ReactNode[] = [];
+  if (usage.turnRate !== null) {
+    speed.push(<Text key="turn"><Text {...theme.faint}>{`${t('usage.turn')} `}</Text><Text {...theme.info} bold>{rateText(usage.turnRate)}</Text><Text {...theme.faint}>{' tok/s'}</Text></Text>);
+  }
+  if (usage.averageRate !== null) {
+    speed.push(<Text key="avg"><Text {...theme.faint}>{`${t('usage.average')} `}</Text><Text {...theme.info}>{rateText(usage.averageRate)}</Text><Text {...theme.faint}>{' tok/s'}</Text></Text>);
+  }
+  if (speed.length) groups.push(<Text key="speed">{speed.map((part, index) => <Text key={index}>{index ? dot : null}{part}</Text>)}</Text>);
+  if (usage.costUsd > 0) groups.push(<Text key="cost" {...theme.success}>{t('usage.cost', { cost: costText(usage.costUsd) })}</Text>);
+
+  const tokens = usage.tokens;
+  const hit = tokens ? cacheHitRate(tokens) : null;
+  const hitTone = hit === null ? theme.muted : hit >= 0.7 ? theme.success : hit >= 0.3 ? theme.warning : theme.muted;
+  const figure = (value: number) => <Text>{compactTokens(value)}</Text>;
+  const tokenRow = tokens ? (
+    <Text wrap="truncate-end">
+      <Text {...theme.info}>{'↑ '}</Text><Text {...theme.faint}>{`${t('usage.input')} `}</Text>{figure(tokens.input)}
+      <Text>{'   '}</Text>
+      <Text {...theme.running}>{'↓ '}</Text><Text {...theme.faint}>{`${t('usage.output')} `}</Text>{figure(tokens.output)}
+      {sep}
+      <Text {...theme.faint}>{`${t('usage.cache')} ${t('usage.cacheRead')} `}</Text>{figure(tokens.cacheRead)}
+      {dot}<Text {...theme.faint}>{`${t('usage.cacheWrite')} `}</Text>{figure(tokens.cacheWrite)}
+      {hit !== null ? <Text>{dot}<Text {...theme.faint}>{`${t('usage.cacheHit')} `}</Text><Text {...hitTone} bold>{percentText(hit)}</Text></Text> : null}
+    </Text>
+  ) : null;
+  if (!groups.length && !tokenRow) return null;
+  return (
+    <Box paddingX={2} flexDirection="column">
+      {groups.length ? <Text wrap="truncate-end">{groups.map((group, index) => <Text key={index}>{index ? sep : null}{group}</Text>)}</Text> : null}
+      {/* This task's tokens: input excludes cache; hit rate uses Desktop's formula. */}
+      {tokenRow}
+    </Box>
+  );
 }
 
 /** A running tool call's dot blinks; finished and committed ones stay still. */
@@ -171,12 +193,18 @@ function Gutter({ mark, children, width = 2 }: { mark: ReactNode; children: Reac
   );
 }
 
+const OSC8 = '\u001B]8;;';
+const BEL = '\u0007';
+
 function SpanText({ span }: { span: Span }) {
   const theme = useTheme();
-  const tone = span.code ? theme.code : span.tone ? theme.syntax[span.tone] : span.dim ? theme.muted : undefined;
+  const links = useContext(LinkContext);
+  if (span.linkFallback && links) return null;
+  const tone = span.border ? theme.faint : span.code ? theme.code : span.tone ? theme.syntax[span.tone] : span.dim ? theme.muted : span.href ? theme.info : undefined;
+  const text = span.href && links ? `${OSC8}${span.href}${BEL}${span.text}${OSC8}${BEL}` : span.text;
   return (
     <Text bold={span.bold} italic={span.italic || span.tone === 'comment'} strikethrough={span.strike} underline={span.underline} {...tone}>
-      {span.text}
+      {text}
     </Text>
   );
 }
@@ -187,18 +215,18 @@ function MdRow({ line }: { line: MdLine }) {
   // An empty Text has no height: keep blank lines of a reply.
   if (!line.prefix && line.spans.every(span => !span.text)) return <Text> </Text>;
   return (
-    <Text underline={line.block === 'heading1'}>
+    <Text underline={line.block === 'heading1'} wrap={line.block === 'table' ? 'truncate-end' : 'wrap'}>
       {line.prefix ? <Text {...(line.block === 'quote' ? theme.faint : line.block === 'item' ? theme.muted : {})}>{line.prefix}</Text> : null}
       {line.spans.map((span, index) => <SpanText key={index} span={span} />)}
     </Text>
   );
 }
 
-function Markdown({ text, code }: { text: string; code?: boolean }) {
-  return <>{parseMarkdown(text, code).map((line, index) => <MdRow key={index} line={line} />)}</>;
+function Markdown({ text, code, width }: { text: string; code?: boolean; width: number }) {
+  return <>{parseMarkdown(text, code, width).map((line, index) => <MdRow key={index} line={line} />)}</>;
 }
 
-/** Output lines under a tool call: the first few, then how many more. */
+/** Output lines under a tool call: the first few, then how many more (Ctrl+O shows them all). */
 function outputRows(text: string, t: Translate, theme: Theme, error?: boolean): ReactNode[] {
   if (!text.trim()) return [<Text key="empty" {...theme.faint}>{t('tool.noContent')}</Text>];
   const rows = text.split('\n');
@@ -209,7 +237,45 @@ function outputRows(text: string, t: Translate, theme: Theme, error?: boolean): 
   ];
 }
 
-function toolBody(line: Extract<Line, { kind: 'tool' }>, t: Translate, theme: Theme): ReactNode[] {
+/** One diff row: line number, sign, text; the changed words get a stronger background. */
+function DiffLine({ row, numberWidth }: { row: DiffRow; numberWidth: number }) {
+  const theme = useTheme();
+  const tone = row.sign === '+' ? theme.add : row.sign === '-' ? theme.remove : theme.faint;
+  const word = row.sign === '+' ? theme.addWord : theme.removeWord;
+  const number = numberWidth ? `${String(row.line ?? '').padStart(numberWidth)} ` : '';
+  const [from, to] = row.mark ?? [0, 0];
+  return (
+    // The row's background fills the line, not just its characters.
+    <Box {...(tone.backgroundColor ? { backgroundColor: tone.backgroundColor } : {})}>
+      <Text wrap="truncate-end">
+        <Text {...tone} {...(row.sign === ' ' ? {} : { dimColor: false })}>{`${number}${row.sign} `}</Text>
+        {row.mark ? (
+          <Text {...tone}>{row.text.slice(0, from)}<Text {...word}>{row.text.slice(from, to)}</Text>{row.text.slice(to)}</Text>
+        ) : <Text {...tone}>{row.text || ' '}</Text>}
+      </Text>
+    </Box>
+  );
+}
+
+function diffRows(rows: readonly DiffRow[], more: number, t: Translate, theme: Theme): ReactNode[] {
+  const numberWidth = Math.max(0, ...rows.map(row => String(row.line ?? '').length));
+  return [
+    ...rows.map((row, index) => <DiffLine key={index} row={row} numberWidth={numberWidth} />),
+    ...(more > 0 ? [<Text key="more" {...theme.faint}>{t('tool.more', { count: more })}</Text>] : []),
+  ];
+}
+
+function numberedRows(rows: readonly string[], more: number, t: Translate, theme: Theme): ReactNode[] {
+  const width = String(rows.length).length;
+  return [
+    ...rows.map((row, index) => <Text key={index} wrap="truncate-end"><Text {...theme.faint}>{`${String(index + 1).padStart(width)} `}</Text><Text {...theme.muted}>{row || ' '}</Text></Text>),
+    ...(more > 0 ? [<Text key="more" {...theme.faint}>{t('tool.more', { count: more })}</Text>] : []),
+  ];
+}
+
+type ToolLine = Extract<Line, { kind: 'tool' }>;
+
+function toolBody(line: ToolLine, t: Translate, theme: Theme): ReactNode[] {
   const detail = line.detail;
   if (detail?.kind === 'todos') {
     return detail.items.map((item, index) => item.status === 'completed'
@@ -217,47 +283,164 @@ function toolBody(line: Extract<Line, { kind: 'tool' }>, t: Translate, theme: Th
       : item.status === 'in_progress' ? <Text key={index} bold {...theme.info}>{`◼ ${item.text}`}</Text>
         : <Text key={index}>{`☐ ${item.text}`}</Text>);
   }
+  // A sub-Agent: its last few tool calls while it works, then how it went.
+  if (line.children?.length || line.task) {
+    if (line.result === undefined && !line.interrupted) {
+      const count = line.childCount ?? 0;
+      return [
+        ...(line.children ?? []).map(child => (
+          <Text key={child.id} wrap="truncate-end" {...(child.error ? theme.error : theme.faint)}>
+            {toolDisplayName(child.name)}{child.summary ? `(${child.summary})` : ''}
+          </Text>
+        )),
+        ...(count > CHILD_ROWS ? [<Text key="more" {...theme.faint}>{t('subagent.more', { count: count - CHILD_ROWS })}</Text>] : []),
+      ];
+    }
+  }
+  if (line.interrupted && line.result === undefined) return [<Text key="interrupted" {...theme.warning}>{t('tool.interrupted')}</Text>];
   if (line.result === undefined) return [];
+  if (line.children?.length || line.task) {
+    const uses = line.task?.toolUses ?? line.childCount ?? 0;
+    const facts = [
+      ...(uses ? [t('subagent.toolUses', { count: uses })] : []),
+      ...(line.task?.totalTokens ? [t('subagent.tokens', { tokens: compactTokens(line.task.totalTokens) })] : []),
+      ...(line.task?.durationMs ? [elapsedText(line.task.durationMs)] : []),
+    ];
+    return [
+      <Text key="done" {...(line.error ? theme.error : {})}>
+        {t('subagent.done')}{facts.length ? <Text {...theme.muted}>{` (${facts.join(' · ')})`}</Text> : null}
+        {line.result ? <Text {...theme.faint}>{` ${t('group.expand')}`}</Text> : null}
+      </Text>,
+    ];
+  }
   if (line.error) return outputRows(line.result, t, theme, true);
   if (line.name === 'Read') return [<Text key="read">{t('tool.read', { count: countLines(line.result) })}</Text>];
   if (detail?.kind === 'edit') {
     const rows = detail.rows.slice(0, DETAIL_ROWS);
     return [
-      <Text key="summary">{t('tool.updated', { path: detail.path, added: detail.added, removed: detail.removed })}</Text>,
-      ...rows.map((row, index) => {
-        const tone = row.sign === '+' ? theme.add : row.sign === '-' ? theme.remove : theme.faint;
-        // The row's background fills the line, not just its characters.
-        return <Box key={index} {...(tone.backgroundColor ? { backgroundColor: tone.backgroundColor } : {})}><Text {...tone} wrap="truncate-end">{`${row.sign} ${row.text}`}</Text></Box>;
-      }),
-      ...(detail.rows.length > rows.length ? [<Text key="more" {...theme.faint}>{t('tool.more', { count: detail.rows.length - rows.length })}</Text>] : []),
+      <Text key="summary">
+        {t('tool.updated', { path: detail.path, added: detail.added, removed: detail.removed }).split(/(\+\d+|−\d+)/).map((part, index) => (
+          <Text key={index} {...(/^\+\d+$/.test(part) ? theme.success : /^−\d+$/.test(part) ? theme.error : {})}>{part}</Text>
+        ))}
+      </Text>,
+      ...diffRows(rows, detail.rows.length - rows.length, t, theme),
     ];
   }
   if (detail?.kind === 'write') {
     return [
       <Text key="summary">{t('tool.wrote', { count: detail.lines, path: detail.path })}</Text>,
-      ...detail.preview.map((row, index) => <Text key={index} {...theme.muted} wrap="truncate-end">{row || ' '}</Text>),
-      ...(detail.lines > detail.preview.length ? [<Text key="more" {...theme.faint}>{t('tool.more', { count: detail.lines - detail.preview.length })}</Text>] : []),
+      ...numberedRows(detail.preview, detail.lines - detail.preview.length, t, theme),
     ];
   }
   return outputRows(line.result, t, theme);
 }
 
-/** Terminal rows a transcript line takes, roughly (keeps the live area within the window). */
-function lineRows(line: Line, t: Translate): number {
-  if (line.kind === 'tool') return 2 + toolBody(line, t, THEMES.ansi).length;
-  if (line.kind === 'help') return 1 + line.sections.reduce((rows, section) => rows + 2 + section.rows.length, 0);
-  return 1 + line.text.split('\n').length;
+/** "Read 3 files, searched 2 patterns": what a read / search group did. */
+function groupTitle(items: readonly GroupItem[], t: Translate): string {
+  const count = (names: string[]) => items.filter(item => names.includes(item.name)).length;
+  const reads = count(['Read', 'NotebookRead']);
+  const searches = count(['Grep', 'Glob']);
+  const lists = count(['LS']);
+  const parts = [
+    ...(reads ? [reads === 1 ? t('group.read1') : t('group.readN', { count: reads })] : []),
+    ...(searches ? [searches === 1 ? t('group.search1') : t('group.searchN', { count: searches })] : []),
+    ...(lists ? [lists === 1 ? t('group.list1') : t('group.listN', { count: lists })] : []),
+  ];
+  const text = parts.join(t('group.read1').startsWith('Read') ? ', ' : '，');
+  return text.charAt(0).toUpperCase() + text.slice(1);
 }
 
-function TranscriptLine({ line, t, live }: { line: Line; t: Translate; /** In the live area (not yet printed for good). */ live?: boolean }) {
+/** Terminal rows a transcript line takes, roughly (keeps the live area within the window). */
+function lineRows(line: Line, t: Translate): number {
+  switch (line.kind) {
+    case 'tool': return 2 + toolBody(line, t, THEMES.ansi).length;
+    case 'group': return 3;
+    case 'thinking': case 'interrupted': return 2;
+    case 'local': return 3 + (line.output ? Math.min(OUTPUT_ROWS + 1, line.output.split('\n').length) : 0);
+    case 'help': return 1 + line.sections.reduce((rows, section) => rows + 2 + section.rows.length, 0);
+    default: return 1 + line.text.split('\n').length;
+  }
+}
+
+function ToolRow({ line, t, live }: { line: ToolLine; t: Translate; live?: boolean }) {
+  const theme = useTheme();
+  const done = line.result !== undefined;
+  const mark = line.error ? <Text {...theme.error}>{DOT}</Text>
+    : done ? <Text {...theme.success}>{DOT}</Text>
+      : line.interrupted ? <Text {...theme.warning}>{DOT}</Text>
+        : live ? <Blink>{DOT}</Blink> : <Text {...theme.faint}>{DOT}</Text>;
+  const body = toolBody(line, t, theme);
+  return (
+    <Box flexDirection="column" marginTop={1}>
+      <Gutter mark={mark}><Text><Text bold>{toolDisplayName(line.name)}</Text>{line.summary ? <Text {...theme.muted}>{`(${line.summary})`}</Text> : null}</Text></Gutter>
+      {body.length ? <Gutter width={5} mark={<Text {...theme.faint}>{'  ⎿  '}</Text>}>{body}</Gutter> : null}
+    </Box>
+  );
+}
+
+function TranscriptLine({ line, t, live, width }: { line: Line; t: Translate; /** In the live area (not yet printed for good). */ live?: boolean; width: number }) {
   const theme = useTheme();
   switch (line.kind) {
     case 'user':
       return <Box marginTop={1}><Gutter mark={<Text {...theme.faint}>{'>'}</Text>}><Text {...theme.muted}>{line.text}{line.steer ? <Text {...theme.info}>{`  [${t('chat.steerTag')}]`}</Text> : null}</Text></Gutter></Box>;
     case 'assistant':
-      return <Box marginTop={line.cont ? 0 : 1}><Gutter mark={line.cont ? '' : DOT}><Markdown text={line.text} code={line.code} /></Gutter></Box>;
+      return <Box marginTop={line.cont ? 0 : 1}><Gutter mark={line.cont ? '' : DOT}><Markdown text={line.text} code={line.code} width={width - 2} /></Gutter></Box>;
+    case 'thinking':
+      return (
+        <Box marginTop={1}>
+          <Gutter mark={<Text {...theme.faint}>{THOUGHT}</Text>}>
+            <Text {...theme.faint} italic>
+              {line.durationMs !== undefined ? t('thinking.done', { duration: elapsedText(Math.max(1000, line.durationMs)) }) : t('thinking.doneNoTime')}
+              {` ${t('thinking.hint')}`}
+            </Text>
+          </Gutter>
+        </Box>
+      );
+    case 'interrupted':
+      return <Gutter width={5} mark={<Text {...theme.faint}>{'  ⎿  '}</Text>}><Text {...theme.warning}>{t('chat.interruptedHint')}</Text></Gutter>;
+    case 'tool':
+      return <ToolRow line={line} t={t} {...(live ? { live } : {})} />;
+    case 'group': {
+      // One call reads like any other tool call; several collapse into what they did.
+      if (line.items.length === 1) {
+        const item = line.items[0]!;
+        return <ToolRow line={{ id: line.id, kind: 'tool', name: item.name, summary: item.summary, ...(item.result !== undefined ? { result: item.result } : {}),
+          ...(item.error ? { error: true } : {}), ...(item.interrupted ? { interrupted: true } : {}) }} t={t} {...(live ? { live } : {})} />;
+      }
+      const failed = line.items.filter(item => item.error).length;
+      const waiting = line.items.some(item => item.result === undefined && !item.interrupted);
+      const mark = failed ? <Text {...theme.error}>{DOT}</Text> : waiting && live ? <Blink>{DOT}</Blink>
+        : line.items.some(item => item.interrupted) ? <Text {...theme.warning}>{DOT}</Text> : <Text {...theme.success}>{DOT}</Text>;
+      const last = line.items.at(-1)!;
+      return (
+        <Box flexDirection="column" marginTop={1}>
+          <Gutter mark={mark}>
+            <Text>
+              <Text bold>{groupTitle(line.items, t)}</Text>
+              {failed ? <Text {...theme.error}>{` · ${t('group.failed', { count: failed })}`}</Text> : null}
+              {waiting ? null : <Text {...theme.faint}>{` ${t('group.expand')}`}</Text>}
+            </Text>
+          </Gutter>
+          {waiting ? <Gutter width={5} mark={<Text {...theme.faint}>{'  ⎿  '}</Text>}><Text {...theme.faint} wrap="truncate-end">{`${toolDisplayName(last.name)}(${last.summary})`}</Text></Gutter> : null}
+        </Box>
+      );
+    }
+    case 'local': {
+      const body: ReactNode[] = line.running ? [] : [
+        ...outputRows(line.output ?? '', t, theme, line.exitCode !== 0 && line.exitCode !== undefined),
+        <Text key="meta" {...theme.faint}>
+          {line.exitCode === null ? `${t('local.stopped')} · ` : line.exitCode ? `${t('local.exit', { code: line.exitCode })} · ` : ''}{t('local.pending')}
+        </Text>,
+      ];
+      return (
+        <Box flexDirection="column" marginTop={1}>
+          <Gutter mark={<Text {...theme.local} bold>{'!'}</Text>}><Text {...theme.local}>{line.command}</Text></Gutter>
+          {body.length ? <Gutter width={5} mark={<Text {...theme.faint}>{'  ⎿  '}</Text>}>{body}</Gutter> : null}
+        </Box>
+      );
+    }
     case 'help': {
-      const width = Math.max(...line.sections.flatMap(section => section.rows.map(([keys]) => displayWidth(keys)))) + 2;
+      const keyWidth = Math.max(...line.sections.flatMap(section => section.rows.map(([keys]) => displayWidth(keys)))) + 2;
       return (
         <Box flexDirection="column" marginTop={1}>
           {line.sections.map(section => (
@@ -265,23 +448,12 @@ function TranscriptLine({ line, t, live }: { line: Line; t: Translate; /** In th
               <Text bold>{section.title}</Text>
               {section.rows.map(([keys, description]) => (
                 <Box key={keys}>
-                  <Box width={width + 2} flexShrink={0}><Text {...theme.info}>{`  ${keys}`}</Text></Box>
+                  <Box width={keyWidth + 2} flexShrink={0}><Text {...theme.info}>{`  ${keys}`}</Text></Box>
                   <Text>{description}</Text>
                 </Box>
               ))}
             </Box>
           ))}
-        </Box>
-      );
-    }
-    case 'tool': {
-      const done = line.result !== undefined;
-      const mark = line.error ? <Text {...theme.error}>{DOT}</Text> : done ? <Text {...theme.success}>{DOT}</Text> : live ? <Blink>{DOT}</Blink> : <Text {...theme.faint}>{DOT}</Text>;
-      const body = toolBody(line, t, theme);
-      return (
-        <Box flexDirection="column" marginTop={1}>
-          <Gutter mark={mark}><Text><Text bold>{toolDisplayName(line.name)}</Text>{line.summary ? <Text {...theme.muted}>{`(${line.summary})`}</Text> : null}</Text></Gutter>
-          {body.length ? <Gutter width={5} mark={<Text {...theme.faint}>{'  ⎿  '}</Text>}>{body}</Gutter> : null}
         </Box>
       );
     }
@@ -322,6 +494,18 @@ function Choices({ prompt, t }: { prompt: Prompt; t: Translate }) {
   );
 }
 
+/** What the call would do, shown on its confirmation: the diff, the file's first lines, or the whole command. */
+function PermissionPreviewView({ preview, t }: { preview: NonNullable<Extract<Prompt, { kind: 'permission' }>['preview']>; t: Translate }) {
+  const theme = useTheme();
+  const rows = preview.kind === 'diff' ? diffRows(preview.rows, preview.more, t, theme)
+    : preview.kind === 'write' ? numberedRows(preview.rows, preview.more, t, theme)
+      : [
+        ...preview.rows.map((row, index) => <Text key={index} wrap="truncate-end">{row || ' '}</Text>),
+        ...(preview.more > 0 ? [<Text key="more" {...theme.faint}>{t('tool.more', { count: preview.more })}</Text>] : []),
+      ];
+  return <Box flexDirection="column" marginY={1} paddingLeft={preview.kind === 'command' ? 2 : 0}>{rows}</Box>;
+}
+
 function PromptView({ prompt, hint, t }: { prompt: Prompt; hint: string; t: Translate }) {
   const theme = useTheme();
   if (prompt.kind === 'picker') {
@@ -338,6 +522,7 @@ function PromptView({ prompt, hint, t }: { prompt: Prompt; hint: string; t: Tran
       <Box flexDirection="column" borderStyle="round" borderColor={theme.attention} paddingX={1}>
         <Text bold color={theme.attention}>{prompt.title}</Text>
         {prompt.summary ? <Text>{prompt.summary}</Text> : null}
+        {prompt.preview ? <PermissionPreviewView preview={prompt.preview} t={t} /> : null}
         {prompt.description ? <Text {...theme.muted}>{prompt.description}</Text> : null}
         <Choices prompt={prompt} t={t} />
       </Box>
@@ -400,15 +585,18 @@ export const edit = {
   remove: ({ value }: Editor, from: number, to: number): Editor => ({ value: value.slice(0, from) + value.slice(to), cursor: from }),
 };
 
-function InputBox({ editor, placeholder }: { editor: Editor; placeholder: string }) {
+/** In local command mode (`!` first) the mark is `!` in its own color and the `!` itself is not repeated. */
+function InputBox({ editor, placeholder, local }: { editor: Editor; placeholder: string; local: boolean }) {
   const theme = useTheme();
-  const before = editor.value.slice(0, editor.cursor);
+  const skip = local && editor.cursor > 0 ? 1 : 0;
+  const before = editor.value.slice(skip, editor.cursor);
   const at = editor.value[editor.cursor] ?? ' ';
   const after = editor.value.slice(editor.cursor + 1);
+  const shown = editor.value.slice(skip);
   return (
-    <Box borderStyle="round" borderColor={theme.border} paddingX={1}>
-      <Text {...theme.muted}>{'> '}</Text>
-      {editor.value ? (
+    <Box borderStyle="round" borderColor={local ? theme.local.color ?? theme.border : theme.border} paddingX={1}>
+      {local ? <Text {...theme.local} bold>{'! '}</Text> : <Text {...theme.muted}>{'> '}</Text>}
+      {shown ? (
         <Text>{before}<Text inverse>{at === '\n' ? ' ' : at}</Text>{at === '\n' ? '\n' : ''}{after}</Text>
       ) : (
         <Text><Text inverse> </Text><Text {...theme.faint}>{placeholder}</Text></Text>
@@ -417,40 +605,142 @@ function InputBox({ editor, placeholder }: { editor: Editor; placeholder: string
   );
 }
 
-export function App({ controller, header }: { controller: ChatController; header: string }) {
+/** The Ctrl+O viewer: one folded item at a time, scrolled in the live area; nothing is added to the history. */
+function Viewer({ title, position, rows, offset, height, t }: { title: string; position: string; rows: ViewRow[]; offset: number; height: number; t: Translate }) {
+  const theme = useTheme();
+  const shown = rows.slice(offset, offset + height);
+  const tone = (row: ViewRow): Tone => (row.tone === 'add' ? theme.add : row.tone === 'remove' ? theme.remove : row.tone === 'error' ? theme.error
+    : row.tone === 'muted' ? theme.muted : row.tone === 'faint' ? theme.faint : {});
+  return (
+    <Box flexDirection="column">
+      <Text wrap="truncate-end"><Text bold {...theme.info}>{title}</Text><Text {...theme.faint}>{`  ${position}`}</Text></Text>
+      {/* Short content takes only the rows it needs; long content scrolls in a fixed window. */}
+      <Box flexDirection="column" height={Math.max(1, Math.min(height, rows.length))}>
+        {shown.map((row, index) => <Text key={offset + index} {...tone(row)} wrap="truncate-end">{row.text || ' '}</Text>)}
+      </Box>
+      <Text {...theme.faint} wrap="truncate-end">
+        {t('viewer.lines', { from: rows.length ? offset + 1 : 0, to: Math.min(rows.length, offset + height), total: rows.length })}{`  ·  ${t('viewer.hint')}`}
+      </Text>
+    </Box>
+  );
+}
+
+/** Pasted text this long goes in as a placeholder; the message carries the full text. */
+const PASTE_LINES = 10;
+const PASTE_CHARS = 2000;
+/** Placeholders in either interface language (the language can change while they sit in the input or history). */
+const PASTE_RE = /\[(?:Pasted text|粘贴的文本) #(\d+)[^\]]*\]/g;
+const IMAGE_RE = /\[(?:Image|图片) #(\d+)\]/g;
+
+export function App({ controller, header, hyperlinks = false, colorDepth = 24 }: {
+  controller: ChatController; header: string; hyperlinks?: boolean; /** The terminal's color depth (getColorDepth). */ colorDepth?: number;
+}) {
   const app = useApp();
   const windowSize = useWindowSize();
   const snapshot = useSyncExternalStore(controller.subscribe, controller.getSnapshot);
   const t = controller.translate();
-  const theme = THEMES[snapshot.theme];
+  const theme = themeFor(snapshot.theme, colorDepth);
   const [editor, setEditor] = useState<Editor>({ value: '', cursor: 0 });
   const [history, setHistory] = useState<string[]>([]);
   const [historyIndex, setHistoryIndex] = useState<number | null>(null);
   const [suggestion, setSuggestion] = useState(0);
+  /** Ctrl+O viewer: which folded item and how far it is scrolled; null when closed. */
+  const [viewer, setViewer] = useState<{ index: number; offset: number } | null>(null);
+  /** Pasted texts and images behind the input's placeholders, kept for the run (history and queue reuse them). */
+  const pastes = useRef(new Map<number, string>());
+  const images = useRef(new Map<number, ImageAttachment>());
+  const pasteCount = useRef(0);
   const prompt = snapshot.prompt;
   const typing = !prompt || prompt.kind === 'question' || prompt.kind === 'plan';
-  const suggestions = typing ? commandSuggestions(editor.value) : [];
+  const local = typing && !prompt && editor.value.startsWith('!');
+  const commands = typing ? commandSuggestions(editor.value) : [];
+  const mention = typing && !commands.length && !local ? mentionAt(editor.value, editor.cursor) : null;
+  const files = mention ? controller.fileSuggestions(mention.query) : [];
+  const suggestions: Array<{ kind: 'command' | 'file'; value: string }> = commands.length
+    ? commands.map(value => ({ kind: 'command', value })) : files.map(value => ({ kind: 'file', value }));
   const selected = suggestions[Math.min(suggestion, suggestions.length - 1)];
   useEffect(() => { setSuggestion(0); }, [editor.value]);
 
   useEffect(() => { if (snapshot.exited) app.exit(); }, [snapshot.exited, app]);
+  // A confirmation or question needs the screen: close the viewer.
+  useEffect(() => { if (prompt) setViewer(null); }, [prompt]);
+
+  const items = viewer ? viewItems(snapshot.lines, t) : [];
+  const viewHeight = Math.max(3, windowSize.rows - 4);
+  const viewItem = viewer ? items[Math.min(viewer.index, items.length - 1)] : undefined;
+  const viewRows = viewItem ? wrapView(viewItem.rows, Math.max(10, windowSize.columns - 1)) : [];
 
   const insert = (text: string) => setEditor(current => ({ value: current.value.slice(0, current.cursor) + text + current.value.slice(current.cursor), cursor: current.cursor + text.length }));
-  usePaste(text => { if (typing) insert(text.replace(/\r\n?/g, '\n')); });
+  const attachImage = (image: ImageAttachment) => {
+    const id = ++pasteCount.current;
+    images.current.set(id, image);
+    setEditor(current => {
+      const before = current.value.slice(0, current.cursor);
+      const text = `${before && !/\s$/.test(before) ? ' ' : ''}${t('paste.image', { id })} `;
+      return { value: before + text + current.value.slice(current.cursor), cursor: current.cursor + text.length };
+    });
+  };
+  /** The input as sent: placeholders replaced by the pasted text, images collected from their placeholders. */
+  const resolve = (value: string) => {
+    const text = value.replace(PASTE_RE, (whole, id: string) => pastes.current.get(Number(id)) ?? whole);
+    const attached = [...new Set([...value.matchAll(IMAGE_RE)].map(match => Number(match[1])))].flatMap(id => images.current.get(id) ?? []);
+    return { text, extra: { ...(text !== value ? { display: value } : {}), ...(attached.length ? { images: attached } : {}) } };
+  };
+
+  usePaste(text => {
+    if (!typing || viewer) return;
+    const normalized = text.replace(/\r\n?/g, '\n');
+    // A dropped or pasted image file goes with the message as an image.
+    const image = controller.imageFromPath(normalized);
+    if (image) { attachImage(image); return; }
+    const count = normalized.split('\n').length;
+    if (count > PASTE_LINES || normalized.length > PASTE_CHARS) {
+      const id = ++pasteCount.current;
+      pastes.current.set(id, normalized);
+      insert(t('paste.text', { id, lines: count }));
+      return;
+    }
+    insert(normalized);
+  });
 
   useInput((input, key) => {
+    if (viewer) {
+      const last = Math.max(0, viewRows.length - viewHeight);
+      const scroll = (offset: number) => setViewer({ index: viewer.index, offset: Math.max(0, Math.min(last, offset)) });
+      if (key.escape || (key.ctrl && input === 'o') || input === 'q' || (key.ctrl && input === 'c')) setViewer(null);
+      else if (key.upArrow || input === 'k') scroll(viewer.offset - 1);
+      else if (key.downArrow || input === 'j') scroll(viewer.offset + 1);
+      else if (key.pageUp || input === 'b') scroll(viewer.offset - viewHeight);
+      else if (key.pageDown || input === ' ') scroll(viewer.offset + viewHeight);
+      else if (key.home || input === 'g') scroll(0);
+      else if (key.end || input === 'G') scroll(last);
+      else if (key.leftArrow) setViewer({ index: Math.max(0, viewer.index - 1), offset: 0 });
+      else if (key.rightArrow) setViewer({ index: Math.min(items.length - 1, viewer.index + 1), offset: 0 });
+      return;
+    }
     if (key.ctrl && input === 'c') { controller.ctrlC(); return; }
+    if (key.ctrl && input === 'o') {
+      const count = viewItems(snapshot.lines, t).length;
+      if (count && !prompt) setViewer({ index: count - 1, offset: 0 });
+      return;
+    }
     if (key.escape) {
       if (prompt) controller.cancelPrompt();
+      else if (controller.stopLocal()) { /* stopped the local command */ }
       else if (snapshot.phase === 'running') controller.interrupt();
       else setEditor({ value: '', cursor: 0 });
       return;
     }
     if (key.tab && key.shift) { void controller.cyclePermission(); return; }
     if (key.ctrl && input === 's') {
-      const value = editor.value;
+      const { text, extra } = resolve(editor.value);
       setEditor({ value: '', cursor: 0 });
-      void controller.steer(value);
+      void controller.steer(text, extra);
+      return;
+    }
+    // Ctrl+V (Alt+V where the terminal keeps Ctrl+V for its own paste): an image from the clipboard.
+    if (typing && ((key.ctrl && input === 'v') || (key.meta && input === 'v'))) {
+      void controller.pasteImage().then(image => { if (image) attachImage(image); });
       return;
     }
     if (prompt && prompt.kind !== 'question' && prompt.kind !== 'plan') {
@@ -472,29 +762,36 @@ export function App({ controller, header }: { controller: ChatController; header
         return;
       }
     }
-    // ↑/↓ choose among the listed commands; Tab completes and Enter runs the highlighted one.
+    // ↑/↓ choose among the listed commands or files; Tab completes and Enter runs / completes the highlighted one.
     if ((key.upArrow || key.downArrow) && suggestions.length > 1) {
       setSuggestion(index => (index + (key.upArrow ? -1 : 1) + suggestions.length) % suggestions.length);
+      return;
+    }
+    if (selected?.kind === 'file' && mention && (key.tab || key.return)) {
+      const value = selected.value;
+      const token = `@${/\s/.test(value) ? `"${value}"` : value} `;
+      setEditor(current => ({ value: current.value.slice(0, mention.start) + token + current.value.slice(current.cursor), cursor: mention.start + token.length }));
       return;
     }
     // ? on an empty input opens the operations guide (Claude Code parity).
     if (input === '?' && !prompt && !editor.value) { void controller.submit('/help'); return; }
     // ↑ on an empty line with queued messages: take the last one back for editing (Claude Code parity).
     if (key.upArrow && !prompt && !editor.value && snapshot.queue.length) {
-      const text = controller.popQueued();
-      if (text !== null) setEditor({ value: text, cursor: text.length });
+      const queued = controller.popQueued();
+      if (queued) { const text = queued.display ?? queued.text; setEditor({ value: text, cursor: text.length }); }
       return;
     }
     if (key.return) {
       if (editor.value.endsWith('\\')) { setEditor(current => ({ value: `${current.value.slice(0, -1)}\n`, cursor: current.value.length })); return; }
-      const value = selected ? `/${selected}` : editor.value;
-      if (value.trim()) setHistory(items => [...items.filter(item => item !== value), value].slice(-100));
+      const value = selected?.kind === 'command' ? `/${selected.value}` : editor.value;
+      if (value.trim()) setHistory(entries => [...entries.filter(item => item !== value), value].slice(-100));
       setHistoryIndex(null);
       setEditor({ value: '', cursor: 0 });
-      void controller.submit(value);
+      const { text, extra } = resolve(value);
+      void controller.submit(text, extra);
       return;
     }
-    if (key.tab && selected) { const value = `/${selected} `; setEditor({ value, cursor: value.length }); return; }
+    if (key.tab && selected?.kind === 'command') { const value = `/${selected.value} `; setEditor({ value, cursor: value.length }); return; }
     // In a multi-line input ↑/↓ move between its lines; history only from the first / last line.
     if (key.upArrow || key.downArrow) {
       const cursor = edit.vertical(editor, key.upArrow ? -1 : 1);
@@ -528,32 +825,42 @@ export function App({ controller, header }: { controller: ChatController; header
     if (input && !key.ctrl && !key.meta) insert(input);
   });
 
-  // <Static> prints each line once: keep lines from the first tool still awaiting its result live until the turn ends.
-  // The boundary only moves forward (lines are append-only), so nothing is printed twice.
+  // <Static> prints each line once. While the turn runs, keep live: lines from the first call still awaiting its
+  // result (a running `!command` too, at any time), and a read / search group that may still grow. The boundary
+  // only moves forward (lines are append-only), so nothing is printed twice.
   const committedCount = useRef(0);
-  const firstPending = snapshot.phase === 'idle' ? -1
-    : snapshot.lines.findIndex((line, index) => index >= committedCount.current && line.kind === 'tool' && line.result === undefined);
-  committedCount.current = Math.max(committedCount.current, firstPending < 0 ? snapshot.lines.length : firstPending);
+  const running = snapshot.phase !== 'idle';
+  const waiting = (line: Line) => (line.kind === 'local' && !!line.running)
+    || (running && line.kind === 'tool' && line.result === undefined && !line.interrupted)
+    || (running && line.kind === 'group' && line.items.some(item => item.result === undefined && !item.interrupted));
+  const firstPending = snapshot.lines.findIndex((line, index) => index >= committedCount.current && waiting(line));
+  let boundary = firstPending < 0 ? snapshot.lines.length : firstPending;
+  const open = running ? openGroupIndex(snapshot.lines) : -1;
+  if (open >= committedCount.current && open < boundary) boundary = open;
+  committedCount.current = Math.max(committedCount.current, boundary);
   const committed = snapshot.lines.slice(0, committedCount.current);
   const pending = snapshot.lines.slice(committedCount.current);
   const pendingRows = pending.reduce((rows, line) => rows + lineRows(line, t), 0);
   const model = snapshot.model;
-  const status = snapshot.phase === 'connecting'
-    ? t('chat.connecting', { where: model?.targetLabel ?? '' })
-    : snapshot.phase === 'running' ? (prompt ? t('chat.waitingAnswer') : t(snapshot.thinking ? 'chat.thinking' : 'chat.working')) : '';
-  const statusKeys = snapshot.phase === 'running' && !prompt ? t('chat.workingKeys') : undefined;
+  const status = snapshot.localRunning ? t('chat.localRunning')
+    : snapshot.phase === 'connecting' ? t('chat.connecting', { where: model?.targetLabel ?? '' })
+      : snapshot.phase === 'running' ? (prompt ? t('chat.waitingAnswer') : t(snapshot.thinking ? 'chat.thinking' : 'chat.working')) : '';
+  const statusKeys = snapshot.localRunning ? t('chat.localKeys') : snapshot.phase === 'running' && !prompt ? t('chat.workingKeys') : undefined;
   const queue = snapshot.queue;
-  // Footer left: the exit hint, a non-default permission mode, or where to find all keys (Claude Code parity).
+  // Footer left: the exit hint, local command mode, a non-default permission mode, or where to find all keys.
   const mode = snapshot.exitArmed ? <Text>{t('chat.exitHint')}</Text>
-    : snapshot.permission === 'full' ? <Text {...theme.full}>{t('footer.full')}</Text>
-      : snapshot.permission === 'plan' ? <Text {...theme.info}>{t('footer.plan')}</Text>
-        : !editor.value && !prompt ? <Text {...theme.faint}>{t('footer.shortcuts')}</Text> : <Text> </Text>;
+    : local ? <Text {...theme.local}>{t('footer.local')}</Text>
+      : snapshot.permission === 'full' ? <Text {...theme.full}>{t('footer.full')}</Text>
+        : snapshot.permission === 'plan' ? <Text {...theme.info}>{t('footer.plan')}</Text>
+          : !editor.value && !prompt ? <Text {...theme.faint}>{t('footer.shortcuts')}</Text> : <Text> </Text>;
+  const width = windowSize.columns;
   return (
     <ThemeContext.Provider value={theme}>
+    <LinkContext.Provider value={hyperlinks}>
     <Box flexDirection="column">
       <Static items={[{ id: 'header', kind: 'notice', tone: 'info', text: header } as Line, ...committed]}>
         {/* <Static> lays lines out shrink-to-fit; the terminal width lets diff backgrounds span the row. */}
-        {line => <Box key={line.id} flexDirection="column" width={windowSize.columns}><TranscriptLine line={line} t={t} /></Box>}
+        {line => <Box key={line.id} flexDirection="column" width={width}><TranscriptLine line={line} t={t} width={width} /></Box>}
       </Static>
       {/* Bound the entire live area, including pending tools, wrapped text and the composer. Bounding
           only snapshot.live lets a pending tool hold arbitrarily many later lines here; Ink then clears
@@ -561,16 +868,21 @@ export function App({ controller, header }: { controller: ChatController; header
           visible and leave one spare terminal row, including on Windows. Clipped history is still
           committed in full above when the pending tools finish. */}
       <Box flexDirection="column" maxHeight={Math.max(1, windowSize.rows - 1)} overflowY="hidden" justifyContent="flex-end">
+        {viewer && viewItem ? (
+          <Viewer title={viewItem.title} position={t('viewer.position', { index: Math.min(viewer.index, items.length - 1) + 1, total: items.length })}
+            rows={viewRows} offset={viewer.offset} height={viewHeight} t={t} />
+        ) : (
         <Box flexDirection="column" flexShrink={0}>
-          {pending.map(line => <TranscriptLine key={line.id} line={line} t={t} live />)}
+          {pending.map(line => <TranscriptLine key={line.id} line={line} t={t} width={width} live />)}
           {snapshot.live ? (
             <Box marginTop={snapshot.liveCont ? 0 : 1}>
               <Gutter mark={snapshot.liveCont ? '' : DOT}>
-                <Markdown text={tailRows(snapshot.live, windowSize.rows - RESERVED_ROWS - pendingRows, windowSize.columns - 2)} code={snapshot.liveCode} />
+                <Markdown text={tailRows(snapshot.live, windowSize.rows - RESERVED_ROWS - pendingRows, width - 2)} code={snapshot.liveCode} width={width - 2} />
               </Gutter>
             </Box>
           ) : null}
-          {status ? <Status text={status} {...(statusKeys ? { keys: statusKeys } : {})} startedAt={snapshot.phase === 'running' ? snapshot.turnStartedAt : null} /> : null}
+          {status ? <Status text={status} {...(statusKeys ? { keys: statusKeys } : {})} startedAt={!snapshot.localRunning && snapshot.phase === 'running' ? snapshot.turnStartedAt : null}
+            {...(snapshot.localRunning ? { tone: theme.local } : {})} /> : null}
           <Box marginTop={1} flexDirection="column">
             {prompt ? <PromptView prompt={prompt} t={t} hint={prompt.kind === 'plan' ? t('ask.planTitle') : t('picker.hint')} /> : null}
             {queue.length ? (
@@ -578,20 +890,26 @@ export function App({ controller, header }: { controller: ChatController; header
                 <Text {...(snapshot.queuePaused ? theme.warning : theme.muted)}>
                   {snapshot.queuePaused ? t('chat.queuePaused', { count: queue.length }) : t('chat.queued', { count: queue.length })}
                 </Text>
-                {queue.slice(0, 3).map((item, index) => <Text key={item.id} {...theme.faint}>{`  ${index + 1}. ${item.text.split('\n')[0]!.slice(0, 100)}`}</Text>)}
+                {queue.slice(0, 3).map((item, index) => <Text key={item.id} {...theme.faint}>{`  ${index + 1}. ${(item.display ?? item.text).split('\n')[0]!.slice(0, 100)}`}</Text>)}
                 {queue.length > 3 ? <Text {...theme.faint}>{`  ${t('chat.queueMore', { count: queue.length - 3 })}`}</Text> : null}
                 <Text {...theme.faint}>{`  ${t('chat.queueHint')}`}</Text>
               </Box>
             ) : null}
-            {typing ? <InputBox editor={editor} placeholder={prompt?.kind === 'question' ? t(prompt.question.multiSelect ? 'ask.multiHint' : 'ask.questionHint') : prompt?.kind === 'plan' ? t('ask.planHint') : t('chat.hint')} /> : null}
+            {snapshot.localPending && !local ? <Box paddingX={2}><Text {...theme.local}>{t('local.pendingCount', { count: snapshot.localPending })}</Text></Box> : null}
+            {typing ? <InputBox editor={editor} local={local} placeholder={prompt?.kind === 'question' ? t(prompt.question.multiSelect ? 'ask.multiHint' : 'ask.questionHint') : prompt?.kind === 'plan' ? t('ask.planHint') : t('chat.hint')} /> : null}
             {suggestions.length ? (
               <Box flexDirection="column" paddingX={2}>
-                {suggestions.map(name => (
-                  <Text key={name}>
-                    <Text {...(name === selected ? theme.info : theme.muted)} bold={name === selected}>{`/${name.padEnd(12)}`}</Text>
-                    <Text {...(name === selected ? theme.info : theme.faint)}>{commandDescription(t, name)}</Text>
-                  </Text>
-                ))}
+                {suggestions.map(item => {
+                  const isSelected = item === selected;
+                  return item.kind === 'command' ? (
+                    <Text key={item.value}>
+                      <Text {...(isSelected ? theme.info : theme.muted)} bold={isSelected}>{`/${item.value.padEnd(12)}`}</Text>
+                      <Text {...(isSelected ? theme.info : theme.faint)}>{commandDescription(t, item.value as Parameters<typeof commandDescription>[1])}</Text>
+                    </Text>
+                  ) : (
+                    <Text key={item.value} wrap="truncate-end" {...(isSelected ? theme.info : theme.muted)} bold={isSelected}>{`${isSelected ? '❯ ' : '  '}@${item.value}`}</Text>
+                  );
+                })}
               </Box>
             ) : null}
             <Box paddingX={2} justifyContent="space-between">
@@ -601,8 +919,10 @@ export function App({ controller, header }: { controller: ChatController; header
             {snapshot.usage ? <UsageBar usage={snapshot.usage} t={t} /> : null}
           </Box>
         </Box>
+        )}
       </Box>
     </Box>
+    </LinkContext.Provider>
     </ThemeContext.Provider>
   );
 }

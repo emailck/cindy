@@ -32,6 +32,11 @@ export interface Theme {
   warning: Tone;
   add: Tone;
   remove: Tone;
+  /** The changed words inside an added / removed row. */
+  addWord: Tone;
+  removeWord: Tone;
+  /** Local command mode (`!`): its prompt mark and input border. */
+  local: Tone;
   border: string;
   /** Border of a confirmation that needs the user's decision. */
   attention: string;
@@ -46,6 +51,8 @@ export const THEMES: Record<ThemeName, Theme> = {
     running: { color: ORANGE }, full: { color: ORANGE }, info: { color: '#60A5FA' }, code: { color: '#60A5FA' },
     success: { color: '#2AAE5B' }, error: { color: '#F87171' }, warning: { color: '#F3A115' },
     add: { color: '#7EE787', backgroundColor: '#033A16' }, remove: { color: '#FF7B72', backgroundColor: '#67060C' },
+    addWord: { color: '#FFFFFF', backgroundColor: '#1A7F37' }, removeWord: { color: '#FFFFFF', backgroundColor: '#A40E26' },
+    local: { color: '#E79FC1' },
     border: '#737373', attention: ORANGE,
     syntax: { keyword: { color: '#60A5FA' }, string: { color: '#7EE787' }, number: { color: '#F3A115' }, comment: { color: '#737373' } },
   },
@@ -54,6 +61,8 @@ export const THEMES: Record<ThemeName, Theme> = {
     running: { color: ORANGE }, full: { color: ORANGE }, info: { color: '#1D4ED8' }, code: { color: '#1D4ED8' },
     success: { color: '#177C3C' }, error: { color: '#DC2626' }, warning: { color: ORANGE },
     add: { color: '#22863A', backgroundColor: '#F0FFF4' }, remove: { color: '#B31D28', backgroundColor: '#FFEEF0' },
+    addWord: { color: '#165C2A', backgroundColor: '#ACF2BD' }, removeWord: { color: '#86181D', backgroundColor: '#FDB8C0' },
+    local: { color: '#DF83B0' },
     border: '#A3A3A3', attention: ORANGE,
     syntax: { keyword: { color: '#1D4ED8' }, string: { color: '#22863A' }, number: { color: ORANGE }, comment: { color: '#A3A3A3' } },
   },
@@ -62,10 +71,49 @@ export const THEMES: Record<ThemeName, Theme> = {
     running: { color: 'yellow' }, full: { color: 'yellow' }, info: { color: 'cyan' }, code: { color: 'cyan' },
     success: { color: 'green' }, error: { color: 'red' }, warning: { color: 'yellow' },
     add: { color: 'green' }, remove: { color: 'red' },
+    addWord: { color: 'black', backgroundColor: 'green' }, removeWord: { color: 'black', backgroundColor: 'red' },
+    local: { color: 'magenta' },
     border: 'gray', attention: 'yellow',
     syntax: { keyword: { color: 'cyan' }, string: { color: 'green' }, number: { color: 'yellow' }, comment: { dimColor: true } },
   },
 };
+
+/**
+ * Terminals that render OSC 8 hyperlinks (link text stays clickable, no URL printed after it). Others print the
+ * URL in parentheses. Detected from what the terminal itself sets; SSH sessions usually do not forward it.
+ */
+export function supportsHyperlinks(env: NodeJS.ProcessEnv, isTTY: boolean): boolean {
+  if (!isTTY || env.TERM === 'dumb' || (env.NO_COLOR !== undefined && env.NO_COLOR !== '')) return false;
+  if (env.CINDY_HYPERLINKS === '0') return false;
+  if (env.CINDY_HYPERLINKS === '1') return true;
+  if (env.WT_SESSION || env.KITTY_WINDOW_ID || env.WEZTERM_EXECUTABLE || env.GHOSTTY_RESOURCES_DIR) return true;
+  if (/^xterm-(kitty|ghostty)$/.test(env.TERM ?? '')) return true;
+  const program = env.TERM_PROGRAM ?? '';
+  if (program === 'iTerm.app' || program === 'WezTerm' || program === 'vscode' || program === 'ghostty' || program === 'Hyper') return true;
+  return Number(env.VTE_VERSION ?? 0) >= 5000;
+}
+
+/**
+ * A 256-color terminal (common over SSH, where COLORTERM is not forwarded) rounds the subtle diff backgrounds to
+ * the palette's saturated reds and greens (#870000, #005f00). These entries are the darkest (dark) and palest
+ * (light) tinted ones the palette has, so diff rows stay readable there.
+ */
+const DIFF_256: Record<'dark' | 'light', Pick<Theme, 'add' | 'remove' | 'addWord' | 'removeWord'>> = {
+  dark: {
+    add: { color: '#7EE787', backgroundColor: 'ansi256(22)' }, remove: { color: '#FF7B72', backgroundColor: 'ansi256(52)' },
+    addWord: { color: '#FFFFFF', backgroundColor: 'ansi256(28)' }, removeWord: { color: '#FFFFFF', backgroundColor: 'ansi256(88)' },
+  },
+  light: {
+    add: { color: '#22863A', backgroundColor: 'ansi256(194)' }, remove: { color: '#B31D28', backgroundColor: 'ansi256(224)' },
+    addWord: { color: '#165C2A', backgroundColor: 'ansi256(157)' }, removeWord: { color: '#86181D', backgroundColor: 'ansi256(217)' },
+  },
+};
+
+/** The theme's colors for the terminal's color depth (bits per pixel, as getColorDepth reports). */
+export function themeFor(name: ThemeName, colorDepth: number): Theme {
+  const theme = THEMES[name];
+  return name !== 'ansi' && colorDepth < 24 ? { ...theme, ...DIFF_256[name] } : theme;
+}
 
 /** Exact colors need a 256-color or truecolor terminal; otherwise the terminal's own palette reads better. */
 export function colorDepthTheme(env: NodeJS.ProcessEnv, depth: number): ThemeName | null {
