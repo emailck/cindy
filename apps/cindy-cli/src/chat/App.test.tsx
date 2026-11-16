@@ -9,11 +9,19 @@
  *   Edit 不显示改了什么、长输出不折叠、<tool_use_error> 标签原样显示、TodoWrite 显示成 JSON；输入编辑：多行输入里 ↑ 跳到历史而不是上一行、
  *   Ctrl+W 不删词、Delete 当成退格、命令列表 ↓ 后 Enter 仍执行第一项；
  *   配色：终端背景回复（OSC 11）被读成错误的深浅、读到一半就判断、OSC 11 到达后立刻交出终端使紧随的 DA1 回复漏进输入框、
- *   探测期间 Ctrl+C 被吞掉；/theme 选择不生效或不保存。
+ *   探测期间 Ctrl+C 被吞掉；/theme 选择不生效或不保存；
+ *   状态栏：占位 status 帧把上下文清零、新请求仍显示上一轮速度、上一轮测速晚到被重复计入平均、远端进程重启后费用从零算起、
+ *   宿主标记测速不可靠时仍显示本轮速度、/clear 后仍显示旧任务的用量；token 行只取一个模型、远端进程重启（新 epoch）后
+ *   token 从零算起、缓存命中率与 Desktop 口径不一致（分母漏掉缓存写入）。
+ * - 状态栏依据：用户需求（上下文占用、本轮与本任务平均 tok/s、预计费用、本任务输入／输出／缓存读写与命中率）；
+ *   UsageSnapshot 字段语义见 maker-core types/events.ts，命中率公式见 Desktop shared/turnUsageDetails.ts。
  * - tier：unit（ink-testing-library 内存终端，假会话句柄）。
+ * - 实测耗时：App.test.tsx 单独运行 3.89 秒（2026-11-16）。
  */
 import type { AgentEvent, AgentSessionHandle, InteractionDecision, InteractionResolver } from '@cindy/maker-core';
 import { render } from 'ink-testing-library';
+import { render as renderTerminal } from 'ink';
+import { PassThrough } from 'node:stream';
 import { describe, expect, it, vi } from 'vitest';
 import type { CatalogModel } from '../catalog';
 import { EventEmitter } from 'node:events';
@@ -42,6 +50,68 @@ function streamingHandle() {
 }
 
 describe('terminal UI', () => {
+  // Regression: the debug renderer above does not exercise Ink's TTY overflow fallback. A pending tool
+  // followed by a long reply used to reprint committed history on every frame (user-reported flooding).
+  // Unit: real App + Ink renderer, in-memory TTY, no process/network or persisted session.
+  it.each(['light', 'dark'] as const)('does not replay history behind a pending tool or after resize (%s)', async setting => {
+    const { handle } = streamingHandle();
+    const controller = new ChatController({ workingDir: '/project', language: 'en', permission: 'full',
+      theme: { setting, background: setting, depth: null },
+      catalog: async () => ({ models: [model('claude-a')], unavailable: [] }), openTask: async () => handle,
+      tasks: { list: async () => [], save: async () => {} } });
+    const stdout = Object.assign(new PassThrough(), { isTTY: true, columns: 163, rows: 37 });
+    const stdin = Object.assign(new PassThrough(), { isTTY: true, setRawMode() {}, ref() {}, unref() {} });
+    let output = '';
+    stdout.on('data', chunk => { output += chunk.toString(); });
+    const ui = renderTerminal(<App controller={controller} header="HISTORY_SENTINEL" />, {
+      stdout: stdout as unknown as NodeJS.WriteStream, stdin: stdin as unknown as NodeJS.ReadStream,
+      stderr: new PassThrough() as unknown as NodeJS.WriteStream,
+      interactive: true, incrementalRendering: true, patchConsole: false, exitOnCtrlC: false, maxFps: 1000,
+    });
+    try {
+      await controller.init();
+      await controller.submit('go');
+      await tick();
+      controller.apply({ type: 'tool_use', data: { toolUseId: 'slow', toolName: 'Bash', input: { command: 'slow-command' } } });
+      controller.apply({ type: 'text', data: { text: Array.from({ length: 45 }, (_, i) => `pending-row-${i}`).join('\n'), isFinal: true } });
+      await tick();
+      expect(output.match(/HISTORY_SENTINEL/g)).toHaveLength(1);
+      controller.apply({ type: 'thinking', data: { stage: 'start' } });
+      await tick();
+      expect(output.match(/HISTORY_SENTINEL/g)).toHaveLength(1);
+      expect(output).not.toContain('\x1b[2J');
+      stdout.columns = 40;
+      stdout.rows = 12;
+      stdout.emit('resize');
+      await tick();
+      // Ink itself redraws history on a width change. Subsequent frames must settle, not keep replaying it.
+      output = '';
+      stdin.write('DRAFT_SENTINEL');
+      controller.apply({ type: 'thinking', data: { stage: 'final' } });
+      await tick();
+      controller.apply({ type: 'thinking', data: { stage: 'start' } });
+      await tick();
+      expect(output).not.toContain('HISTORY_SENTINEL');
+      expect(output).toContain('DRAFT_SENTINEL');
+      expect(output).not.toContain('\x1b[2J');
+      // Finishing the pending tool must still print the full reply and late result into scrollback.
+      output = '';
+      controller.apply({ type: 'tool_result_full', data: { toolUseId: 'slow', fullText: 'LATE_RESULT' } });
+      controller.apply({ type: 'done', data: {} });
+      await tick();
+      expect(output).toContain('pending-row-0');
+      expect(output).toContain('pending-row-44');
+      expect(output.match(/LATE_RESULT/g)).toHaveLength(1);
+      expect(output).not.toContain('HISTORY_SENTINEL');
+    } finally {
+      ui.unmount();
+      ui.cleanup();
+      await controller.exit();
+      stdin.destroy();
+      stdout.destroy();
+    }
+  });
+
   it('completes slash commands, picks a model, answers a confirmation by number and interrupts with Esc', async () => {
     let resolver: InteractionResolver | undefined;
     const queue: AgentEvent[] = [];
@@ -206,6 +276,58 @@ describe('terminal UI', () => {
       'Updated src/a.ts (+1 −1)', '- old', '+ new', 'n4', '… +6 lines', 'boom', '☒ first step', '◼ second step', '☐ third step']) expect(frame).toContain(text);
     expect(frame.indexOf('- old')).toBeLessThan(frame.indexOf('+ new'));
     for (const text of ['```', '# Done', 'three', 'n5', '<tool_use_error>', 'content']) expect(frame).not.toContain(text);
+    ui.unmount();
+  });
+
+  it('shows context, this turn and average tok/s, and the reported cost in the status bar', async () => {
+    const { handle, push } = streamingHandle();
+    const controller = new ChatController({ workingDir: '/project', language: 'en', permission: 'full',
+      catalog: async () => ({ models: [model('claude-a')], unavailable: [] }), openTask: async () => handle,
+      tasks: { list: async () => [], save: async () => {} } });
+    const ui = render(<App controller={controller} header="Cindy" />);
+    const speed = (tokens: number, elapsedMs: number, rate: number, streaming: boolean) => ({ tokens, elapsedMs, rate, average: (tokens * 1000) / elapsedMs, streaming });
+    const status = (data: Record<string, unknown>) => push({ type: 'status', data: { isRunning: true, ...data } } as AgentEvent);
+    await controller.init();
+    await controller.submit('one');
+    await tick();
+    // Request receipts: cumulative per Agent process (epoch), one row per model; the task row sums the models.
+    const receipt = (epoch: string, ...models: Array<[string, number, number, number, number]>) => ({ epoch,
+      models: models.map(([name, inputTokens, outputTokens, cacheReadTokens, cacheCreateTokens]) => ({ model: name, inputTokens, outputTokens, cacheReadTokens, cacheCreateTokens })) });
+    status({ contextTokens: 50_000, contextWindow: 200_000, costUsd: 0.2, tokenSpeed: speed(300, 10_000, 42, true),
+      requestUsage: receipt('p1', ['a', 1000, 300, 6000, 1000], ['b', 1000, 200, 0, 1000]) });
+    await tick();
+    expect(ui.lastFrame()).toContain('Context 25% (50k/200k) · This turn 42 tok/s · Avg 30 tok/s · This task ≈ $0.200');
+    // Hit rate = cache read / (input + cache read + cache write), Desktop's formula: 6k / 10k.
+    expect(ui.lastFrame()).toContain('Input 2k · Output 500 · Cache read 6k · Cache write 2k · Cache hit rate 60%');
+    // Turn end: this turn shows its own average. A placeholder frame with zeros keeps the last known figures.
+    status({ contextTokens: 170_000, contextWindow: 200_000, costUsd: 0.2, tokenSpeed: speed(300, 10_000, 42, false) });
+    status({ isRunning: false, contextTokens: 0, contextWindow: 0, costUsd: 0 });
+    push({ type: 'done', data: {} });
+    await tick();
+    expect(ui.lastFrame()).toContain('Context 85% (170k/200k) · This turn 30 tok/s · Avg 30 tok/s');
+    expect(ui.lastFrame()).toContain('Input 2k · Output 500 · Cache read 6k');
+    // Next request: no stale "this turn"; a late repeat of the last turn's meter is not counted twice.
+    await controller.submit('two');
+    await tick();
+    status({ tokenSpeed: speed(300, 10_000, 42, false) });
+    await tick();
+    expect(ui.lastFrame()).not.toContain('This turn');
+    expect(ui.lastFrame()).toContain('Avg 30 tok/s');
+    // The remote Agent process restarted: its cost starts over, the task total keeps what was spent before.
+    // Its receipts start over too (new epoch): tokens keep counting on top of the earlier process's.
+    status({ costUsd: 0.05, tokenSpeed: speed(100, 10_000, 10, true), requestUsage: receipt('p2', ['a', 1000, 500, 1000, 0]) });
+    await tick();
+    expect(ui.lastFrame()).toContain('This turn 10 tok/s · Avg 20 tok/s · This task ≈ $0.250');
+    expect(ui.lastFrame()).toContain('Input 3k · Output 1k · Cache read 7k · Cache write 2k · Cache hit rate 58.3%');
+    status({ generationReliable: false });
+    await tick();
+    expect(ui.lastFrame()).not.toContain('This turn');
+    push({ type: 'done', data: {} });
+    await tick();
+    await controller.submit('/clear');
+    await tick();
+    expect(ui.lastFrame()).not.toContain('Context');
+    expect(ui.lastFrame()).not.toContain('Input');
     ui.unmount();
   });
 

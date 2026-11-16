@@ -4,7 +4,7 @@
  */
 import { createContext, useContext, useEffect, useRef, useState, useSyncExternalStore, type ReactNode } from 'react';
 import { Box, Static, Text, useApp, useInput, usePaste, useWindowSize } from 'ink';
-import { commandDescription, commandSuggestions, type ChatController, type Line, type Prompt } from './controller';
+import { cacheHitRate, commandDescription, commandSuggestions, type ChatController, type Line, type Prompt, type UsageView } from './controller';
 import type { Translate } from '../i18n';
 import { parseMarkdown, type MdLine, type Span } from './markdown';
 import { countLines, DETAIL_ROWS, OUTPUT_ROWS, toolDisplayName } from './tools';
@@ -49,8 +49,8 @@ export function tailRows(text: string, rows: number, columns: number): string {
   return kept.join('\n');
 }
 
-/** Rows kept free below the live text for the status, input box, queue preview and footer. */
-const RESERVED_ROWS = 12;
+/** Rows kept free below the live text for the status, input box, queue preview, footer and the two usage rows. */
+const RESERVED_ROWS = 14;
 
 const WINDOWS = process.platform === 'win32';
 /** Marks the start of a reply or tool call; the Windows console font often lacks ⏺. */
@@ -79,6 +79,76 @@ function Status({ text, keys, startedAt }: { text: string; keys?: string; starte
       {extra.length ? <Text {...theme.faint}>{` (${extra.join(' · ')})`}</Text> : null}
     </Box>
   );
+}
+
+function compactTokens(tokens: number): string {
+  if (tokens >= 1_000_000) return `${(tokens / 1_000_000).toFixed(1).replace(/\.0$/, '')}M`;
+  if (tokens >= 1_000) return `${(tokens / 1_000).toFixed(1).replace(/\.0$/, '')}k`;
+  return String(Math.round(tokens));
+}
+
+/** Desktop rounding: whole numbers from 100 tok/s, one decimal below. */
+function rateText(rate: number): string {
+  if (rate > 0 && rate < 0.1) return '<0.1';
+  return rate >= 100 ? rate.toFixed(0) : rate.toFixed(1).replace(/\.0$/, '');
+}
+
+function costText(cost: number): string {
+  return cost < 0.001 ? '<0.001' : cost.toFixed(cost < 1 ? 3 : 2);
+}
+
+/** Context nearly full: the user may want /compact soon. */
+const CONTEXT_WARN_PERCENT = 80;
+
+/**
+ * Status bar under the footer: context use, this turn's and the task's average output speed, and the cost the Agent
+ * reports. Each part appears only once the Agent reports it.
+ */
+function UsageBar({ usage, t }: { usage: UsageView; t: Translate }) {
+  const theme = useTheme();
+  const percent = usage.contextWindow ? Math.round((usage.contextTokens / usage.contextWindow) * 100) : null;
+  const parts: Array<{ text: string; warn?: boolean }> = [];
+  if (usage.contextTokens) {
+    parts.push(percent !== null
+      ? { text: t('usage.context', { percent, used: compactTokens(usage.contextTokens), max: compactTokens(usage.contextWindow) }), warn: percent >= CONTEXT_WARN_PERCENT }
+      : { text: t('usage.contextTokens', { used: compactTokens(usage.contextTokens) }) });
+  }
+  if (usage.turnRate !== null) parts.push({ text: t('usage.turnRate', { rate: rateText(usage.turnRate) }) });
+  if (usage.averageRate !== null) parts.push({ text: t('usage.averageRate', { rate: rateText(usage.averageRate) }) });
+  if (usage.costUsd > 0) parts.push({ text: t('usage.cost', { cost: costText(usage.costUsd) }) });
+  const tokens = usage.tokens;
+  const hit = tokens ? cacheHitRate(tokens) : null;
+  const tokenParts = tokens ? [
+    t('usage.input', { tokens: compactTokens(tokens.input) }),
+    t('usage.output', { tokens: compactTokens(tokens.output) }),
+    t('usage.cacheRead', { tokens: compactTokens(tokens.cacheRead) }),
+    t('usage.cacheWrite', { tokens: compactTokens(tokens.cacheWrite) }),
+    ...(hit !== null ? [t('usage.cacheHit', { percent: percentText(hit) })] : []),
+  ].map(text => ({ text })) : [];
+  if (!parts.length && !tokenParts.length) return null;
+  const row = (items: Array<{ text: string; warn?: boolean }>) => (
+    <Text wrap="truncate-end">
+      {items.map((part, index) => (
+        <Text key={index}>
+          {index ? <Text {...theme.faint}>{' · '}</Text> : null}
+          <Text {...(part.warn ? theme.warning : theme.faint)}>{part.text}</Text>
+        </Text>
+      ))}
+    </Text>
+  );
+  return (
+    <Box paddingX={2} flexDirection="column">
+      {parts.length ? row(parts) : null}
+      {/* This task's tokens: input excludes cache; hit rate uses Desktop's formula. */}
+      {tokenParts.length ? row(tokenParts) : null}
+    </Box>
+  );
+}
+
+/** Desktop rounding: a whole percent when within 0.05 of it, otherwise one decimal. */
+function percentText(rate: number): string {
+  const percent = Math.min(100, Math.max(0, rate * 100));
+  return Math.abs(percent - Math.round(percent)) < 0.05 ? `${Math.round(percent)}%` : `${percent.toFixed(1)}%`;
 }
 
 /** A running tool call's dot blinks; finished and committed ones stay still. */
@@ -485,41 +555,51 @@ export function App({ controller, header }: { controller: ChatController; header
         {/* <Static> lays lines out shrink-to-fit; the terminal width lets diff backgrounds span the row. */}
         {line => <Box key={line.id} flexDirection="column" width={windowSize.columns}><TranscriptLine line={line} t={t} /></Box>}
       </Static>
-      {pending.map(line => <TranscriptLine key={line.id} line={line} t={t} live />)}
-      {snapshot.live ? (
-        <Box marginTop={snapshot.liveCont ? 0 : 1}>
-          <Gutter mark={snapshot.liveCont ? '' : DOT}>
-            <Markdown text={tailRows(snapshot.live, windowSize.rows - RESERVED_ROWS - pendingRows, windowSize.columns - 2)} code={snapshot.liveCode} />
-          </Gutter>
-        </Box>
-      ) : null}
-      {status ? <Status text={status} {...(statusKeys ? { keys: statusKeys } : {})} startedAt={snapshot.phase === 'running' ? snapshot.turnStartedAt : null} /> : null}
-      <Box marginTop={1} flexDirection="column">
-        {prompt ? <PromptView prompt={prompt} t={t} hint={prompt.kind === 'plan' ? t('ask.planTitle') : t('picker.hint')} /> : null}
-        {queue.length ? (
-          <Box flexDirection="column" paddingX={2}>
-            <Text {...(snapshot.queuePaused ? theme.warning : theme.muted)}>
-              {snapshot.queuePaused ? t('chat.queuePaused', { count: queue.length }) : t('chat.queued', { count: queue.length })}
-            </Text>
-            {queue.slice(0, 3).map((item, index) => <Text key={item.id} {...theme.faint}>{`  ${index + 1}. ${item.text.split('\n')[0]!.slice(0, 100)}`}</Text>)}
-            {queue.length > 3 ? <Text {...theme.faint}>{`  ${t('chat.queueMore', { count: queue.length - 3 })}`}</Text> : null}
-            <Text {...theme.faint}>{`  ${t('chat.queueHint')}`}</Text>
+      {/* Bound the entire live area, including pending tools, wrapped text and the composer. Bounding
+          only snapshot.live lets a pending tool hold arbitrarily many later lines here; Ink then clears
+          the terminal and replays all static history on every spinner tick. Keep the bottom (input)
+          visible and leave one spare terminal row, including on Windows. Clipped history is still
+          committed in full above when the pending tools finish. */}
+      <Box flexDirection="column" maxHeight={Math.max(1, windowSize.rows - 1)} overflowY="hidden" justifyContent="flex-end">
+        <Box flexDirection="column" flexShrink={0}>
+          {pending.map(line => <TranscriptLine key={line.id} line={line} t={t} live />)}
+          {snapshot.live ? (
+            <Box marginTop={snapshot.liveCont ? 0 : 1}>
+              <Gutter mark={snapshot.liveCont ? '' : DOT}>
+                <Markdown text={tailRows(snapshot.live, windowSize.rows - RESERVED_ROWS - pendingRows, windowSize.columns - 2)} code={snapshot.liveCode} />
+              </Gutter>
+            </Box>
+          ) : null}
+          {status ? <Status text={status} {...(statusKeys ? { keys: statusKeys } : {})} startedAt={snapshot.phase === 'running' ? snapshot.turnStartedAt : null} /> : null}
+          <Box marginTop={1} flexDirection="column">
+            {prompt ? <PromptView prompt={prompt} t={t} hint={prompt.kind === 'plan' ? t('ask.planTitle') : t('picker.hint')} /> : null}
+            {queue.length ? (
+              <Box flexDirection="column" paddingX={2}>
+                <Text {...(snapshot.queuePaused ? theme.warning : theme.muted)}>
+                  {snapshot.queuePaused ? t('chat.queuePaused', { count: queue.length }) : t('chat.queued', { count: queue.length })}
+                </Text>
+                {queue.slice(0, 3).map((item, index) => <Text key={item.id} {...theme.faint}>{`  ${index + 1}. ${item.text.split('\n')[0]!.slice(0, 100)}`}</Text>)}
+                {queue.length > 3 ? <Text {...theme.faint}>{`  ${t('chat.queueMore', { count: queue.length - 3 })}`}</Text> : null}
+                <Text {...theme.faint}>{`  ${t('chat.queueHint')}`}</Text>
+              </Box>
+            ) : null}
+            {typing ? <InputBox editor={editor} placeholder={prompt?.kind === 'question' ? t(prompt.question.multiSelect ? 'ask.multiHint' : 'ask.questionHint') : prompt?.kind === 'plan' ? t('ask.planHint') : t('chat.hint')} /> : null}
+            {suggestions.length ? (
+              <Box flexDirection="column" paddingX={2}>
+                {suggestions.map(name => (
+                  <Text key={name}>
+                    <Text {...(name === selected ? theme.info : theme.muted)} bold={name === selected}>{`/${name.padEnd(12)}`}</Text>
+                    <Text {...(name === selected ? theme.info : theme.faint)}>{commandDescription(t, name)}</Text>
+                  </Text>
+                ))}
+              </Box>
+            ) : null}
+            <Box paddingX={2} justifyContent="space-between">
+              {mode}
+              <Text {...theme.faint}>{model ? `${model.modelName}${snapshot.effort ? ` (${snapshot.effort})` : ''} · ${model.targetLabel}` : t('chat.noModel')}</Text>
+            </Box>
+            {snapshot.usage ? <UsageBar usage={snapshot.usage} t={t} /> : null}
           </Box>
-        ) : null}
-        {typing ? <InputBox editor={editor} placeholder={prompt?.kind === 'question' ? t(prompt.question.multiSelect ? 'ask.multiHint' : 'ask.questionHint') : prompt?.kind === 'plan' ? t('ask.planHint') : t('chat.hint')} /> : null}
-        {suggestions.length ? (
-          <Box flexDirection="column" paddingX={2}>
-            {suggestions.map(name => (
-              <Text key={name}>
-                <Text {...(name === selected ? theme.info : theme.muted)} bold={name === selected}>{`/${name.padEnd(12)}`}</Text>
-                <Text {...(name === selected ? theme.info : theme.faint)}>{commandDescription(t, name)}</Text>
-              </Text>
-            ))}
-          </Box>
-        ) : null}
-        <Box paddingX={2} justifyContent="space-between">
-          {mode}
-          <Text {...theme.faint}>{model ? `${model.modelName}${snapshot.effort ? ` (${snapshot.effort})` : ''} · ${model.targetLabel}` : t('chat.noModel')}</Text>
         </Box>
       </Box>
     </Box>

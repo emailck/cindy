@@ -6,6 +6,7 @@
  */
 import { randomUUID } from 'node:crypto';
 import type { AgentEvent, AgentSessionHandle, AskUserQuestionItem, Effort, InteractionDecision, InteractionRequest } from '@cindy/maker-core';
+import { readTokenSpeedSnapshot } from '@cindy/maker-shared/usage-format';
 import type { CatalogModel, CatalogResult, CatalogSource } from '../catalog';
 import { createTranslator, type Language, type MessageKey, type Translate } from '../i18n';
 import type { ModelChoice, PermissionChoice } from '../profile';
@@ -90,7 +91,45 @@ export interface ChatSnapshot {
   queuePaused: boolean;
   exitArmed: boolean;
   exited: boolean;
+  /** Status bar figures for the open task; null until the Agent reports usage. */
+  usage: UsageView | null;
 }
+
+/** Usage shown in the status bar, from the Agent's status events (UsageSnapshot). */
+export interface UsageView {
+  /** Context taken by the last model request. */
+  contextTokens: number;
+  /** 0 when the Agent does not report its context window. */
+  contextWindow: number;
+  /** Output tok/s of this turn: live while streaming, the turn's average once it ended. Null when not measured reliably. */
+  turnRate: number | null;
+  /** Output tokens over generation time (tool waits excluded) across this task's turns. */
+  averageRate: number | null;
+  /** Cost the Agent reports for this task in USD; 0 when it reports none (Codex, subscriptions). */
+  costUsd: number;
+  /** Tokens this task sent and received, summed over models; null until the Agent reports request receipts. */
+  tokens: TokenTotals | null;
+}
+
+/** Input excludes cache reads and writes (every Agent reports it uncached), as in Desktop's usage figures. */
+export interface TokenTotals { input: number; output: number; cacheRead: number; cacheWrite: number }
+
+const NO_TOKENS: TokenTotals = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 };
+const TOKEN_KEYS = ['input', 'output', 'cacheRead', 'cacheWrite'] as const;
+
+function sumTokens(parts: TokenTotals[]): TokenTotals {
+  const total = { ...NO_TOKENS };
+  for (const part of parts) for (const key of TOKEN_KEYS) total[key] += part[key];
+  return total;
+}
+
+/** Desktop's formula: cache read / (input + cache read + cache write); null before any input. */
+export function cacheHitRate(tokens: TokenTotals): number | null {
+  const denominator = tokens.input + tokens.cacheRead + tokens.cacheWrite;
+  return denominator > 0 ? tokens.cacheRead / denominator : null;
+}
+
+interface SpeedSample { tokens: number; ms: number }
 
 export interface QueuedMessage { id: string; text: string }
 
@@ -191,13 +230,27 @@ export class ChatController {
   private flushed = 0;
   /** A code fence is open at the end of the committed part of the reply. */
   private fence = false;
+  /** Generation of finished turns, the running turn's latest sample, and the turn just folded (a late repeat of it is ignored). */
+  private speedDone: SpeedSample = { tokens: 0, ms: 0 };
+  private speedTurn: SpeedSample | null = null;
+  private speedFolded: SpeedSample | null = null;
+  /** Reported cost restarts when the remote Agent process does; earlier totals are kept in costBase. */
+  private costBase = 0;
+  private costLast = 0;
+  /**
+   * Request receipts are cumulative per Agent process (epoch) and per model. A new epoch starts from zero: the
+   * finished epochs' totals stay in tokenBase.
+   */
+  private tokenEpoch: string | null = null;
+  private tokenModels = new Map<string, TokenTotals>();
+  private tokenBase: TokenTotals = NO_TOKENS;
 
   constructor(private readonly deps: ChatDeps) {
     this.t = createTranslator(deps.language);
     this.snapshot = { lines: [], live: '', liveCont: false, liveCode: false, phase: 'idle', thinking: false, turnStartedAt: null, prompt: null, model: null,
       permission: deps.permission, effort: null, language: deps.language, queue: [],
       theme: resolveTheme(deps.theme?.setting ?? 'auto', { background: deps.theme?.background ?? null, depth: deps.theme?.depth ?? null }),
-      themeSetting: deps.theme?.setting ?? 'auto', queuePaused: false, exitArmed: false, exited: false };
+      themeSetting: deps.theme?.setting ?? 'auto', queuePaused: false, exitArmed: false, exited: false, usage: null };
   }
 
   subscribe = (listener: () => void) => { this.listeners.add(listener); return () => { this.listeners.delete(listener); }; };
@@ -316,7 +369,10 @@ export class ChatController {
     if (!this.title) this.title = taskTitle(text);
     const handle = await this.ensureHandle(model);
     if (!handle) return;
-    this.update({ phase: 'running', thinking: false, turnStartedAt: (this.deps.now ?? Date.now)() });
+    // A new request: the last turn counts toward the average, its own speed is no longer "this turn".
+    this.foldSpeed();
+    const usage = this.snapshot.usage;
+    this.update({ phase: 'running', thinking: false, turnStartedAt: (this.deps.now ?? Date.now)(), ...(usage ? { usage: { ...usage, turnRate: null } } : {}) });
     try { await handle.send({ type: 'user', content: text }); }
     catch (error) {
       this.notice('chat.error', { message: errorText(error) }, 'error');
@@ -439,9 +495,91 @@ export class ChatController {
         if (terminal) this.finishTurn('error');
         return;
       }
+      case 'status': this.applyUsage(data); return;
       case 'done': this.commitLive(); this.finishTurn(); void this.record(); return;
       default: return;
     }
+  }
+
+  /**
+   * Status events carry the UsageSnapshot fields inline. Placeholder frames omit or zero some of them; those keep
+   * the last known value instead of flashing 0. Speed comes from the host's meter (tokenSpeed), or from turn output
+   * tokens over generation time; neither is used when the host marks generation timing unreliable.
+   */
+  private applyUsage(data: Record<string, unknown>) {
+    const num = (value: unknown) => (typeof value === 'number' && Number.isFinite(value) && value > 0 ? value : 0);
+    const previous = this.snapshot.usage;
+    const cost = num(data.costUsd);
+    if (cost) {
+      if (cost < this.costLast) this.costBase += this.costLast;
+      this.costLast = cost;
+    }
+    let turnRate = previous?.turnRate ?? null;
+    const reliable = data.generationReliable !== false;
+    const speed = reliable ? readTokenSpeedSnapshot(data.tokenSpeed) : undefined;
+    const output = num(data.outputTokens);
+    const duration = num(data.generationDurationMs);
+    const sample: (SpeedSample & { rate: number }) | null = speed && speed.elapsedMs > 0
+      ? { tokens: speed.tokens, ms: speed.elapsedMs, rate: speed.streaming ? speed.rate : speed.average }
+      : reliable && output && duration ? { tokens: output, ms: duration, rate: (output * 1000) / duration } : null;
+    if (data.generationReliable === false) turnRate = null;
+    else if (sample && !(this.speedFolded && this.speedFolded.tokens === sample.tokens && this.speedFolded.ms === sample.ms)) {
+      // The meter restarted inside the turn (a continuation): count what it had measured so far.
+      if (this.speedTurn && sample.ms < this.speedTurn.ms) this.foldSpeed();
+      this.speedTurn = { tokens: sample.tokens, ms: sample.ms };
+      this.speedFolded = null;
+      turnRate = sample.tokens > 0 ? sample.rate : null;
+    }
+    const tokens = this.speedDone.tokens + (this.speedTurn?.tokens ?? 0);
+    const ms = this.speedDone.ms + (this.speedTurn?.ms ?? 0);
+    const usage: UsageView = {
+      contextTokens: num(data.contextTokens) || previous?.contextTokens || 0,
+      contextWindow: num(data.contextWindow) || previous?.contextWindow || 0,
+      turnRate,
+      averageRate: tokens > 0 && ms > 0 ? (tokens * 1000) / ms : null,
+      costUsd: this.costBase + this.costLast,
+      tokens: this.readTokens(data.requestUsage, previous?.tokens ?? null),
+    };
+    const same = previous && (Object.keys(usage) as Array<keyof UsageView>).every(key => usage[key] === previous[key]);
+    if (!same) this.update({ usage });
+  }
+
+  /**
+   * Task token totals from `requestUsage` ({ epoch, models: [...] }, cumulative per Agent process). Frames without
+   * it keep the last totals; a model's count never goes down within an epoch. Returns `previous` when nothing
+   * changed, so an unchanged frame does not re-render.
+   */
+  private readTokens(value: unknown, previous: TokenTotals | null): TokenTotals | null {
+    const receipt = value && typeof value === 'object' ? value as { epoch?: unknown; models?: unknown } : null;
+    if (!receipt || typeof receipt.epoch !== 'string' || !Array.isArray(receipt.models)) return previous;
+    const count = (raw: unknown) => (typeof raw === 'number' && Number.isFinite(raw) && raw > 0 ? raw : 0);
+    if (receipt.epoch !== this.tokenEpoch) {
+      this.tokenBase = sumTokens([this.tokenBase, ...this.tokenModels.values()]);
+      this.tokenModels = new Map();
+      this.tokenEpoch = receipt.epoch;
+    }
+    for (const raw of receipt.models) {
+      if (!raw || typeof raw !== 'object') continue;
+      const row = raw as Record<string, unknown>;
+      const model = typeof row.model === 'string' && row.model ? row.model : '';
+      const last = this.tokenModels.get(model) ?? NO_TOKENS;
+      this.tokenModels.set(model, {
+        input: Math.max(last.input, count(row.inputTokens)),
+        output: Math.max(last.output, count(row.outputTokens)),
+        cacheRead: Math.max(last.cacheRead, count(row.cacheReadTokens)),
+        cacheWrite: Math.max(last.cacheWrite, count(row.cacheCreateTokens)),
+      });
+    }
+    const next = sumTokens([this.tokenBase, ...this.tokenModels.values()]);
+    if (TOKEN_KEYS.every(key => !next[key])) return previous;
+    return previous && TOKEN_KEYS.every(key => next[key] === previous[key]) ? previous : next;
+  }
+
+  private foldSpeed() {
+    if (!this.speedTurn) return;
+    this.speedDone = { tokens: this.speedDone.tokens + this.speedTurn.tokens, ms: this.speedDone.ms + this.speedTurn.ms };
+    this.speedFolded = this.speedTurn;
+    this.speedTurn = null;
   }
 
   private finishTurn(outcome: 'done' | 'interrupted' | 'error' | 'closed' = 'done') {
@@ -832,7 +970,15 @@ export class ChatController {
     this.streamed = '';
     this.flushed = 0;
     this.fence = false;
-    this.update({ live: '', liveCont: false, liveCode: false, phase: 'idle', thinking: false, turnStartedAt: null });
+    this.speedDone = { tokens: 0, ms: 0 };
+    this.speedTurn = null;
+    this.speedFolded = null;
+    this.costBase = 0;
+    this.costLast = 0;
+    this.tokenEpoch = null;
+    this.tokenModels = new Map();
+    this.tokenBase = NO_TOKENS;
+    this.update({ live: '', liveCont: false, liveCode: false, phase: 'idle', thinking: false, turnStartedAt: null, usage: null });
   }
 
   private async resumeCommand(): Promise<void> {
