@@ -139,7 +139,9 @@ Linux 上的真实账号远端任务、macOS、ARM64 与 musl 尚未实测。
 
 - 数据目录默认：Windows `%LOCALAPPDATA%\Cindy CLI`，macOS `~/Library/Application Support/Cindy CLI`，
   Linux `$XDG_STATE_HOME/cindy-cli`（缺省 `~/.local/state/cindy-cli`）；可用 `--data-dir` 或 `CINDY_CLI_DATA_DIR`
-  覆盖，必须在 Git 工作区外。同一数据目录同时只能有一个 `cindy` 进程。
+  覆盖，必须在 Git 工作区外。同一数据目录同时只能有一个 `cindy` 进程（`profile.lock`，防止两个进程同时轮换登录凭证）；
+  上一个进程异常退出（崩溃、`kill -9`、断电）留下的锁，在锁里记录的进程已不存在时会被自动接管。关闭终端或 SSH 断线时进程会正常收尾并删除锁。
+  确实被占用时会提示占用进程的 PID。要同时开多个，用不同的数据目录（各自登录一次，在对方看来是两台设备）。
 - Linux 凭证默认保存在用户数据目录的 `credentials/`；macOS / Windows 默认使用系统钥匙串。
   `CINDY_CLI_CREDENTIAL_STORE=keyring|file` 可显式覆盖（file 仅支持 POSIX）；切换不迁移或删除旧凭证。
   普通配置与凭证分开保存，`config show` 不会显示凭证。

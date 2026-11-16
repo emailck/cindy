@@ -4,9 +4,12 @@
  * - Bug／规则依据：docs/cindy-cli-client-plan.md（用户裁决：默认 full、中英切换）；credentials-and-local-storage
  *   （数据目录不得在 Git 工作区内）；同一数据目录只能有一个进程持有登录（刷新令牌轮换竞态）。
  * - 现有覆盖缺口：新程序，无既有覆盖；cindy-host 的同类测试不经过本入口。
- * - 最小失败输入：语言优先级颠倒、坏设置文件被覆盖、Git 内数据目录被接受、并发登录不报 PROFILE_BUSY。
+ * - 最小失败输入：语言优先级颠倒、坏设置文件被覆盖、Git 内数据目录被接受、并发登录不报 PROFILE_BUSY；
+ *   进程已不在的 profile.lock 挡住下一次启动、关掉终端（SIGHUP）或界面接管前按 Ctrl+C 时进程被直接杀掉而锁留下
+ *   （2026-11-16 用户反馈：进程退出后锁还在）。
  * - tier：unit（临时目录 + 注入依赖，不访问网络与系统钥匙串）。
  */
+import { EventEmitter } from 'node:events';
 import { mkdtemp, readFile, readdir, stat, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
@@ -105,10 +108,30 @@ describe('cindy command entry', () => {
     expect(seen).toEqual({ request: { prompt: 'hello' }, overrides: { model: 'claude-x', permissionMode: 'plan', language: undefined, continue: true } });
 
     expect(await run(['login'], { login: async () => 0 })).toBe(1);
-    expect(errors.pop()).toMatch(/^PROFILE_BUSY: /);
+    expect(errors.pop()).toMatch(new RegExp(`^PROFILE_BUSY: .*\\(PID ${process.pid}\\)`));
     release();
     expect(await first).toBe(0);
     expect(await run(['status', '--model', 'x'])).toBe(1);
     expect(await run(['status', '-c'])).toBe(1);
+  });
+
+  it('takes over a lock whose process is gone, and releases its own lock when the terminal closes', async () => {
+    const lock = path.join(dataDir, 'profile.lock');
+    await writeFile(lock, '2000000000\n'); // no process has this id: left by a crash or kill -9
+    const terminal = new EventEmitter();
+    let started!: () => void;
+    const running = new Promise<void>(resolve => { started = resolve; });
+    const chat: CliDependencies['chat'] = async (_request, _context, signal) => {
+      started();
+      await new Promise(resolve => signal.addEventListener('abort', resolve, { once: true }));
+      return 0;
+    };
+    const session = runCli(['--data-dir', dataDir], { env, signals: terminal, output: text => lines.push(text), error: text => errors.push(text), chat });
+    await running;
+    expect((await readFile(lock, 'utf8')).trim()).toBe(String(process.pid));
+    terminal.emit('SIGHUP'); // terminal window closed or SSH dropped: end normally instead of being killed
+    expect(await session).toBe(0);
+    await expect(stat(lock)).rejects.toMatchObject({ code: 'ENOENT' });
+    expect(terminal.listenerCount('SIGHUP') + terminal.listenerCount('SIGINT')).toBe(0);
   });
 });

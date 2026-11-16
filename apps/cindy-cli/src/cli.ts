@@ -94,8 +94,8 @@ export async function runCli(argv: readonly string[], dependencies: CliDependenc
       overrides: { model: options.get('--model'), permissionMode: permissionFlag as PermissionChoice | undefined, language: langFlag as Language | undefined, ...(flags.has('--continue') ? { continue: true } : {}) },
     };
     if (['chat', 'print', 'login', 'logout', 'received', 'models'].includes(command)) dependencies.beforeCommand?.();
-    const locked = <T>(action: (signal: AbortSignal) => Promise<T>, interruptOnSigint = true) =>
-      withProfileLock(dataDir, action, { signals: dependencies.signals, interruptOnSigint });
+    const locked = <T>(action: (signal: AbortSignal) => Promise<T>) =>
+      withProfileLock(dataDir, action, { ...(dependencies.signals ? { signals: dependencies.signals } : {}) });
 
     switch (command) {
       case 'config': {
@@ -140,8 +140,8 @@ export async function runCli(argv: readonly string[], dependencies: CliDependenc
       default: {
         if (positionals.length) throw new CliError('INVALID_ARGUMENT', 'error.unknownCommand');
         if (!dependencies.chat) throw new CliError('NOT_IMPLEMENTED', 'error.notImplemented');
-        // The interactive UI owns Ctrl+C (interrupt turn, then exit); print mode cancels on Ctrl+C.
-        return await locked(signal => dependencies.chat!({ prompt }, context, signal), command === 'print');
+        // Once the interactive UI owns the terminal, Ctrl+C is a key there (interrupt turn, then exit), not SIGINT.
+        return await locked(signal => dependencies.chat!({ prompt }, context, signal));
       }
     }
   } catch (cause) {

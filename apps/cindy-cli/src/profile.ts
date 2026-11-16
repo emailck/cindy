@@ -1,5 +1,5 @@
 import { randomUUID } from 'node:crypto';
-import { lstat, mkdir, open, readFile, rename, unlink } from 'node:fs/promises';
+import { link, lstat, mkdir, open, readFile, rename, stat, unlink, type FileHandle } from 'node:fs/promises';
 import { homedir, hostname } from 'node:os';
 import path from 'node:path';
 // Fork-owned CLI code is shared with the provider host by direct import (same data-directory rules).
@@ -137,35 +137,91 @@ export function parseConfigValue(key: string, value: string): Partial<CliConfig>
 }
 
 export interface SignalSource {
-  on(event: 'SIGINT' | 'SIGTERM', listener: () => void): unknown;
-  removeListener(event: 'SIGINT' | 'SIGTERM', listener: () => void): unknown;
+  on(event: 'SIGINT' | 'SIGTERM' | 'SIGHUP', listener: () => void): unknown;
+  removeListener(event: 'SIGINT' | 'SIGTERM' | 'SIGHUP', listener: () => void): unknown;
+}
+
+/** Whether a process with this id exists. EPERM: it exists but belongs to another user. */
+function processAlive(pid: number): boolean {
+  try { process.kill(pid, 0); return true; }
+  catch (error) { return (error as NodeJS.ErrnoException).code === 'EPERM'; }
+}
+
+/** A lock without a process id this old was left between creating the file and writing the id. */
+const UNWRITTEN_LOCK_MS = 30_000;
+
+/**
+ * profile.lock left by a process that no longer runs (crash, kill -9, power loss): move it aside, and remove it
+ * only if it is still the same stale lock, so a lock another starting process just created is put back.
+ * Returns whether the caller may try to create the lock again; a live holder's id otherwise.
+ */
+async function clearStaleLock(file: string): Promise<{ cleared: true } | { cleared: false; pid?: number }> {
+  let content: string;
+  try { content = await readFile(file, 'utf8'); }
+  catch (error) { return (error as NodeJS.ErrnoException).code === 'ENOENT' ? { cleared: true } : { cleared: false }; }
+  const pid = /^\s*(\d+)\s*$/.test(content) ? Number(content.trim()) : null;
+  if (pid !== null) {
+    // The same process id as ours is another command in this very process (tests), never a stale lock.
+    if (pid === process.pid || processAlive(pid)) return { cleared: false, pid };
+  } else {
+    const age = await stat(file).then(info => Date.now() - info.mtimeMs, () => 0);
+    if (age < UNWRITTEN_LOCK_MS) return { cleared: false };
+  }
+  const aside = `${file}.stale-${randomUUID()}`;
+  try { await rename(file, aside); }
+  catch (error) { return (error as NodeJS.ErrnoException).code === 'ENOENT' ? { cleared: true } : { cleared: false }; }
+  const moved = await readFile(aside, 'utf8').catch(() => null);
+  if (moved !== content) {
+    // Another process replaced the stale lock meanwhile: give its lock back.
+    await link(aside, file).catch(() => undefined);
+    await unlink(aside).catch(() => undefined);
+    return { cleared: false };
+  }
+  await unlink(aside).catch(() => undefined);
+  return { cleared: true };
+}
+
+async function acquireProfileLock(file: string): Promise<FileHandle> {
+  for (let attempt = 0; ; attempt++) {
+    try { return await open(file, 'wx', 0o600); }
+    catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'EEXIST' || attempt > 0) throw new CliError('PROFILE_BUSY', 'error.profileBusy');
+    }
+    const stale = await clearStaleLock(file);
+    if (!stale.cleared) {
+      throw stale.pid !== undefined
+        ? new CliError('PROFILE_BUSY', 'error.profileBusyPid', { pid: String(stale.pid), file })
+        : new CliError('PROFILE_BUSY', 'error.profileBusy');
+    }
+  }
 }
 
 /**
- * One Cindy CLI process per data directory: refresh-token rotation must never race.
- * SIGTERM aborts the action; the interactive UI handles Ctrl+C itself.
+ * One Cindy CLI process per data directory: refresh-token rotation must never race. A lock whose process is gone
+ * is taken over. SIGINT (Ctrl+C before the interactive UI owns the terminal; in it, Ctrl+C is a key), SIGTERM and
+ * SIGHUP (terminal closed, SSH dropped) abort the action, so it ends through its normal cleanup and the lock goes.
  */
-export async function withProfileLock<T>(dataDir: string, action: (signal: AbortSignal) => Promise<T>, options: { signals?: SignalSource; interruptOnSigint?: boolean } = {}): Promise<T> {
+export async function withProfileLock<T>(dataDir: string, action: (signal: AbortSignal) => Promise<T>, options: { signals?: SignalSource } = {}): Promise<T> {
   const signals = options.signals ?? process;
   const controller = new AbortController();
   const cancel = () => controller.abort();
-  const interrupt = options.interruptOnSigint ?? true;
-  if (interrupt) signals.on('SIGINT', cancel);
-  signals.on('SIGTERM', cancel);
+  const events = ['SIGINT', 'SIGTERM', 'SIGHUP'] as const;
+  for (const event of events) signals.on(event, cancel);
   try {
     await mkdir(dataDir, { recursive: true, mode: 0o700 });
     if (controller.signal.aborted) throw new CliError('COMMAND_CANCELLED', 'error.cancelled');
     const file = path.join(dataDir, 'profile.lock');
-    let lock;
-    try { lock = await open(file, 'wx', 0o600); }
-    catch { throw new CliError('PROFILE_BUSY', 'error.profileBusy'); }
+    const lock = await acquireProfileLock(file);
     try {
       await lock.writeFile(`${process.pid}\n`);
       if (controller.signal.aborted) throw new CliError('COMMAND_CANCELLED', 'error.cancelled');
       return await action(controller.signal);
+    } catch (error) {
+      // Startup work cut short by a signal fails in its own way (aborted fetch, relay); report the cancellation.
+      if (controller.signal.aborted && !(error instanceof CliError && error.code === 'COMMAND_CANCELLED')) throw new CliError('COMMAND_CANCELLED', 'error.cancelled');
+      throw error;
     } finally { await lock.close(); await unlink(file).catch(() => {}); }
   } finally {
-    if (interrupt) signals.removeListener('SIGINT', cancel);
-    signals.removeListener('SIGTERM', cancel);
+    for (const event of events) signals.removeListener(event, cancel);
   }
 }
