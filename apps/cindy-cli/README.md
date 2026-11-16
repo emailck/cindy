@@ -87,9 +87,10 @@ Linux 上的真实账号远端任务、macOS、ARM64 与 musl 尚未实测。
 - 工具在本机执行：远端 Agent 的命令、读写文件都在你这台电脑的工作目录里执行；Linux 用 `$SHELL`（bash/zsh），Windows 需要 Git Bash
   （Git for Windows，或用 `CLAUDE_CODE_GIT_BASH_PATH` 指定），没有时启动会提示。
 - ripgrep：`apt install ripgrep`（或 `dnf` / `pacman`）；没有时启动会提示，Agent 改用较慢的 `grep` / `find`。也可用 `CINDY_CLI_RG` 指定路径。
-- 凭证：桌面 Linux 使用 Secret Service（GNOME Keyring / KWallet，需解锁并在同一 D-Bus 会话里）。没有它的服务器或纯 SSH 环境，
-  登录会拒绝而不会自动降级；可显式设置 `CINDY_CLI_CREDENTIAL_STORE=file`，凭证以**不加密**文件保存在数据目录
-  （目录 0700、文件 0600，只认当前用户的普通文件）。
+- 凭证：Linux 默认保存在当前用户数据目录的 `credentials/` 下（缺省 `~/.local/state/cindy-cli/credentials/`），
+  无需安装钥匙串或配置环境变量。文件**不加密**，目录 0700、文件 0600，只认当前用户的普通文件。
+  可设置 `CINDY_CLI_CREDENTIAL_STORE=keyring` 使用 Secret Service（需安装并解锁）。旧版钥匙串凭证保持原样，
+  升级后可重新登录使用文件存储，或显式选择 keyring 继续使用原登录态。
 - 数据目录默认 `$XDG_STATE_HOME/cindy-cli`（缺省 `~/.local/state/cindy-cli`）。如果主目录本身是 Git 仓库（如用 Git 管理 dotfiles），
   会因「数据目录不能在 Git 工作区内」被拒绝，请用 `CINDY_CLI_DATA_DIR` 指到仓库外。
 - 代理：自动使用 `HTTPS_PROXY` / `HTTP_PROXY` / `ALL_PROXY` / `NO_PROXY`（与 curl 同一惯例；本机地址直连）。登录与 REST 支持 HTTP 代理，
@@ -103,8 +104,9 @@ Linux 上的真实账号远端任务、macOS、ARM64 与 musl 尚未实测。
 - 数据目录默认：Windows `%LOCALAPPDATA%\Cindy CLI`，macOS `~/Library/Application Support/Cindy CLI`，
   Linux `$XDG_STATE_HOME/cindy-cli`（缺省 `~/.local/state/cindy-cli`）；可用 `--data-dir` 或 `CINDY_CLI_DATA_DIR`
   覆盖，必须在 Git 工作区外。同一数据目录同时只能有一个 `cindy` 进程。
-- 凭证保存在系统钥匙串（Linux 需 Secret Service）；与 `cindy-host` 相同的受保护存储实现，
-  `CINDY_CLI_CREDENTIAL_STORE=file` 为显式的文件存储选项（仅限没有钥匙串的服务器）。
+- Linux 凭证默认保存在用户数据目录的 `credentials/`；macOS / Windows 默认使用系统钥匙串。
+  `CINDY_CLI_CREDENTIAL_STORE=keyring|file` 可显式覆盖（file 仅支持 POSIX）；切换不迁移或删除旧凭证。
+  普通配置与凭证分开保存，`config show` 不会显示凭证。
 - `cindy config set language zh|en`、`permissionMode full|normal|plan`、`deviceName 名称`；语言缺省跟随系统，
   `--lang` 只影响本次运行。`/model` 与 `/lang` 的选择会记住。
 - 本地任务记录（用于 `/resume`）只保存任务标识、远端会话 id、模型和第一条消息的前 80 个字符，按账号隔离；

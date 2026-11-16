@@ -57,8 +57,12 @@ Secret Service 的 POSIX 主机。此模式不加密，目录 0700、文件 0600
 默认仍为 `keyring`，不能因密钥环失败自动降级；切换模式不迁移、不删除旧凭证，需重新
 登录。该例外不适用于 Desktop、Mobile 或插件。用户可通过取消环境变量恢复默认。
 
-终端客户端 `apps/cindy-cli` 复用同一实现，以 `CINDY_CLI_CREDENTIAL_STORE=file` 显式选择，条件与上文完全相同
-（仅 POSIX、不加密、0700/0600、不自动降级、不迁移）；钥匙串不可用时的报错只提示该选项，不自动切换。
+终端客户端 `apps/cindy-cli` 复用同一实现。2026-11-16 用户裁决：Linux 默认使用用户目录下的文件存储，
+无需钥匙串或环境变量；默认位置为 `~/.local/state/cindy-cli/credentials/`（遵循 `XDG_STATE_HOME` 与显式数据目录覆盖）。
+macOS / Windows 默认仍为 keyring。`CINDY_CLI_CREDENTIAL_STORE=keyring|file` 显式覆盖优先；
+文件模式仍仅限 POSIX、不加密、0700/0600、仓库外、不迁移不删除旧凭证。旧版 Linux keyring 用户可重新登录
+使用文件存储，或显式选择 keyring 保留原登录态。指定 keyring 后失败仍不自动降级；此默认值例外仅适用于
+终端客户端，不改变 `cindy-host`、Desktop、Mobile 或插件。普通配置与凭证分开保存，配置显示不得包含凭证。
 
 ## Claude 订阅只经 Claude Code 自己的登录
 

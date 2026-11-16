@@ -42,7 +42,9 @@ export async function promptVisible(question: string, signal?: AbortSignal): Pro
 }
 
 export function credentialStore(dataDir: string): ProtectedCredentialStore {
-  return createHostCredentialStore(dataDir, process.env.CINDY_CLI_CREDENTIAL_STORE ?? 'keyring');
+  // Linux terminals commonly have no Secret Service. Keep credentials in the user's
+  // private data directory by default; an explicit backend selection still wins.
+  return createHostCredentialStore(dataDir, process.env.CINDY_CLI_CREDENTIAL_STORE ?? (process.platform === 'linux' ? 'file' : 'keyring'));
 }
 
 /** Caller holds the profile lock until drain() completes. */
@@ -56,7 +58,7 @@ export async function createAuth(dataDir: string, signal?: AbortSignal): Promise
     const client = new CindyAuthClient({ baseUrl: CLI_ENDPOINTS.authApiBaseUrl, region: CLI_REGION, deviceId, clientType: 'desktop', fetch: createHostAuthFetch(signal, networkFetch()) });
     return createHostAuthService({ store, client, region: CLI_REGION, authApiBaseUrl: CLI_ENDPOINTS.authApiBaseUrl });
   } catch (error) {
-    if (error instanceof CredentialStoreUnavailableError || error instanceof HostAuthError) throw new CliError('CREDENTIAL_STORE_UNAVAILABLE', 'error.credentialStore');
+    if (error instanceof CredentialStoreUnavailableError || error instanceof HostAuthError || (error as { code?: string })?.code === 'CREDENTIAL_STORE_UNAVAILABLE') throw new CliError('CREDENTIAL_STORE_UNAVAILABLE', 'error.credentialStore');
     throw error;
   }
 }
