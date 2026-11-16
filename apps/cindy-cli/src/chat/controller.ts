@@ -107,7 +107,8 @@ export function groupModels(models: readonly CatalogModel[]): ProviderGroup[] {
 
 export type Prompt =
   | { kind: 'picker'; title: string; choices: Choice[]; index: number; /** Esc returns to the previous step. */ back?: boolean }
-  | { kind: 'permission'; title: string; summary: string; description?: string; preview?: PermissionPreview; choices: Choice[]; index: number }
+  /** feedback: typed text denies the call and tells the Agent why (not for confirmations this computer owns). */
+  | { kind: 'permission'; title: string; summary: string; description?: string; preview?: PermissionPreview; choices: Choice[]; index: number; feedback: boolean }
   | { kind: 'question'; question: AskUserQuestionItem; position: string; choices: Choice[]; index: number; /** Multi-select: toggled option indexes. */ selected: number[] }
   | { kind: 'plan'; plan: string; choices: Choice[]; index: number };
 
@@ -221,6 +222,10 @@ export interface ChatDeps {
   /** False on Windows without Git Bash: warn once at startup. */
   shellAvailable?: boolean;
   now?(): number;
+  /** Draws attention (terminal bell): a long turn finished, or a running turn waits for the user's decision. */
+  notify?(event: 'done' | 'waiting'): void;
+  /** Typed input remembered across runs, per project directory (↑ and Ctrl+R). */
+  history?: InputHistory;
   /** A local file's text (diff line numbers and context); null when it cannot be read. */
   readText?: ReadText;
   /** Whether an absolute local path is a file or a directory (`@` mentions). */
@@ -232,6 +237,18 @@ export interface ChatDeps {
   /** Saves an image on the clipboard to a temporary file; null when the clipboard holds no image. */
   clipboardImage?(): Promise<ImageAttachment | null>;
 }
+
+export interface InputHistory {
+  /** Oldest first. */
+  load(workingDir: string): Promise<string[]>;
+  add(workingDir: string, text: string): Promise<void>;
+}
+
+/** A turn at least this long rings when it ends; shorter ones were watched anyway. */
+export const NOTIFY_AFTER_MS = 10_000;
+
+/** What `cindy` prints after the interactive UI closes. */
+export interface ExitSummary { tokens: TokenTotals | null; costUsd: number; workMs: number; turns: number }
 
 /** Image types the Agents accept as message attachments. */
 export const IMAGE_TYPES: Readonly<Record<string, string>> = { '.png': 'image/png', '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg', '.gif': 'image/gif', '.webp': 'image/webp' };
@@ -319,6 +336,9 @@ export class ChatController {
   /** `@` completion: project paths, loaded on first use. */
   private files: string[] | null = null;
   private filesLoading = false;
+  /** Time spent in turns and how many there were in this task (the exit summary). */
+  private workMs = 0;
+  private turns = 0;
   private models: CatalogModel[] = [];
   private exitTimer: ReturnType<typeof setTimeout> | undefined;
   private exitWaiters: Array<() => void> = [];
@@ -398,6 +418,7 @@ export class ChatController {
     if (!text && !extra.images?.length) { if (!this.pending) this.resumeQueue(); return; }
     if (this.pending?.kind === 'question') { this.answerQuestion(text); return; }
     if (this.pending?.kind === 'plan') { this.planFeedback(text); return; }
+    if (this.pending?.kind === 'permission' && this.snapshot.prompt?.kind === 'permission' && this.snapshot.prompt.feedback) { this.denyWithReason(text); return; }
     if (this.pending) return;
     if (text.startsWith('/')) { await this.command(text); return; }
     if (text.startsWith('!')) { await this.runLocal(text.slice(1).trim()); return; }
@@ -532,6 +553,23 @@ export class ChatController {
       lines: this.snapshot.lines.map(line => (line.id === lineId && line.kind === 'local' ? { id: lineId, kind: 'local', command, output: kept, exitCode: result.exitCode } : line)),
       localRunning: false, localPending: this.localContext.length,
     });
+  }
+
+  /** Inputs remembered for this project directory, oldest first; empty without a store or when it cannot be read. */
+  loadHistory(): Promise<string[]> {
+    return this.deps.history?.load(this.deps.workingDir).catch(() => []) ?? Promise.resolve([]);
+  }
+
+  /** Remembers a sent input for later runs; a failure to save never disturbs the session. */
+  remember(text: string): void {
+    if (text.trim()) void this.deps.history?.add(this.deps.workingDir, text).catch(() => undefined);
+  }
+
+  /** The task's totals for the line printed on exit; null when no task was started. */
+  exitSummary(): ExitSummary | null {
+    if (!this.turns) return null;
+    const usage = this.snapshot.usage;
+    return { tokens: usage?.tokens ?? null, costUsd: usage?.costUsd ?? 0, workMs: this.workMs, turns: this.turns };
   }
 
   /** Esc while a `!command` runs: stop it. */
@@ -884,6 +922,13 @@ export class ChatController {
   private finishTurn(outcome: 'done' | 'interrupted' | 'error' | 'closed' = 'done') {
     this.commitLive();
     const wasRunning = this.snapshot.phase !== 'idle';
+    const started = this.snapshot.turnStartedAt;
+    if (wasRunning && started !== null) {
+      const took = (this.deps.now ?? Date.now)() - started;
+      this.workMs += took;
+      this.turns++;
+      if (outcome === 'done' && took >= NOTIFY_AFTER_MS) this.deps.notify?.('done');
+    }
     if (wasRunning || this.snapshot.thinking) this.update({ phase: 'idle', thinking: false, turnStartedAt: null });
     for (const waiter of this.turnWaiters.splice(0)) waiter();
     if (outcome !== 'done') {
@@ -991,6 +1036,14 @@ export class ChatController {
     this.update({ prompt: { ...prompt, selected, index } });
   }
 
+  /** Typed text on a confirmation: deny the call and tell the Agent what to do instead. */
+  private denyWithReason(text: string) {
+    const pending = this.pending;
+    if (pending?.kind !== 'permission') return;
+    this.clearPrompt();
+    pending.resolve({ kind: 'permission', behavior: 'deny', reason: text });
+  }
+
   /** Typed text while a plan is shown: keep planning, with that feedback for the Agent. */
   private planFeedback(text: string) {
     const pending = this.pending;
@@ -1031,6 +1084,8 @@ export class ChatController {
       // A newer prompt replaces an unanswered one; the older request is denied, never approved.
       if (this.pending && this.pending.kind !== 'picker') this.cancelPrompt();
       this.commitLive();
+      const started = this.snapshot.turnStartedAt;
+      if (started !== null && (this.deps.now ?? Date.now)() - started >= NOTIFY_AFTER_MS) this.deps.notify?.('waiting');
       if (request.kind === 'permission') {
         const decisions: InteractionDecision[] = [{ kind: 'permission', behavior: 'allow' }];
         const choices: Choice[] = [{ label: this.t('ask.allowOnce') }];
@@ -1045,7 +1100,9 @@ export class ChatController {
         this.update({ prompt: { kind: 'permission', title: this.t('ask.permissionTitle', { tool: request.displayName ?? builtinName(request.toolName) }),
           // A command shown in full needs no one-line summary above it. Paths stay absolute: this is a decision.
           summary: preview?.kind === 'command' ? '' : toolSummary(request.input),
-          ...(request.description ? { description: request.description } : {}), ...(preview ? { preview } : {}), choices, index: 0 } });
+          ...(request.description ? { description: request.description } : {}), ...(preview ? { preview } : {}), choices, index: 0,
+          // Confirmations this computer raises (shared-provider credentials) answer yes or no only; a reason would be lost.
+          feedback: request.metadata?.hostOwnedConfirmation === undefined } });
       } else if (request.kind === 'ask_user_question') {
         this.pending = { kind: 'question', queue: [...request.questions], answers: {}, resolve: settle };
         this.nextQuestion();
@@ -1306,6 +1363,8 @@ export class ChatController {
     this.thinkingStarted = null;
     // `!command` output belongs to the task it was meant for.
     this.localContext = [];
+    this.workMs = 0;
+    this.turns = 0;
     this.update({ live: '', liveCont: false, liveCode: false, phase: 'idle', thinking: false, turnStartedAt: null, usage: null, localPending: 0 });
   }
 

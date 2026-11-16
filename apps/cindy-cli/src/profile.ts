@@ -34,9 +34,13 @@ export interface CliConfig {
   model?: ModelChoice;
   /** Terminal colors; auto follows the terminal background. */
   theme?: ThemeSetting;
+  /** Terminal bell when a long turn ends or a turn waits for the user; on when unset. */
+  notify?: NotifySetting;
 }
+export type NotifySetting = 'bell' | 'off';
+export function isNotifySetting(value: unknown): value is NotifySetting { return value === 'bell' || value === 'off'; }
 type StoredConfig = Partial<CliConfig>;
-export const CONFIG_KEYS = ['language', 'permissionMode', 'deviceName', 'theme'] as const;
+export const CONFIG_KEYS = ['language', 'permissionMode', 'deviceName', 'theme', 'notify'] as const;
 export type ConfigKey = (typeof CONFIG_KEYS)[number];
 
 /** Per-user application data, outside any project. Explicit flag/env win. */
@@ -72,6 +76,7 @@ function validateStored(value: unknown, file: string): StoredConfig {
     else if (key === 'deviceName' && validDeviceName(item)) result.deviceName = item;
     else if (key === 'model' && isModelChoice(item)) result.model = item;
     else if (key === 'theme' && isThemeSetting(item)) result.theme = item;
+    else if (key === 'notify' && isNotifySetting(item)) result.notify = item;
     else throw invalid();
   }
   return result;
@@ -133,6 +138,7 @@ export function parseConfigValue(key: string, value: string): Partial<CliConfig>
   if (key === 'permissionMode' && isPermissionChoice(value)) return { permissionMode: value };
   if (key === 'deviceName' && validDeviceName(value)) return { deviceName: value };
   if (key === 'theme' && isThemeSetting(value)) return { theme: value };
+  if (key === 'notify' && isNotifySetting(value)) return { notify: value };
   throw new CliError('INVALID_CONFIG', 'error.configValue', { key });
 }
 

@@ -5,7 +5,8 @@
  * - Bug／规则依据：docs/cindy-cli-client-plan.md「斜杠命令」「交互确认」（不伪造用户选择，中断按拒绝）；
  *   provider-sharing.md §9 第 7 条（「本任务总是允许」只能来自用户选择，经同一确认通道回传授权建议）。
  * - 现有覆盖缺口：新代码；Desktop 的确认卡与模型选择器在 renderer，不经过这里。
- * - 最小失败输入：运行中输入被丢弃或立即发送、打断后队列继续自动发送、插话失败丢消息、多选只取一项、计划修改意见丢失；/model 未先选供应商、同名分享无法区分、连不上的来源可被选中；流式增量与最终全文重复显示；流式回复逐行提交后最终全文再次输出或 -p 输出被拆成多段；Ctrl+C 关闭确认被当成允许；换到另一台电脑的模型仍发到旧任务；
+ * - 最小失败输入：长回合结束或运行中等待确认时不响铃、短回合也响铃；退出汇总的轮数与用时不对或 /clear 后仍汇总旧任务；
+ *   运行中输入被丢弃或立即发送、打断后队列继续自动发送、插话失败丢消息、多选只取一项、计划修改意见丢失；/model 未先选供应商、同名分享无法区分、连不上的来源可被选中；流式增量与最终全文重复显示；流式回复逐行提交后最终全文再次输出或 -p 输出被拆成多段；Ctrl+C 关闭确认被当成允许；换到另一台电脑的模型仍发到旧任务；
  *   /resume 不带原生会话 id；记录里的模型已不可用时仍把旧的原生会话 id 交给当前另一条路由。
  * - tier：unit（假会话句柄、内存任务记录；无网络）。
  */
@@ -277,5 +278,37 @@ describe('ChatController', () => {
     expect(await decision).toEqual({ kind: 'permission', behavior: 'deny' });
     expect(out).toEqual(['answer\n\nmore']);
     expect(session.handle.close).toHaveBeenCalled();
+  });
+
+  it('rings only for a turn that ran long or waits for the user, and sums the task for the exit line', async () => {
+    let clock = 0;
+    const notify = vi.fn();
+    const session = fakeHandle();
+    const controller = new ChatController({ workingDir: '/project', language: 'en', permission: 'full',
+      catalog: async () => ({ models: [model('vps', 'claude-a')], unavailable: [] }), openTask: async () => session.handle,
+      tasks: { list: async () => [], save: async () => {} }, now: () => clock, notify });
+    await controller.init();
+    expect(controller.exitSummary()).toBeNull();
+    await controller.submit('quick');
+    clock = 3_000;
+    session.push({ type: 'done', data: {} });
+    await controller.waitForTurn();
+    expect(notify).not.toHaveBeenCalled();
+
+    await controller.submit('long');
+    clock = 18_000; // 15 s into the turn the Agent asks: ring
+    const decision = session.ask({ kind: 'permission', requestId: 'p', toolName: 'Bash', input: { command: 'make' } });
+    expect(notify).toHaveBeenLastCalledWith('waiting');
+    controller.choose(0);
+    await decision;
+    clock = 40_000;
+    session.push({ type: 'done', data: {} });
+    await controller.waitForTurn();
+    expect(notify).toHaveBeenLastCalledWith('done');
+    expect(notify).toHaveBeenCalledTimes(2);
+    expect(controller.exitSummary()).toMatchObject({ turns: 2, workMs: 40_000 });
+
+    await controller.submit('/clear');
+    expect(controller.exitSummary()).toBeNull();
   });
 });

@@ -17,11 +17,13 @@
  *   打断后等结果的调用仍显示在运行、Ctrl+O 看不到被折叠的完整输出或 ← 不切到上一项；表格逐行流式到达时各行单独提交（列不对齐）；
  *   确认框只有一行摘要（看不到 Edit 的 diff 与行号、多行 Bash 命令只剩首行）；
  *   输入：`!命令` 被当成消息发给 Agent 或其输出没随下一条消息发送、`@` 补全不出现或发送时没有引用块、长粘贴把全文塞进记录、
- *   粘贴的图片路径当成文字发送而不是图片块。
+ *   粘贴的图片路径当成文字发送而不是图片块；
+ *   高优先级优化（2026-11-16）：确认框里输入的文字没有作为拒绝理由交回（本机凭证确认却接受了输入）、计划按原文显示 Markdown 标记
+ *   或超长计划看不到结尾、Ctrl+R 搜不到上次运行的输入或发送后没有记住。
  * - 状态栏依据：用户需求（上下文占用、本轮与本任务平均 tok/s、预计费用、本任务输入／输出／缓存读写与命中率）；
  *   UsageSnapshot 字段语义见 maker-core types/events.ts，命中率公式见 Desktop shared/turnUsageDetails.ts。
  * - tier：unit（ink-testing-library 内存终端，假会话句柄）。
- * - 实测耗时：App.test.tsx 单独运行 vitest Duration 4.6–4.8 秒（2026-11-16，14 项；等待由 20 ms 降为 5 ms，只有 Esc 等 Ink 的 20 ms 判定）。
+ * - 实测耗时：App.test.tsx 单独运行 vitest Duration 4.5 秒（2026-11-16，15 项；等待由 20 ms 降为 5 ms，只有 Esc 等 Ink 的 20 ms 判定）。
  */
 import type { AgentEvent, AgentSessionHandle, InteractionDecision, InteractionResolver } from '@cindy/maker-core';
 import { render } from 'ink-testing-library';
@@ -173,8 +175,31 @@ describe('terminal UI', () => {
     const edit = resolver!({ kind: 'permission', requestId: 'e', toolName: 'mcp__cindy_exec__Edit', input: { file_path: '/project/a.ts', old_string: 'const a = 1;', new_string: 'const a = 2;' } });
     await tick();
     for (const text of ['Allow Edit?', '2   two', '3 - const a = 1;', '3 + const a = 2;', '4   const b = 2;']) expect(ui.lastFrame()).toContain(text);
+    // Typing on an Agent's confirmation denies the step and tells the Agent what to do instead.
+    ui.stdin.write('use git mv instead'); await tick();
+    ui.stdin.write('\r');
+    expect(await edit).toEqual({ kind: 'permission', behavior: 'deny', reason: 'use git mv instead' });
+    // A confirmation this computer raises (shared-provider credentials) answers yes or no only: typing does nothing.
+    const credential = resolver!({ kind: 'permission', requestId: 'c', toolName: 'Read', input: { file_path: '/project/.env' }, metadata: { hostOwnedConfirmation: 'shared_provider_credential' } });
+    await tick();
+    expect(ui.lastFrame()).not.toContain('what the Agent should do instead');
+    ui.stdin.write('x'); await tick();
     ui.stdin.write('2');
-    expect(await edit).toEqual({ kind: 'permission', behavior: 'deny' });
+    expect(await credential).toEqual({ kind: 'permission', behavior: 'deny' });
+    // A plan reads as Markdown; a long one shows its start, Ctrl+O the whole plan.
+    const plan = resolver!({ kind: 'plan_review', requestId: 'pl', plan: ['# Steps', '1. **Rename** files', ...Array.from({ length: 30 }, (_, index) => `- step ${index + 3}`), 'LAST_STEP'].join('\n') });
+    await tick();
+    let frame = ui.lastFrame()!;
+    expect(frame).toContain('Rename files');
+    for (const text of ['# Steps', '**Rename**', 'LAST_STEP']) expect(frame).not.toContain(text);
+    expect(frame).toMatch(/… \+\d+ lines · Ctrl\+O shows the whole plan/);
+    ui.stdin.write('\u000F'); await tick();
+    ui.stdin.write('G'); await tick();
+    expect(ui.lastFrame()).toContain('LAST_STEP');
+    await pressEscape(ui.stdin); // closes the viewer, not the plan
+    ui.stdin.write('2');
+    expect(await plan).toEqual({ kind: 'plan_review', behavior: 'deny' });
+    frame = ui.lastFrame()!;
 
     await pressEscape(ui.stdin);
     expect(abort).toHaveBeenCalledOnce();
@@ -365,6 +390,27 @@ describe('terminal UI', () => {
     expect(submit).toHaveBeenLastCalledWith(' one bX\ncd', {});
     await type('/c'); await type('\u001B[B'); await type('\r'); // ↓ highlights the second command, Enter runs it
     expect(submit).toHaveBeenLastCalledWith('/clear', {});
+    ui.unmount();
+  });
+
+  it('reaches earlier runs\' inputs with Ctrl+R and remembers what is sent', async () => {
+    const add = vi.fn(async () => {});
+    const controller = new ChatController({ workingDir: '/project', language: 'en', permission: 'full',
+      catalog: async () => ({ models: [model('claude-a')], unavailable: [] }), openTask: async () => { throw new Error('unused'); },
+      tasks: { list: async () => [], save: async () => {} }, history: { load: async () => ['deploy staging', 'run tests', 'deploy prod'], add } });
+    const submit = vi.spyOn(controller, 'submit');
+    const ui = render(<App controller={controller} header="Cindy" />);
+    await controller.init();
+    const type = async (text: string) => { ui.stdin.write(text); await tick(); };
+    await type('\u0012'); await type('depl'); // Ctrl+R: the newest match first
+    expect(ui.lastFrame()).toContain('deploy prod');
+    await type('\u0012'); // older match
+    expect(ui.lastFrame()).toContain('deploy staging');
+    await type('\r');
+    expect(ui.lastFrame()).toContain('> deploy staging');
+    await type('\r');
+    expect(submit).toHaveBeenLastCalledWith('deploy staging', {});
+    expect(add).toHaveBeenLastCalledWith('/project', 'deploy staging');
     ui.unmount();
   });
 

@@ -6,11 +6,27 @@ import { render } from 'ink';
 import type { ChatRequest, CommandContext } from '../cli';
 import { CliError, writeConfig } from '../profile';
 import { startClientRuntime } from '../runtime';
-import { App } from './App';
-import { ChatController, type ChatDeps } from './controller';
+import type { Translate } from '../i18n';
+import { App, compactTokens, elapsedText } from './App';
+import { cacheHitRate, ChatController, type ChatDeps, type ExitSummary } from './controller';
 import { runPrint } from './print';
 import { listProjectFiles, readClipboardImage, readText, runLocalCommand, statPath } from './local';
 import { colorDepthTheme, colorFgBgTheme, queryBackground, supportsHyperlinks } from './theme';
+
+/** Printed after the interactive UI closes: what this task used, and how to pick it up again. */
+export function exitSummaryText(summary: ExitSummary | null, t: Translate, workingDir: string): string | null {
+  if (!summary) return null;
+  const tokens = summary.tokens;
+  const hit = tokens ? cacheHitRate(tokens) : null;
+  const facts = [
+    t('exit.turns', { count: summary.turns }),
+    ...(tokens ? [t('exit.tokens', { input: compactTokens(tokens.input), output: compactTokens(tokens.output) })] : []),
+    ...(hit !== null ? [t('exit.cacheHit', { percent: Math.round(hit * 100) })] : []),
+    ...(summary.costUsd > 0 ? [t('exit.cost', { cost: summary.costUsd < 0.01 ? summary.costUsd.toFixed(3) : summary.costUsd.toFixed(2) })] : []),
+    t('exit.time', { time: elapsedText(summary.workMs) }),
+  ];
+  return `${t('exit.summary', { facts: facts.join(' · ') })}\n${t('exit.continue', { dir: workingDir })}`;
+}
 
 export async function runChat(request: ChatRequest, context: CommandContext, signal: AbortSignal): Promise<number> {
   const interactive = request.prompt === undefined;
@@ -40,6 +56,9 @@ export async function runChat(request: ChatRequest, context: CommandContext, sig
       saveModel: choice => writeConfig(context.dataDir, current => ({ ...current, model: choice })),
       theme: { setting: context.config.theme ?? 'auto', background: await background, depth: colorDepthTheme(process.env, process.stdout.getColorDepth?.() ?? 8) },
       saveTheme: setting => writeConfig(context.dataDir, current => ({ ...current, theme: setting })),
+      history: runtime.history,
+      // The bell reaches the terminal outside Ink's frame; it moves no cursor.
+      ...(context.config.notify === 'off' ? {} : { notify: () => { process.stdout.write('\u0007'); } }),
       readText,
       statPath,
       listFiles: () => listProjectFiles(workingDir, runtime.rgPath),
@@ -67,6 +86,8 @@ export async function runChat(request: ChatRequest, context: CommandContext, sig
       await controller.whenExited();
       instance.unmount();
       await instance.waitUntilExit().catch(() => undefined);
+      const summary = exitSummaryText(controller.exitSummary(), context.t, deps.workingDir);
+      if (summary) context.output(summary);
       return 0;
     } finally { signal.removeEventListener('abort', stop); }
   } finally {

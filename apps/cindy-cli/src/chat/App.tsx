@@ -98,6 +98,32 @@ function costText(cost: number): string {
   return cost < 0.001 ? '<0.001' : cost.toFixed(cost < 1 ? 3 : 2);
 }
 
+/**
+ * Output speed at a glance: only the number takes a color, from slow (red) through amber and green to fast
+ * (blue). Thresholds follow what current models stream: large models around 30–60 tok/s, small ones past 100.
+ */
+const SPEED_TONES: ReadonlyArray<{ below: number; tone: 'error' | 'warning' | 'success' | 'info' }> = [
+  { below: 20, tone: 'error' },
+  { below: 50, tone: 'warning' },
+  { below: 100, tone: 'success' },
+  { below: Infinity, tone: 'info' },
+];
+
+export function speedTone(rate: number): 'error' | 'warning' | 'success' | 'info' {
+  return SPEED_TONES.find(level => rate < level.below)!.tone;
+}
+
+function Speed({ label, rate, bold }: { label: string; rate: number; bold?: boolean }) {
+  const theme = useTheme();
+  return (
+    <Text>
+      <Text {...theme.faint}>{`${label} `}</Text>
+      <Text {...theme[speedTone(rate)]} bold={bold}>{rateText(rate)}</Text>
+      <Text {...theme.faint}>{' tok/s'}</Text>
+    </Text>
+  );
+}
+
 /** Context nearly full: the user may want /compact soon. */
 const CONTEXT_WARN_PERCENT = 80;
 /** Context past half: worth keeping an eye on. */
@@ -114,7 +140,8 @@ function percentText(rate: number): string {
  * Status bar under the footer, two rows, each part only once the Agent reports it:
  *   Context ███░░░░░░░ 25% 50k/200k │ This turn 42 tok/s · Avg 30 tok/s │ This task ≈ $0.200
  *   ↑ In 2k  ↓ Out 500 │ Cache read 6k · write 2k · hit 60%
- * The meter and percent turn amber past 60% and red from 80% (time for /compact); the hit rate is green when high.
+ * The meter and percent turn amber past 60% and red from 80% (time for /compact); the hit rate is green when high;
+ * a tok/s figure goes red below 20, amber below 50, green below 100 and blue from 100.
  */
 function UsageBar({ usage, t }: { usage: UsageView; t: Translate }) {
   const theme = useTheme();
@@ -139,12 +166,8 @@ function UsageBar({ usage, t }: { usage: UsageView; t: Translate }) {
     );
   }
   const speed: ReactNode[] = [];
-  if (usage.turnRate !== null) {
-    speed.push(<Text key="turn"><Text {...theme.faint}>{`${t('usage.turn')} `}</Text><Text {...theme.info} bold>{rateText(usage.turnRate)}</Text><Text {...theme.faint}>{' tok/s'}</Text></Text>);
-  }
-  if (usage.averageRate !== null) {
-    speed.push(<Text key="avg"><Text {...theme.faint}>{`${t('usage.average')} `}</Text><Text {...theme.info}>{rateText(usage.averageRate)}</Text><Text {...theme.faint}>{' tok/s'}</Text></Text>);
-  }
+  if (usage.turnRate !== null) speed.push(<Speed key="turn" label={t('usage.turn')} rate={usage.turnRate} bold />);
+  if (usage.averageRate !== null) speed.push(<Speed key="avg" label={t('usage.average')} rate={usage.averageRate} />);
   if (speed.length) groups.push(<Text key="speed">{speed.map((part, index) => <Text key={index}>{index ? dot : null}{part}</Text>)}</Text>);
   if (usage.costUsd > 0) groups.push(<Text key="cost" {...theme.success}>{t('usage.cost', { cost: costText(usage.costUsd) })}</Text>);
 
@@ -506,7 +529,7 @@ function PermissionPreviewView({ preview, t }: { preview: NonNullable<Extract<Pr
   return <Box flexDirection="column" marginY={1} paddingLeft={preview.kind === 'command' ? 2 : 0}>{rows}</Box>;
 }
 
-function PromptView({ prompt, hint, t }: { prompt: Prompt; hint: string; t: Translate }) {
+function PromptView({ prompt, hint, t, width, planRows }: { prompt: Prompt; hint: string; t: Translate; width: number; /** Rows the plan may take. */ planRows: number }) {
   const theme = useTheme();
   if (prompt.kind === 'picker') {
     return (
@@ -536,10 +559,15 @@ function PromptView({ prompt, hint, t }: { prompt: Prompt; hint: string; t: Tran
       </Box>
     );
   }
+  // The plan reads like a reply (Markdown). A long one shows its start here; Ctrl+O shows all of it.
+  const source = prompt.plan.split('\n');
+  const rows = Math.max(3, planRows);
+  const shown = source.length > rows ? source.slice(0, rows - 1) : source;
   return (
     <Box flexDirection="column" borderStyle="round" borderColor={theme.info.color ?? theme.border} paddingX={1}>
       <Text bold>{hint}</Text>
-      <Text>{prompt.plan}</Text>
+      <Box flexDirection="column" marginY={1}><Markdown text={shown.join('\n')} width={width - 4} /></Box>
+      {shown.length < source.length ? <Text {...theme.faint}>{t('plan.more', { count: source.length - shown.length })}</Text> : null}
       <Choices prompt={prompt} t={t} />
       <Text {...theme.faint}>{t('ask.planHint')}</Text>
     </Box>
@@ -605,6 +633,29 @@ function InputBox({ editor, placeholder, local }: { editor: Editor; placeholder:
   );
 }
 
+/** Ctrl+R: the search text, and the newest earlier input containing it with the match marked. */
+function HistorySearch({ query, match, t }: { query: string; match: string | null; t: Translate }) {
+  const theme = useTheme();
+  // The line of the input that contains the search text, the match marked; … where lines are left out.
+  const rows = match ? match.split('\n') : [];
+  const row = rows.findIndex(line => line.toLowerCase().includes(query.toLowerCase()));
+  const line = row >= 0 ? rows[row]! : '';
+  const at = line.toLowerCase().indexOf(query.toLowerCase());
+  return (
+    <Box flexDirection="column" borderStyle="round" borderColor={theme.info.color ?? theme.border} paddingX={1}>
+      <Text><Text {...theme.info} bold>{`${t('history.search')}: `}</Text>{query}<Text inverse> </Text></Text>
+      {match && row >= 0 ? (
+        <Text wrap="truncate-end">
+          {row > 0 ? <Text {...theme.faint}>{'… '}</Text> : null}
+          {line.slice(0, at)}<Text {...theme.info} bold underline>{line.slice(at, at + query.length)}</Text>{line.slice(at + query.length)}
+          {row < rows.length - 1 ? <Text {...theme.faint}>{' …'}</Text> : null}
+        </Text>
+      ) : <Text {...theme.faint}>{query ? t('history.noMatch') : ' '}</Text>}
+      <Text {...theme.faint}>{t('history.searchHint')}</Text>
+    </Box>
+  );
+}
+
 /** The Ctrl+O viewer: one folded item at a time, scrolled in the live area; nothing is added to the history. */
 function Viewer({ title, position, rows, offset, height, t }: { title: string; position: string; rows: ViewRow[]; offset: number; height: number; t: Translate }) {
   const theme = useTheme();
@@ -631,6 +682,8 @@ const PASTE_CHARS = 2000;
 /** Placeholders in either interface language (the language can change while they sit in the input or history). */
 const PASTE_RE = /\[(?:Pasted text|粘贴的文本) #(\d+)[^\]]*\]/g;
 const IMAGE_RE = /\[(?:Image|图片) #(\d+)\]/g;
+/** Inputs ↑ and Ctrl+R reach in a run (earlier runs' included). */
+const HISTORY_KEEP = 500;
 
 export function App({ controller, header, hyperlinks = false, colorDepth = 24 }: {
   controller: ChatController; header: string; hyperlinks?: boolean; /** The terminal's color depth (getColorDepth). */ colorDepth?: number;
@@ -650,11 +703,15 @@ export function App({ controller, header, hyperlinks = false, colorDepth = 24 }:
   const pastes = useRef(new Map<number, string>());
   const images = useRef(new Map<number, ImageAttachment>());
   const pasteCount = useRef(0);
+  /** Ctrl+R: the search text and how many older matches were skipped; null when not searching. */
+  const [search, setSearch] = useState<{ query: string; skip: number } | null>(null);
   const prompt = snapshot.prompt;
-  const typing = !prompt || prompt.kind === 'question' || prompt.kind === 'plan';
+  // Typing answers a question, revises a plan, or (on an Agent's confirmation) denies the step with a reason.
+  const typing = !prompt || prompt.kind === 'question' || prompt.kind === 'plan' || (prompt.kind === 'permission' && prompt.feedback);
   const local = typing && !prompt && editor.value.startsWith('!');
-  const commands = typing ? commandSuggestions(editor.value) : [];
-  const mention = typing && !commands.length && !local ? mentionAt(editor.value, editor.cursor) : null;
+  // Commands and @ completion belong to messages, not to answers.
+  const commands = typing && !prompt ? commandSuggestions(editor.value) : [];
+  const mention = typing && !prompt && !commands.length && !local ? mentionAt(editor.value, editor.cursor) : null;
   const files = mention ? controller.fileSuggestions(mention.query) : [];
   const suggestions: Array<{ kind: 'command' | 'file'; value: string }> = commands.length
     ? commands.map(value => ({ kind: 'command', value })) : files.map(value => ({ kind: 'file', value }));
@@ -662,10 +719,21 @@ export function App({ controller, header, hyperlinks = false, colorDepth = 24 }:
   useEffect(() => { setSuggestion(0); }, [editor.value]);
 
   useEffect(() => { if (snapshot.exited) app.exit(); }, [snapshot.exited, app]);
-  // A confirmation or question needs the screen: close the viewer.
-  useEffect(() => { if (prompt) setViewer(null); }, [prompt]);
+  // A confirmation or question needs the screen: close the viewer and any history search.
+  useEffect(() => { if (prompt) { setViewer(null); setSearch(null); } }, [prompt]);
+  // Earlier runs' inputs in this project directory come before this run's (↑, Ctrl+R).
+  useEffect(() => {
+    let live = true;
+    void controller.loadHistory().then(saved => { if (live && saved.length) setHistory(current => [...saved.filter(item => !current.includes(item)), ...current]); });
+    return () => { live = false; };
+  }, [controller]);
 
-  const items = viewer ? viewItems(snapshot.lines, t) : [];
+  /** Folded items for Ctrl+O; while a plan waits for review, the whole plan is the last one. */
+  const viewable = () => [...viewItems(snapshot.lines, t), ...(prompt?.kind === 'plan' ? [{ id: 'plan', title: t('viewer.plan'), rows: prompt.plan.split('\n').map(text => ({ text })) }] : [])];
+  const items = viewer ? viewable() : [];
+  /** Ctrl+R: newest matching inputs first; the shown one skips `skip` newer matches. */
+  const matches = search ? [...history].reverse().filter(item => item.toLowerCase().includes(search.query.toLowerCase())) : [];
+  const match = search && search.query ? matches[Math.min(search.skip, Math.max(0, matches.length - 1))] : undefined;
   const viewHeight = Math.max(3, windowSize.rows - 4);
   const viewItem = viewer ? items[Math.min(viewer.index, items.length - 1)] : undefined;
   const viewRows = viewItem ? wrapView(viewItem.rows, Math.max(10, windowSize.columns - 1)) : [];
@@ -688,7 +756,7 @@ export function App({ controller, header, hyperlinks = false, colorDepth = 24 }:
   };
 
   usePaste(text => {
-    if (!typing || viewer) return;
+    if (!typing || viewer || search) return;
     const normalized = text.replace(/\r\n?/g, '\n');
     // A dropped or pasted image file goes with the message as an image.
     const image = controller.imageFromPath(normalized);
@@ -718,12 +786,23 @@ export function App({ controller, header, hyperlinks = false, colorDepth = 24 }:
       else if (key.rightArrow) setViewer({ index: Math.min(items.length - 1, viewer.index + 1), offset: 0 });
       return;
     }
-    if (key.ctrl && input === 'c') { controller.ctrlC(); return; }
-    if (key.ctrl && input === 'o') {
-      const count = viewItems(snapshot.lines, t).length;
-      if (count && !prompt) setViewer({ index: count - 1, offset: 0 });
+    if (search) {
+      if (key.escape || (key.ctrl && (input === 'c' || input === 'g'))) setSearch(null);
+      else if (key.ctrl && input === 'r') setSearch({ ...search, skip: Math.min(search.skip + 1, Math.max(0, matches.length - 1)) });
+      else if (key.return || key.tab) {
+        if (match) { setEditor({ value: match, cursor: match.length }); setHistoryIndex(null); }
+        setSearch(null);
+      } else if (key.backspace || key.delete) setSearch({ query: search.query.slice(0, -1), skip: 0 });
+      else if (input && !key.ctrl && !key.meta) setSearch({ query: search.query + input, skip: 0 });
       return;
     }
+    if (key.ctrl && input === 'c') { controller.ctrlC(); return; }
+    if (key.ctrl && input === 'o') {
+      const count = viewable().length;
+      if (count && (!prompt || prompt.kind === 'plan')) setViewer({ index: count - 1, offset: 0 });
+      return;
+    }
+    if (key.ctrl && input === 'r' && !prompt) { setSearch({ query: '', skip: 0 }); return; }
     if (key.escape) {
       if (prompt) controller.cancelPrompt();
       else if (controller.stopLocal()) { /* stopped the local command */ }
@@ -743,14 +822,14 @@ export function App({ controller, header, hyperlinks = false, colorDepth = 24 }:
       void controller.pasteImage().then(image => { if (image) attachImage(image); });
       return;
     }
-    if (prompt && prompt.kind !== 'question' && prompt.kind !== 'plan') {
+    if (prompt && !typing) {
       if (key.upArrow) controller.move(-1);
       else if (key.downArrow) controller.move(1);
       else if (key.return) controller.choose();
       else if (/^[1-9]$/.test(input) && Number(input) <= prompt.choices.length) controller.choose(Number(input) - 1);
       return;
     }
-    if ((prompt?.kind === 'question' || prompt?.kind === 'plan') && !editor.value) {
+    if (prompt && !editor.value) {
       if (key.upArrow) { controller.move(-1); return; }
       if (key.downArrow) { controller.move(1); return; }
       if (key.return) { controller.choose(); return; }
@@ -784,10 +863,15 @@ export function App({ controller, header, hyperlinks = false, colorDepth = 24 }:
     if (key.return) {
       if (editor.value.endsWith('\\')) { setEditor(current => ({ value: `${current.value.slice(0, -1)}\n`, cursor: current.value.length })); return; }
       const value = selected?.kind === 'command' ? `/${selected.value}` : editor.value;
-      if (value.trim()) setHistory(entries => [...entries.filter(item => item !== value), value].slice(-100));
+      const { text, extra } = resolve(value);
+      // Messages and commands are remembered (answers to the Agent are not). Later runs get the pasted text in
+      // full; pasted images are temporary files, so their placeholders are left out.
+      if (!prompt && value.trim()) {
+        setHistory(entries => [...entries.filter(item => item !== value), value].slice(-HISTORY_KEEP));
+        controller.remember(text.replace(IMAGE_RE, '').replace(/[ \t]{2,}/g, ' ').trim());
+      }
       setHistoryIndex(null);
       setEditor({ value: '', cursor: 0 });
-      const { text, extra } = resolve(value);
       void controller.submit(text, extra);
       return;
     }
@@ -884,7 +968,8 @@ export function App({ controller, header, hyperlinks = false, colorDepth = 24 }:
           {status ? <Status text={status} {...(statusKeys ? { keys: statusKeys } : {})} startedAt={!snapshot.localRunning && snapshot.phase === 'running' ? snapshot.turnStartedAt : null}
             {...(snapshot.localRunning ? { tone: theme.local } : {})} /> : null}
           <Box marginTop={1} flexDirection="column">
-            {prompt ? <PromptView prompt={prompt} t={t} hint={prompt.kind === 'plan' ? t('ask.planTitle') : t('picker.hint')} /> : null}
+            {prompt ? <PromptView prompt={prompt} t={t} hint={prompt.kind === 'plan' ? t('ask.planTitle') : t('picker.hint')} width={width}
+              planRows={windowSize.rows - RESERVED_ROWS - prompt.choices.length - 2} /> : null}
             {queue.length ? (
               <Box flexDirection="column" paddingX={2}>
                 <Text {...(snapshot.queuePaused ? theme.warning : theme.muted)}>
@@ -896,7 +981,9 @@ export function App({ controller, header, hyperlinks = false, colorDepth = 24 }:
               </Box>
             ) : null}
             {snapshot.localPending && !local ? <Box paddingX={2}><Text {...theme.local}>{t('local.pendingCount', { count: snapshot.localPending })}</Text></Box> : null}
-            {typing ? <InputBox editor={editor} local={local} placeholder={prompt?.kind === 'question' ? t(prompt.question.multiSelect ? 'ask.multiHint' : 'ask.questionHint') : prompt?.kind === 'plan' ? t('ask.planHint') : t('chat.hint')} /> : null}
+            {search ? <HistorySearch query={search.query} match={match ?? null} t={t} />
+              : typing ? <InputBox editor={editor} local={local} placeholder={prompt?.kind === 'question' ? t(prompt.question.multiSelect ? 'ask.multiHint' : 'ask.questionHint')
+                : prompt?.kind === 'plan' ? t('ask.planHint') : prompt?.kind === 'permission' ? t('permission.feedbackHint') : t('chat.hint')} /> : null}
             {suggestions.length ? (
               <Box flexDirection="column" paddingX={2}>
                 {suggestions.map(item => {

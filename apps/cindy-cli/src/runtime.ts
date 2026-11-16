@@ -11,7 +11,7 @@ import { createCliLink, type CliLink } from './link';
 import { CLI_ENDPOINTS, CliError } from './profile';
 import { createRemoteTaskFactory, prepareLocalTools, type RemoteTaskFactory } from './session';
 import { createGuestShares, type GuestShares } from './shares';
-import { createTaskStore, type TaskStore } from './store';
+import { createHistoryStore, createTaskStore, type TaskStore } from './store';
 
 export interface AccountSummary { displayName?: string; email?: string }
 
@@ -20,6 +20,8 @@ export interface ClientRuntime {
   link: CliLink;
   shares: GuestShares;
   tasks: TaskStore;
+  /** Typed input remembered across runs (↑, Ctrl+R), per account. */
+  history: ReturnType<typeof createHistoryStore>;
   factory: RemoteTaskFactory;
   account: AccountSummary | null;
   /** `rg` runnable from the Agent's Bash tool. */
@@ -68,6 +70,7 @@ export async function startClientRuntime(context: CommandContext, signal: AbortS
     return {
       auth, link: activeLink, shares, factory, account, accountLost, searchAvailable: tools.ripgrep, shellAvailable: tools.gitBash, rgPath: tools.rgPath,
       tasks: createTaskStore(context.dataDir, scope),
+      history: createHistoryStore(context.dataDir, scope),
       async catalog() {
         const [devices, received] = await Promise.all([
           activeLink.listDevices().catch(() => []),
