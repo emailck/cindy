@@ -5,7 +5,7 @@
  * - Bug／规则依据：docs/cindy-cli-client-plan.md「斜杠命令」「交互确认」（不伪造用户选择，中断按拒绝）；
  *   provider-sharing.md §9 第 7 条（「本任务总是允许」只能来自用户选择，经同一确认通道回传授权建议）。
  * - 现有覆盖缺口：新代码；Desktop 的确认卡与模型选择器在 renderer，不经过这里。
- * - 最小失败输入：运行中输入被丢弃或立即发送、打断后队列继续自动发送、插话失败丢消息、多选只取一项、计划修改意见丢失；/model 未先选供应商、同名分享无法区分、连不上的来源可被选中；流式增量与最终全文重复显示；Ctrl+C 关闭确认被当成允许；换到另一台电脑的模型仍发到旧任务；
+ * - 最小失败输入：运行中输入被丢弃或立即发送、打断后队列继续自动发送、插话失败丢消息、多选只取一项、计划修改意见丢失；/model 未先选供应商、同名分享无法区分、连不上的来源可被选中；流式增量与最终全文重复显示；流式回复逐行提交后最终全文再次输出或 -p 输出被拆成多段；Ctrl+C 关闭确认被当成允许；换到另一台电脑的模型仍发到旧任务；
  *   /resume 不带原生会话 id；记录里的模型已不可用时仍把旧的原生会话 id 交给当前另一条路由。
  * - tier：unit（假会话句柄、内存任务记录；无网络）。
  */
@@ -59,8 +59,9 @@ describe('ChatController', () => {
   it('shows streamed text once, attaches tool results, and records the task for /resume', async () => {
     const session = fakeHandle(push => {
       push({ type: 'text', data: { text: 'Hel', isFinal: false } });
-      push({ type: 'text', data: { text: 'lo', isFinal: false } });
-      push({ type: 'text', data: { text: 'Hello', isFinal: true } });
+      push({ type: 'text', data: { text: 'lo\nwor', isFinal: false } });
+      push({ type: 'text', data: { text: 'ld\n\nbye', isFinal: false } });
+      push({ type: 'text', data: { text: 'Hello\nworld\n\nbye', isFinal: true } });
       push({ type: 'tool_use', data: { toolUseId: 't1', toolName: 'Bash', input: { command: 'ls -la' } } });
       push({ type: 'tool_result_full', data: { toolUseId: 't1', fullText: 'a.txt\nb.txt' } });
       push({ type: 'done', data: {} });
@@ -71,10 +72,24 @@ describe('ChatController', () => {
     await controller.waitForTurn();
     const lines = controller.getSnapshot().lines.filter(line => line.kind !== 'notice');
     expect(lines.map(line => line.kind === 'tool' ? `tool:${line.name}:${line.summary}:${line.result}` : `${line.kind}:${'text' in line ? line.text : ''}`))
-      .toEqual(['user:list files', 'assistant:Hello', 'tool:Bash:ls -la:a.txt\nb.txt']);
+      .toEqual(['user:list files', 'assistant:Hello', 'assistant:world', 'assistant:\nbye', 'tool:Bash:ls -la:a.txt\nb.txt']);
+    // Finished lines are committed while streaming (the live area stays one line); later pieces continue the same reply.
+    expect(lines.filter(line => line.kind === 'assistant').map(line => line.kind === 'assistant' && line.cont)).toEqual([false, true, true]);
     expect(opened[0]).toMatchObject({ target: 'vps', model: 'claude-a', permission: 'full', effort: 'low', workingDir: '/project' });
     await flush();
     expect(saved.at(-1)).toMatchObject({ title: 'list files', resumeSessionId: 'native-1', target: 'vps' });
+  });
+
+  it('keeps only the unfinished line of a streamed reply live (taller live text makes Ink redraw the whole screen)', async () => {
+    let stream: ((event: AgentEvent) => void) | undefined;
+    const session = fakeHandle(push => { stream = push; });
+    const { controller } = setup([model('vps', 'claude-a')], [session]);
+    await controller.init();
+    await controller.submit('write a lot');
+    stream!({ type: 'text', data: { text: `${Array.from({ length: 60 }, (_, index) => `row ${index + 1}`).join('\n')}\nstill typ`, isFinal: false } });
+    await flush();
+    expect(controller.getSnapshot().live).toBe('still typ');
+    expect(controller.getSnapshot().lines.at(-1)).toMatchObject({ kind: 'assistant', text: expect.stringMatching(/^row 1\n[^]*\nrow 60$/) });
   });
 
   it('returns only what the user chose: session approval carries the suggestion, Ctrl+C and aborts deny', async () => {
@@ -248,14 +263,19 @@ describe('ChatController', () => {
     let decision: Promise<InteractionDecision> | undefined;
     const session = fakeHandle(push => {
       decision = session.ask({ kind: 'permission', requestId: 'p', toolName: 'Bash', input: { command: 'rm -rf x' } });
-      void decision.then(() => { push({ type: 'text', data: { text: 'answer', isFinal: true } }); push({ type: 'done', data: {} }); });
+      void decision.then(() => {
+        push({ type: 'text', data: { text: 'ans', isFinal: false } });
+        push({ type: 'text', data: { text: 'wer\n\nmore', isFinal: false } });
+        push({ type: 'text', data: { text: 'answer\n\nmore', isFinal: true } });
+        push({ type: 'done', data: {} });
+      });
     });
     const { controller } = setup([model('vps', 'claude-a')], [session]);
     const out: string[] = [];
     const err: string[] = [];
     expect(await runPrint(controller, 'do it', { output: text => out.push(text), error: text => err.push(text) })).toBe(0);
     expect(await decision).toEqual({ kind: 'permission', behavior: 'deny' });
-    expect(out).toEqual(['answer']);
+    expect(out).toEqual(['answer\n\nmore']);
     expect(session.handle.close).toHaveBeenCalled();
   });
 });

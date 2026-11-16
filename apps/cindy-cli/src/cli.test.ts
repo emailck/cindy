@@ -70,8 +70,13 @@ describe('cindy command entry', () => {
   });
 
   it('rejects invalid settings without rewriting the file, and preserves a malformed file', async () => {
+    // A saved /theme must read back: the reader rejects the whole file on any key it does not know.
+    expect(await run(['config', 'set', 'theme', 'light'])).toBe(0);
+    expect(await run(['config', 'set', 'theme', 'pink'])).toBe(1);
+    expect(errors.pop()).toBe('INVALID_CONFIG: Invalid value for theme.');
     expect(await run(['config', 'set', 'permissionMode', 'yolo'])).toBe(1);
     expect(errors.pop()).toBe('INVALID_CONFIG: Invalid value for permissionMode.');
+    expect(JSON.parse(await readFile(path.join(dataDir, 'config.json'), 'utf8'))).toEqual({ theme: 'light' });
 
     const file = path.join(dataDir, 'config.json');
     await writeFile(file, '{ not json');

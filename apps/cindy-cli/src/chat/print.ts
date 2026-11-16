@@ -6,10 +6,16 @@ export async function runPrint(controller: ChatController, prompt: string, io: {
   let failed = false;
   const flush = () => {
     const { lines } = controller.getSnapshot();
+    // A streamed reply is committed line by line (cont pieces); print it as one answer again.
+    let reply: string | null = null;
+    const output = () => { if (reply !== null) io.output(reply); reply = null; };
     for (const line of lines.slice(printed)) {
-      if (line.kind === 'assistant') io.output(line.text);
-      else if (line.kind === 'notice' && line.tone !== 'info') { io.error(line.text); if (line.tone === 'error') failed = true; }
+      if (line.kind === 'assistant') {
+        if (line.cont && reply !== null) reply += `\n${line.text}`;
+        else { output(); reply = line.text; }
+      } else if (line.kind === 'notice' && line.tone !== 'info') { output(); io.error(line.text); if (line.tone === 'error') failed = true; }
     }
+    output();
     printed = lines.length;
   };
   const off = controller.subscribe(() => {

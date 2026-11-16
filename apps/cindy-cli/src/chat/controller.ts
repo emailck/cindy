@@ -12,11 +12,19 @@ import type { ModelChoice, PermissionChoice } from '../profile';
 import { permissionOptions } from '../permissions';
 import type { RemoteTaskRequest } from '../session';
 import { taskTitle, type TaskRecord, type TaskStore } from '../store';
+import { fenceAfter } from './markdown';
+import { toolDetail, toolOutput, type ToolDetail } from './tools';
+import { isThemeSetting, resolveTheme, THEME_SETTINGS, type ThemeName, type ThemeSetting } from './theme';
 
 export type Line =
   | { id: string; kind: 'user'; text: string; /** Sent into the running turn (插话). */ steer?: boolean }
-  | { id: string; kind: 'assistant'; text: string }
-  | { id: string; kind: 'tool'; name: string; summary: string; result?: string; error?: boolean }
+  /**
+   * cont: a later piece of the same reply, committed line by line while streaming (no gap before it).
+   * code: the piece starts inside a code fence opened by an earlier piece.
+   */
+  | { id: string; kind: 'assistant'; text: string; cont?: boolean; code?: boolean }
+  /** name is the tool's own name; result is its output (bounded), summarized by the renderer. */
+  | { id: string; kind: 'tool'; name: string; summary: string; detail?: ToolDetail; result?: string; error?: boolean }
   | { id: string; kind: 'notice'; text: string; tone: 'info' | 'warn' | 'error' }
   /** /help and ?: operations grouped by situation; each row is [keys, what it does]. */
   | { id: string; kind: 'help'; sections: HelpSection[] };
@@ -58,15 +66,24 @@ export type Prompt =
 
 export interface ChatSnapshot {
   lines: readonly Line[];
-  /** Streaming assistant text not yet committed. */
+  /** Streaming assistant text not yet committed: only the unfinished last line, finished lines are already in lines. */
   live: string;
+  /** live continues an assistant line already committed during this reply (rendered without a gap). */
+  liveCont: boolean;
+  /** live is inside a code fence. */
+  liveCode: boolean;
   phase: 'idle' | 'connecting' | 'running';
   thinking: boolean;
+  /** When the running turn started (elapsed time in the status line). */
+  turnStartedAt: number | null;
   prompt: Prompt | null;
   model: CatalogModel | null;
   permission: PermissionChoice;
   effort: string | null;
   language: Language;
+  /** Colors in use, and the setting they come from (/theme). */
+  theme: ThemeName;
+  themeSetting: ThemeSetting;
   /** Messages typed during a turn; sent one per turn, in order, after the current turn ends. */
   queue: readonly QueuedMessage[];
   /** Interrupts and errors pause the queue (Desktop parity); Enter on an empty line resumes. */
@@ -89,6 +106,9 @@ export interface ChatDeps {
   tasks: TaskStore;
   saveLanguage?(language: Language): Promise<void>;
   saveModel?(choice: ModelChoice): Promise<void>;
+  /** Saved /theme choice and what was detected about the terminal at startup. */
+  theme?: { setting: ThemeSetting; background: 'dark' | 'light' | null; depth: ThemeName | null };
+  saveTheme?(setting: ThemeSetting): Promise<void>;
   /** False when ripgrep is missing: warn once at startup. */
   searchAvailable?: boolean;
   /** False on Windows without Git Bash: warn once at startup. */
@@ -96,7 +116,7 @@ export interface ChatDeps {
   now?(): number;
 }
 
-export const COMMANDS = ['help', 'model', 'effort', 'permissions', 'plan', 'compact', 'clear', 'resume', 'status', 'cost', 'context', 'lang', 'exit', 'quit'] as const;
+export const COMMANDS = ['help', 'model', 'effort', 'permissions', 'plan', 'compact', 'clear', 'resume', 'status', 'cost', 'context', 'lang', 'theme', 'exit', 'quit'] as const;
 type Command = (typeof COMMANDS)[number];
 
 export function commandSuggestions(input: string): Command[] {
@@ -117,6 +137,7 @@ export function helpSections(t: Translate): HelpSection[] {
     { title: t('help.titleInput'), rows: [
       row('Enter', 'help.send'), row('\\ + Enter · Ctrl+J', 'help.newline'), row('↑ / ↓', 'help.history'),
       row('/ · Tab', 'help.complete'), row('Esc · Ctrl+U', 'help.clearInput'),
+      row('Alt+← / → · Ctrl+W · Ctrl+K', 'help.editing'), row('Ctrl+A / Ctrl+E', 'help.lineStart'),
     ] },
     { title: t('help.titleRunning'), rows: [
       row('Enter', 'help.queue'), row('Ctrl+S', 'help.steer'), row(t('help.keyUpEmpty'), 'help.takeBack'), row('Esc · Ctrl+C', 'help.interrupt'),
@@ -145,12 +166,6 @@ export function toolSummary(input: unknown): string {
   return '';
 }
 
-function firstLines(text: string, max = 2): string {
-  const lines = text.split('\n').filter(line => line.trim());
-  const head = lines.slice(0, max).map(line => (line.length > 160 ? `${line.slice(0, 159)}…` : line));
-  return lines.length > max ? `${head.join('\n')}\n… (+${lines.length - max})` : head.join('\n');
-}
-
 type Pending =
   | { kind: 'picker'; choose(index: number): void | Promise<void>; back?: () => void }
   | { kind: 'permission'; decisions: InteractionDecision[]; resolve(decision: InteractionDecision): void }
@@ -171,11 +186,18 @@ export class ChatController {
   private exitTimer: ReturnType<typeof setTimeout> | undefined;
   private exitWaiters: Array<() => void> = [];
   private turnWaiters: Array<() => void> = [];
+  /** Raw text of the reply being streamed, and how much of it is already committed to lines. */
+  private streamed = '';
+  private flushed = 0;
+  /** A code fence is open at the end of the committed part of the reply. */
+  private fence = false;
 
   constructor(private readonly deps: ChatDeps) {
     this.t = createTranslator(deps.language);
-    this.snapshot = { lines: [], live: '', phase: 'idle', thinking: false, prompt: null, model: null,
-      permission: deps.permission, effort: null, language: deps.language, queue: [], queuePaused: false, exitArmed: false, exited: false };
+    this.snapshot = { lines: [], live: '', liveCont: false, liveCode: false, phase: 'idle', thinking: false, turnStartedAt: null, prompt: null, model: null,
+      permission: deps.permission, effort: null, language: deps.language, queue: [],
+      theme: resolveTheme(deps.theme?.setting ?? 'auto', { background: deps.theme?.background ?? null, depth: deps.theme?.depth ?? null }),
+      themeSetting: deps.theme?.setting ?? 'auto', queuePaused: false, exitArmed: false, exited: false };
   }
 
   subscribe = (listener: () => void) => { this.listeners.add(listener); return () => { this.listeners.delete(listener); }; };
@@ -189,6 +211,11 @@ export class ChatController {
   private push(line: LineInput) { this.update({ lines: [...this.snapshot.lines, { ...line, id: randomUUID() } as Line] }); }
   private notice(key: MessageKey, vars?: Record<string, string | number>, tone: 'info' | 'warn' | 'error' = 'info') { this.push({ kind: 'notice', text: this.t(key, vars), tone }); }
   private where(model: CatalogModel) { return `${model.providerName} · ${model.targetLabel}`; }
+  /** Paths inside the project directory read relative to it in the transcript. */
+  private relative(path: string) {
+    const root = this.deps.workingDir.replace(/[\\/]+$/, '');
+    return path.startsWith(`${root}/`) || path.startsWith(`${root}\\`) ? path.slice(root.length + 1) : path;
+  }
 
   /** Loads models and applies the initial choice. */
   async init(): Promise<void> {
@@ -289,7 +316,7 @@ export class ChatController {
     if (!this.title) this.title = taskTitle(text);
     const handle = await this.ensureHandle(model);
     if (!handle) return;
-    this.update({ phase: 'running', thinking: false });
+    this.update({ phase: 'running', thinking: false, turnStartedAt: (this.deps.now ?? Date.now)() });
     try { await handle.send({ type: 'user', content: text }); }
     catch (error) {
       this.notice('chat.error', { message: errorText(error) }, 'error');
@@ -331,9 +358,49 @@ export class ChatController {
     if (this.handle === handle) { this.handle = null; this.finishTurn('closed'); }
   }
 
+  /** Uncommitted part of the reply; a continuation drops the line break that separated it from the committed part. */
+  private streamRest() {
+    const rest = this.streamed.slice(this.flushed);
+    return this.flushed ? rest.replace(/^[ \t]*\n/, '') : rest;
+  }
+
+  /**
+   * Streamed reply text: finished lines move to lines right away so only the unfinished last line stays live.
+   * Ink clears the screen and rewrites the whole transcript on every frame once the live area is taller than
+   * the terminal, which is what made long replies flicker.
+   */
+  private streamText(text: string, final: boolean) {
+    if (final) {
+      // The final event carries the whole reply; keep the streamed text if it does not extend what was already committed.
+      if (!this.flushed || text.startsWith(this.streamed.slice(0, this.flushed))) this.streamed = text;
+      if (this.snapshot.thinking) this.update({ thinking: false });
+      this.commitLive();
+      return;
+    }
+    this.streamed += text;
+    const cut = this.streamed.lastIndexOf('\n');
+    const end = cut < 0 ? 0 : this.streamed.slice(0, cut).trimEnd().length;
+    const raw = end > this.flushed ? this.streamed.slice(this.flushed, end) : '';
+    const piece = this.flushed ? raw.replace(/^[ \t]*\n/, '') : raw;
+    if (piece.trim()) {
+      const cont = this.flushed > 0;
+      const code = this.fence;
+      this.flushed = end;
+      this.fence = fenceAfter(piece, code);
+      this.update({ lines: [...this.snapshot.lines, { id: randomUUID(), kind: 'assistant', text: piece, cont, ...(code ? { code } : {}) }],
+        live: this.streamRest(), liveCont: true, liveCode: this.fence, thinking: false });
+    } else this.update({ live: this.streamRest(), liveCont: this.flushed > 0, liveCode: this.fence, thinking: false });
+  }
+
   private commitLive() {
-    if (!this.snapshot.live.trim()) { if (this.snapshot.live) this.update({ live: '' }); return; }
-    this.update({ lines: [...this.snapshot.lines, { id: randomUUID(), kind: 'assistant', text: this.snapshot.live.trimEnd() }], live: '' });
+    const rest = this.streamRest().trimEnd();
+    const cont = this.flushed > 0;
+    const code = this.fence;
+    this.streamed = '';
+    this.flushed = 0;
+    this.fence = false;
+    if (!rest.trim()) { if (this.snapshot.live) this.update({ live: '', liveCont: false, liveCode: false }); return; }
+    this.update({ lines: [...this.snapshot.lines, { id: randomUUID(), kind: 'assistant', text: rest, cont, ...(code ? { code } : {}) }], live: '', liveCont: false, liveCode: false });
   }
 
   apply(event: AgentEvent): void {
@@ -342,8 +409,7 @@ export class ChatController {
       case 'text': {
         if (event.agentMeta && typeof (event.agentMeta as { parentUuid?: unknown }).parentUuid === 'string') return; // subagent text
         const text = typeof data.text === 'string' ? data.text : '';
-        if (data.isFinal === true) { this.update({ live: text, thinking: false }); this.commitLive(); }
-        else this.update({ live: this.snapshot.live + text, thinking: false });
+        this.streamText(text, data.isFinal === true);
         return;
       }
       case 'thinking': this.update({ thinking: data.stage !== 'final' && data.stage !== 'redacted' }); return;
@@ -352,14 +418,17 @@ export class ChatController {
         const id = typeof data.toolUseId === 'string' ? data.toolUseId : randomUUID();
         const lineId = randomUUID();
         this.tools.set(id, lineId);
-        this.update({ thinking: false, lines: [...this.snapshot.lines, { id: lineId, kind: 'tool', name: String(data.toolName ?? 'tool'), summary: toolSummary(data.input) }] });
+        const name = String(data.toolName ?? 'tool');
+        const detail = toolDetail(name, data.input);
+        if (detail && detail.kind !== 'todos') detail.path = this.relative(detail.path);
+        this.update({ thinking: false, lines: [...this.snapshot.lines, { id: lineId, kind: 'tool', name, summary: this.relative(toolSummary(data.input)), ...(detail ? { detail } : {}) }] });
         return;
       }
       case 'tool_result_full': {
         const lineId = typeof data.toolUseId === 'string' ? this.tools.get(data.toolUseId) : undefined;
         if (!lineId || typeof data.fullText !== 'string') return;
-        const result = firstLines(data.fullText);
-        this.update({ lines: this.snapshot.lines.map(line => (line.id === lineId && line.kind === 'tool' ? { ...line, result } : line)) });
+        const { output, error } = toolOutput(data.fullText);
+        this.update({ lines: this.snapshot.lines.map(line => (line.id === lineId && line.kind === 'tool' ? { ...line, result: output, ...(error || data.isError === true ? { error: true } : {}) } : line)) });
         return;
       }
       case 'error': {
@@ -378,7 +447,7 @@ export class ChatController {
   private finishTurn(outcome: 'done' | 'interrupted' | 'error' | 'closed' = 'done') {
     this.commitLive();
     const wasRunning = this.snapshot.phase !== 'idle';
-    if (wasRunning || this.snapshot.thinking) this.update({ phase: 'idle', thinking: false });
+    if (wasRunning || this.snapshot.thinking) this.update({ phase: 'idle', thinking: false, turnStartedAt: null });
     for (const waiter of this.turnWaiters.splice(0)) waiter();
     if (outcome !== 'done') {
       if (this.snapshot.queue.length && !this.snapshot.queuePaused) this.update({ queuePaused: true });
@@ -563,7 +632,7 @@ export class ChatController {
     const name = (head ?? '').toLowerCase() as Command;
     const arg = rest.join(' ').trim();
     if (!(COMMANDS as readonly string[]).includes(name)) { this.notice('chat.unknownCommand', { name: `/${head}` }, 'warn'); return; }
-    const busy = this.snapshot.phase !== 'idle' && !['help', 'status', 'cost', 'context', 'exit', 'quit', 'lang'].includes(name);
+    const busy = this.snapshot.phase !== 'idle' && !['help', 'status', 'cost', 'context', 'exit', 'quit', 'lang', 'theme'].includes(name);
     if (busy) { this.notice('chat.busy', undefined, 'warn'); return; }
     switch (name) {
       case 'help': this.push({ kind: 'help', sections: helpSections(this.t) }); return;
@@ -627,6 +696,7 @@ export class ChatController {
         this.picker('picker.lang', [{ label: 'English' }, { label: '中文' }], index => apply(index === 0 ? 'en' : 'zh'), this.snapshot.language === 'zh' ? 1 : 0);
         return;
       }
+      case 'theme': return this.themeCommand(arg);
       case 'exit':
       case 'quit': await this.exit(); return;
     }
@@ -689,6 +759,25 @@ export class ChatController {
     catch (error) { this.notice('chat.error', { message: errorText(error) }, 'error'); }
   }
 
+  private async themeCommand(arg: string): Promise<void> {
+    const detected = { background: this.deps.theme?.background ?? null, depth: this.deps.theme?.depth ?? null };
+    const label = (setting: ThemeSetting) => setting === 'auto'
+      ? this.t('theme.auto', { theme: this.t(`theme.${resolveTheme('auto', detected)}` as MessageKey) })
+      : this.t(`theme.${setting}` as MessageKey);
+    const apply = async (setting: ThemeSetting) => {
+      // Lines already printed keep their colors; everything from here on uses the new theme.
+      this.update({ themeSetting: setting, theme: resolveTheme(setting, detected) });
+      await this.deps.saveTheme?.(setting).catch(() => undefined);
+      this.notice('chat.theme', { theme: label(setting) });
+    };
+    if (arg) {
+      if (!isThemeSetting(arg)) { this.notice('chat.unknownCommand', { name: `/theme ${arg}` }, 'warn'); return; }
+      return apply(arg);
+    }
+    this.picker('picker.theme', THEME_SETTINGS.map(setting => ({ label: label(setting) })), index => apply(THEME_SETTINGS[index]!),
+      THEME_SETTINGS.indexOf(this.snapshot.themeSetting));
+  }
+
   private async effortCommand(arg: string): Promise<void> {
     const model = this.snapshot.model;
     if (!model?.efforts.length) { this.notice('chat.effortNone', undefined, 'warn'); return; }
@@ -740,7 +829,10 @@ export class ChatController {
     this.resumeSessionId = undefined;
     this.title = '';
     this.tools.clear();
-    this.update({ live: '', phase: 'idle', thinking: false });
+    this.streamed = '';
+    this.flushed = 0;
+    this.fence = false;
+    this.update({ live: '', liveCont: false, liveCode: false, phase: 'idle', thinking: false, turnStartedAt: null });
   }
 
   private async resumeCommand(): Promise<void> {

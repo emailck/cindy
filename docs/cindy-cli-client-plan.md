@@ -88,10 +88,12 @@ apps/desktop/src/main/remote-agent/{controller,executor}/**（Electron 无关闭
 | `/status` | 账号、设备、供应商、模型、权限档、连接状态 | 本地状态 |
 | `/cost` `/context` | 本任务用量与上下文占用 | `getUsageSnapshot`、`getContextUsage` |
 | `/lang [zh\|en]` | 切换界面语言 | 本地配置 |
+| `/theme [auto\|dark\|light\|ansi]` | 终端配色：自动（按终端背景）、深色、浅色、终端自带 16 色 | 本地配置 |
 | `/exit` `/quit` | 退出（关闭链路与任务） | — |
 
 快捷键：Enter 发送，运行中为排队（回合结束后逐条发送）；Ctrl+S 插话（`handle.steer`，不打断）；空输入框 ↑ 取回排队消息；
-Esc 打断（`handle.abort`，队列暂停，空输入框 Enter 继续）；Shift+Tab 循环权限档；行尾 `\` 或 Ctrl+J 换行；↑/↓ 历史；Ctrl+C 两次退出。
+Esc 打断（`handle.abort`，队列暂停，空输入框 Enter 继续）；Shift+Tab 循环权限档；行尾 `\` 或 Ctrl+J 换行；↑/↓ 历史（多行输入先在行间移动）；
+命令列表 ↑/↓ 选择、Enter 执行选中项；Alt/Ctrl+←→ 按词移动、Ctrl+W 删词、Ctrl+K 删到行尾、Delete 向后删；Ctrl+C 两次退出。
 提问支持数字键与多选（空格勾选）；计划确认可直接输入修改意见。
 非交互：`cindy -p "提示"` 输出最终回答后退出，`--model`、`--permission-mode` 可覆盖默认。
 `cindy -c`（`--continue`）接着当前目录最近一次的任务，可与 `-p` 合用；只有原来的电脑、供应商与模型仍可用时才接回，
@@ -105,7 +107,7 @@ Esc 打断（`handle.abort`，队列暂停，空输入框 Enter 继续）；Shif
 | CC-002 | `apps/cindy-cli` 骨架：package、esbuild 构建、`cindy` 入口、数据目录、进程锁、`login/logout/status`（引用 cindy-host auth）、Desktop 闭包门禁 | 001 | 无 Electron 构建通过；help/version/status 可运行；门禁对注入的 electron 导入报错；秘密不进参数、日志 |
 | CC-003 | `link/`：连接 relay、presence、设备与供应商列表（`maker:provider:list`、`maker:get-capabilities`）、出站 `openLink`（分享能力 + 后台链路）、`invoke` 恢复语义 | 002 | 通过真实 `DeviceLinkClient` + 模拟 relay：上线等待、重开、主动关闭后不自动重连、无响应快速失败；两个 peer 其一静默时另一个零感知（故障半径三问） |
 | CC-004 | `session/` + `store/`：实现 `StartRemoteAgentDeps`，得到 `AgentSessionHandle`；项目说明同步、ripgrep、本地任务记录与续接 | 003 | 对接真实 `createRemoteAgentHost`（引用现有 cindy-host runtime 集成测试方式）：开任务、流式、工具回到本机执行、停止、续接 |
-| CC-005 | `tui/`：ink 交互界面；流式输出、工具调用展示、权限确认、回答 Agent 提问、Esc 打断、`/model` `/resume` `/clear` `/exit`、`-p` 非交互 | 004 | 组件测试覆盖确认与提问的真实回调；终端浅/深背景可读（只用终端语义色）；未验证终端如实登记 |
+| CC-005 | `tui/`：ink 交互界面；流式输出、工具调用展示、权限确认、回答 Agent 提问、Esc 打断、`/model` `/resume` `/clear` `/exit`、`-p` 非交互 | 004 | 组件测试覆盖确认与提问的真实回调；终端浅/深背景可读（深色、浅色两套 Desktop 语义色 + 终端 16 色兜底，见进度「呈现与配色」）；未验证终端如实登记 |
 | CC-006 | `share-guest/` 与 `cindy received join|list|leave`：预览信息完整展示、确认后申请、配对码、等待/撤回、名单刷新（暂停/移除）、退出；任务目标解析与凭证确认 | 003（使用依赖 004） | 假 REST + 真实 scoped 帧：批准前拒绝、批准后可用、暂停/移除后拒绝且迟到结果不恢复授权、换账号后迟到结果失效；凭证类操作在 full 档下仍要确认 |
 | CC-007 | 集成验收 | 004–006 | 同账号：本机 CLI → 自己的 cindy-host（Claude）；跨账号：另一账号经分享使用同一 cindy-host。真实账号由用户操作，未验证项登记 |
 | CC-008 | 文档与同步清单：CLI README、`repo-map.md`、`provider-sharing.md` 补充 CLI 受邀者端、上游合并检查清单 | 007 | `pnpm check:dev-docs` 通过；合并清单可执行 |

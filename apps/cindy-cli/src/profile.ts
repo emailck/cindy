@@ -4,6 +4,7 @@ import { homedir, hostname } from 'node:os';
 import path from 'node:path';
 // Fork-owned CLI code is shared with the provider host by direct import (same data-directory rules).
 import { HostCliError, resolveDataDirectory as resolveHostDataDirectory } from '../../cindy-host/src/config';
+import { isThemeSetting, type ThemeSetting } from './chat/theme';
 import { isLanguage, type Language, type MessageKey } from './i18n';
 
 export { HOST_ENDPOINTS as CLI_ENDPOINTS, HOST_REGION as CLI_REGION } from '../../cindy-host/src/config';
@@ -31,9 +32,11 @@ export interface CliConfig {
   permissionMode: PermissionChoice;
   deviceName: string;
   model?: ModelChoice;
+  /** Terminal colors; auto follows the terminal background. */
+  theme?: ThemeSetting;
 }
 type StoredConfig = Partial<CliConfig>;
-export const CONFIG_KEYS = ['language', 'permissionMode', 'deviceName'] as const;
+export const CONFIG_KEYS = ['language', 'permissionMode', 'deviceName', 'theme'] as const;
 export type ConfigKey = (typeof CONFIG_KEYS)[number];
 
 /** Per-user application data, outside any project. Explicit flag/env win. */
@@ -68,6 +71,7 @@ function validateStored(value: unknown, file: string): StoredConfig {
     else if (key === 'permissionMode' && isPermissionChoice(item)) result.permissionMode = item;
     else if (key === 'deviceName' && validDeviceName(item)) result.deviceName = item;
     else if (key === 'model' && isModelChoice(item)) result.model = item;
+    else if (key === 'theme' && isThemeSetting(item)) result.theme = item;
     else throw invalid();
   }
   return result;
@@ -128,6 +132,7 @@ export function parseConfigValue(key: string, value: string): Partial<CliConfig>
   if (key === 'language' && isLanguage(value)) return { language: value };
   if (key === 'permissionMode' && isPermissionChoice(value)) return { permissionMode: value };
   if (key === 'deviceName' && validDeviceName(value)) return { deviceName: value };
+  if (key === 'theme' && isThemeSetting(value)) return { theme: value };
   throw new CliError('INVALID_CONFIG', 'error.configValue', { key });
 }
 

@@ -122,10 +122,30 @@
   「edited line」。模型提到远端看到的虚拟工作区路径很长、一次绝对路径被映射错后自行纠正——这是 Desktop 远程会话的路径映射行为
   （CLI 原样引用，Desktop 间远程任务相同），本轮未改。
 
+## 呈现与配色：参考 Claude Code 的交互习惯（2026-11-15，用户要求）
+
+- 用户要求参考 Claude Code 的显示、渲染与操作方式，只借鉴交互、不搬代码；实现完全基于现有 ink 界面，未读取任何 Claude Code 源码。
+- 呈现：回复 `⏺` 起头、按行解析 Markdown（代码块状态跨流式片段延续，`code` 标记由控制器在提交片段时计算，`markdown.ts`）；
+  工具行 `⏺ 名称(参数)` + `⎿` 摘要（`tools.ts`：Read 行数、Edit diff、Write 行数与预览、TodoWrite 清单、其余输出前 4 行 + 剩余行数、
+  `<tool_use_error>` 去标签标红；项目目录内路径显示为相对路径；`mcp__a__b` 显示为 `a - b (MCP)`）；状态行带已用时间；
+  页脚左侧权限档（full / plan）或「? 查看全部操作」、右侧模型。
+- 操作：命令列表 ↑/↓ 选择、Enter 执行选中项；多行输入 ↑/↓ 在行间移动；按词移动与删除、Ctrl+K、Delete 向后删、Ctrl+A/E 改为行首行尾。
+- 配色（用户追加要求「不只是黑白」）：`theme.ts` 深色 / 浅色两套取 Desktop token 值（Thinking/Heart Orange `#EA6B17`、info-700、
+  status-success、error-fg、warning、text-secondary/tertiary、GitHub diff 前景与底色），`ansi` 用终端命名色。`auto` 启动时发 OSC 11 + DA1，
+  等 DA1 回复后才交还 stdin（防止回复漏进输入框），探测期间 Ctrl+C 转为 SIGINT；不支持时用 `COLORFGBG`，再默认深色；
+  终端颜色深度不足 256 色或设置 `NO_COLOR` 时用 `ansi`。新增 `/theme` 与配置键 `theme`。
+- 兼容：配置文件新增 `theme` 键。读取端对未知键整体报错（既有设计），降级到本批之前的 CLI 版本会因 `theme` 报配置无效：降级前在新版本执行 `cindy config reset theme`，或手动删掉 `config.json` 里的 `theme`。
+- 测试：App 新增「Markdown 与工具摘要」「输入编辑」「背景探测协议」「/theme」4 项，修改 1 项既有断言（`⎿` 后两个空格）；cli 配置用例加入 theme。
+  CLI 全部 7 文件 41 项通过（见下方交付前检查）。
+- PTY 实测（Linux，Node 24，xterm-256color + truecolor，临时脚本打包真实 App + 控制器、假会话）：浅色回复分片到达、深色、终端不支持 OSC 11
+  三种情形均判断正确，输入框只收到用户键入的 `hi`、无回复泄漏；输出含 24 位色（Thinking Orange、两套 diff 底色）；用 pyte 回放成图目检
+  深浅两套布局正常。临时脚本、虚拟环境与截图在会话临时目录，未进仓库。
+- 未验证：真实终端（iTerm2、Windows Terminal、VS Code、tmux、SSH 远端）的背景探测与观感；Windows 控制台字体对 `⏵ ⏸ ✻` 等字形的支持。
+
 ## 未验证项
 
 - 跨账号分享的申请/批准/暂停/撤销流程未在真实环境运行（本次使用的是已存在的分享）；提供端为 cindy-host 的同账号路径未实测。
-- 真实终端中的 ink 交互（中文输入法、窄窗口、浅色/深色终端主题）未目检；配色只用终端命名色。
+- 真实终端中的 ink 交互（中文输入法、窄窗口、真实终端里的浅色/深色）未目检；配色见「呈现与配色」，PTY 回放截图不等于真实终端目检。
 - macOS / Linux 未运行；Linux 需要可用的 Secret Service。
 
 ## 验收所需（CC-007）

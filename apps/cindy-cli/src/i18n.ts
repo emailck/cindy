@@ -36,7 +36,7 @@ Commands:
   received withdraw REQUEST_ID Withdraw a pending request
   received leave MEMBER_ID     Stop using a shared provider
   config show                  Show settings
-  config set KEY VALUE         Change a setting (language, permissionMode, deviceName)
+  config set KEY VALUE         Change a setting (language, permissionMode, deviceName, theme)
   config reset KEY             Restore a setting's default
   help, version
 
@@ -59,7 +59,7 @@ In the interactive UI, type /help or ? for all keyboard operations.`,
   'error.profileBusy': 'This data directory is used by another Cindy process. Close it first. If a crash left profile.lock, make sure no Cindy process is running before removing it.',
   'error.configInvalid': 'The settings file is invalid. It has been kept unchanged: {file}',
   'error.configBusy': 'Settings are being changed by another process. Try again.',
-  'error.configKey': 'Unknown setting. Available: language, permissionMode, deviceName.',
+  'error.configKey': 'Unknown setting. Available: language, permissionMode, deviceName, theme.',
   'error.configValue': 'Invalid value for {key}.',
   'error.terminalRequired': 'This command needs an interactive terminal.',
   'error.credentialStore': 'Credential storage is unavailable. On Linux, check that your data directory is writable, outside Git workspaces, and that credentials/ has permissions 700 and its files 600. If you selected keyring, unlock Secret Service. On macOS, unlock the login Keychain; on Windows, check Credential Manager.',
@@ -190,6 +190,16 @@ In the interactive UI, type /help or ? for all keyboard operations.`,
   "chat.sessionOpen": "open",
   "chat.sessionNone": "not started",
   "chat.toolDenied": "Denied.",
+  "tool.read": "Read {count} lines",
+  "tool.wrote": "Wrote {count} lines to {path}",
+  "tool.updated": "Updated {path} (+{added} −{removed})",
+  "tool.more": "… +{count} lines",
+  "tool.noContent": "(No content)",
+  "footer.shortcuts": "? for all keys",
+  "footer.full": "⏵⏵ full access · Shift+Tab to switch",
+  "footer.plan": "⏸ Plan mode · Shift+Tab to switch",
+  "help.editing": "Move by word · delete word · delete to end of line",
+  "help.lineStart": "Start / end of line",
   "perm.full": "full — act without asking",
   "perm.normal": "normal — ask before risky actions",
   "perm.plan": "plan — plan only, change nothing",
@@ -228,6 +238,13 @@ In the interactive UI, type /help or ? for all keyboard operations.`,
   "cmd.cost": "Show token usage and cost for this session",
   "cmd.context": "Show context usage",
   "cmd.lang": "Switch interface language (en, zh)",
+  "cmd.theme": "Choose terminal colors (auto, dark, light, ansi)",
+  "picker.theme": "Terminal colors",
+  "theme.auto": "Auto — follow the terminal ({theme})",
+  "theme.dark": "Dark",
+  "theme.light": "Light",
+  "theme.ansi": "Terminal palette (16 colors)",
+  "chat.theme": "Colors: {theme}",
   "cmd.exit": "Exit",
 } as const;
 
@@ -252,7 +269,7 @@ const zh: Record<MessageKey, string> = {
   received withdraw 申请ID     撤回申请
   received leave 成员ID        不再使用某个分享来的供应商
   config show                  查看设置
-  config set 键 值             修改设置（language、permissionMode、deviceName）
+  config set 键 值             修改设置（language、permissionMode、deviceName、theme）
   config reset 键              恢复某项设置的默认值
   help、version
 
@@ -275,7 +292,7 @@ const zh: Record<MessageKey, string> = {
   'error.profileBusy': '这个数据目录正被另一个 Cindy 进程使用，请先关闭它。如果是异常退出留下了 profile.lock，确认没有 Cindy 进程在运行后再删除。',
   'error.configInvalid': '设置文件无效，已保持原样：{file}',
   'error.configBusy': '设置正被另一个进程修改，请重试。',
-  'error.configKey': '未知设置。可用：language、permissionMode、deviceName。',
+  'error.configKey': '未知设置。可用：language、permissionMode、deviceName、theme。',
   'error.configValue': '{key} 的值无效。',
   'error.terminalRequired': '这个命令需要在交互终端中运行。',
   'error.credentialStore': '凭证存储不可用。Linux 请检查用户数据目录可写且位于 Git 工作区外，credentials/ 目录权限为 700、文件权限为 600。如主动选择了 keyring，请解锁 Secret Service。macOS 请解锁登录钥匙串；Windows 请检查凭据管理器。',
@@ -406,6 +423,16 @@ const zh: Record<MessageKey, string> = {
   "chat.sessionOpen": "已打开",
   "chat.sessionNone": "未开始",
   "chat.toolDenied": "已拒绝。",
+  "tool.read": "读取了 {count} 行",
+  "tool.wrote": "写入 {count} 行到 {path}",
+  "tool.updated": "已更新 {path}（+{added} −{removed}）",
+  "tool.more": "… 还有 {count} 行",
+  "tool.noContent": "（无输出）",
+  "footer.shortcuts": "? 查看全部操作",
+  "footer.full": "⏵⏵ 完全访问 · Shift+Tab 切换",
+  "footer.plan": "⏸ 计划模式 · Shift+Tab 切换",
+  "help.editing": "按词移动 · 删除前一个词 · 删除到行尾",
+  "help.lineStart": "行首 / 行尾",
   "perm.full": "full：完全访问，不再确认",
   "perm.normal": "normal：有风险的操作先确认",
   "perm.plan": "plan：只做计划，不做改动",
@@ -444,6 +471,13 @@ const zh: Record<MessageKey, string> = {
   "cmd.cost": "查看本任务的 token 用量与费用",
   "cmd.context": "查看上下文占用",
   "cmd.lang": "切换界面语言（en、zh）",
+  "cmd.theme": "选择终端配色（auto、dark、light、ansi）",
+  "picker.theme": "终端配色",
+  "theme.auto": "自动：跟随终端（{theme}）",
+  "theme.dark": "深色",
+  "theme.light": "浅色",
+  "theme.ansi": "终端自带配色（16 色）",
+  "chat.theme": "配色：{theme}",
   "cmd.exit": "退出",
 };
 
