@@ -8,17 +8,20 @@ import { randomUUID } from 'node:crypto';
 import path from 'node:path';
 import type { AgentEvent, AgentSessionHandle, AskUserQuestionItem, Effort, InteractionDecision, InteractionRequest, UserContentBlock, UserMessage } from '@cindy/maker-core';
 import { readTokenSpeedSnapshot } from '@cindy/maker-shared/usage-format';
-import type { CatalogModel, CatalogResult, CatalogSource } from '../catalog';
+import { parseShareAgentDeviceId, type CatalogModel, type CatalogResult, type CatalogSource } from '../catalog';
 import { createTranslator, type Language, type MessageKey, type Translate } from '../i18n';
 import type { ModelChoice, PermissionChoice } from '../profile';
 import { permissionOptions } from '../permissions';
+import { shareFailure } from '../received';
 import type { RemoteTaskRequest } from '../session';
 import { taskTitle, type TaskRecord, type TaskStore } from '../store';
-import { fenceAfter, isTableRow } from './markdown';
+import { fenceAfter, stableMarkdownEnd } from './markdown';
 import {
-  builtinName, COMMAND_ROWS, commandText, DETAIL_ROWS, GROUPED_TOOLS, SUBAGENT_TOOLS, toolDetail, toolOutput,
+  builtinName, commandText, GROUPED_TOOLS, SUBAGENT_TOOLS, toolDetail, toolOutput,
   type DiffRow, type ReadText, type ToolDetail,
 } from './tools';
+import { commandAvailable, commandHelpRows, resolveCommand } from './commands';
+export { COMMANDS, commandDescription, commandSuggestions } from './commands';
 import { isThemeSetting, resolveTheme, THEME_SETTINGS, type ThemeName, type ThemeSetting } from './theme';
 
 /** A tool call a sub-Agent made, shown under the call that started it. */
@@ -37,7 +40,7 @@ export interface Outgoing { text: string; display?: string; images?: readonly Im
 export type Line =
   | { id: string; kind: 'user'; text: string; /** Sent into the running turn (插话). */ steer?: boolean }
   /**
-   * cont: a later piece of the same reply, committed line by line while streaming (no gap before it).
+   * cont: a later piece of the same reply, committed in stable blocks while streaming (no gap before it).
    * code: the piece starts inside a code fence opened by an earlier piece.
    */
   | { id: string; kind: 'assistant'; text: string; cont?: boolean; code?: boolean }
@@ -106,7 +109,7 @@ export function groupModels(models: readonly CatalogModel[]): ProviderGroup[] {
 }
 
 export type Prompt =
-  | { kind: 'picker'; title: string; choices: Choice[]; index: number; /** Esc returns to the previous step. */ back?: boolean }
+  | { kind: 'picker'; title: string; choices: Choice[]; index: number; /** Esc returns to the previous step. */ back?: boolean; searchable?: boolean }
   /** feedback: typed text denies the call and tells the Agent why (not for confirmations this computer owns). */
   | { kind: 'permission'; title: string; summary: string; description?: string; preview?: PermissionPreview; choices: Choice[]; index: number; feedback: boolean }
   | { kind: 'question'; question: AskUserQuestionItem; position: string; choices: Choice[]; index: number; /** Multi-select: toggled option indexes. */ selected: number[] }
@@ -121,12 +124,9 @@ export type PermissionPreview =
   | { kind: 'write'; rows: string[]; more: number }
   | { kind: 'command'; rows: string[]; more: number };
 
-/** Rows of an edit diff shown on its confirmation. */
-const PREVIEW_DIFF_ROWS = 20;
-
 export interface ChatSnapshot {
   lines: readonly Line[];
-  /** Streaming assistant text not yet committed: only the unfinished last line, finished lines are already in lines. */
+  /** Streaming assistant text not yet committed: an unfinished line or structural Markdown block. */
   live: string;
   /** live continues an assistant line already committed during this reply (rendered without a gap). */
   liveCont: boolean;
@@ -213,6 +213,8 @@ export interface ChatDeps {
   openTask(request: RemoteTaskRequest): Promise<AgentSessionHandle>;
   tasks: TaskStore;
   saveLanguage?(language: Language): Promise<void>;
+  /** Explicit per-share local trust; status and mutations revalidate membership. */
+  shareTrust?(shareId: string, enabled?: boolean): Promise<{ name: string; enabled: boolean }>;
   saveModel?(choice: ModelChoice): Promise<void>;
   /** Saved /theme choice and what was detected about the terminal at startup. */
   theme?: { setting: ThemeSetting; background: 'dark' | 'light' | null; depth: ThemeName | null };
@@ -256,24 +258,11 @@ export const IMAGE_TYPES: Readonly<Record<string, string>> = { '.png': 'image/pn
 /** A `!command`'s output kept for the transcript and the next message. */
 const LOCAL_OUTPUT_KEEP = 30_000;
 
-export const COMMANDS = ['help', 'model', 'effort', 'permissions', 'plan', 'compact', 'clear', 'resume', 'status', 'cost', 'context', 'lang', 'theme', 'exit', 'quit'] as const;
-type Command = (typeof COMMANDS)[number];
-
-export function commandSuggestions(input: string): Command[] {
-  if (!input.startsWith('/') || input.includes(' ')) return [];
-  const prefix = input.slice(1).toLowerCase();
-  return COMMANDS.filter(name => name.startsWith(prefix) && name !== 'quit');
-}
-
-export function commandDescription(t: Translate, name: Command): string {
-  return t((name === 'quit' ? 'cmd.exit' : `cmd.${name}`) as MessageKey);
-}
-
 /** The operations guide shown by /help and ?. Keys are literal; descriptions follow the interface language. */
 export function helpSections(t: Translate): HelpSection[] {
   const row = (keys: string, key: MessageKey): [string, string] => [keys, t(key)];
   return [
-    { title: t('help.titleCommands'), rows: COMMANDS.filter(command => command !== 'quit').map(command => [`/${command}`, commandDescription(t, command)]) },
+    { title: t('help.titleCommands'), rows: commandHelpRows(t) },
     { title: t('help.titleInput'), rows: [
       row('Enter', 'help.send'), row('\\ + Enter · Ctrl+J', 'help.newline'), row('↑ / ↓', 'help.history'),
       row('/ · Tab', 'help.complete'), row('@', 'help.mention'), row('!', 'help.local'),
@@ -598,6 +587,7 @@ export class ChatController {
     const scored: Array<[number, string]> = [];
     for (const file of this.files) {
       const lower = file.toLowerCase();
+      if (needle.endsWith('/') && lower === needle) continue;
       const name = lower.replace(/\/$/, '').split('/').pop()!;
       const score = !needle ? 3 : name.startsWith(needle) ? 0 : name.includes(needle) ? 1 : lower.includes(needle) ? 2 : subsequence(lower, needle) ? 3 : -1;
       if (score >= 0) scored.push([score, file]);
@@ -675,7 +665,7 @@ export class ChatController {
   }
 
   /**
-   * Streamed reply text: finished lines move to lines right away so only the unfinished last line stays live.
+   * Streamed reply text: stable lines move to history; unfinished structural Markdown blocks stay live.
    * Ink clears the screen and rewrites the whole transcript on every frame once the live area is taller than
    * the terminal, which is what made long replies flicker.
    */
@@ -688,16 +678,7 @@ export class ChatController {
       return;
     }
     this.streamed += text;
-    const cut = this.streamed.lastIndexOf('\n');
-    let end = cut < 0 ? 0 : this.streamed.slice(0, cut).trimEnd().length;
-    // A table is committed once complete, so its columns can be aligned: hold back trailing table rows.
-    const complete = end > this.flushed ? this.streamed.slice(this.flushed, end) : '';
-    if (complete && !fenceAfter(complete, this.fence)) {
-      const rows = complete.split('\n');
-      let keep = rows.length;
-      while (keep > 0 && isTableRow(rows[keep - 1]!)) keep--;
-      if (keep < rows.length) end = this.flushed + rows.slice(0, keep).join('\n').trimEnd().length;
-    }
+    const end = this.flushed + stableMarkdownEnd(this.streamed.slice(this.flushed));
     const raw = end > this.flushed ? this.streamed.slice(this.flushed, end) : '';
     const piece = this.flushed ? raw.replace(/^[ \t]*\n/, '') : raw;
     if (piece.trim()) {
@@ -1068,11 +1049,11 @@ export class ChatController {
 
   private clearPrompt() { this.pending = null; this.update({ prompt: null }); }
 
-  private picker(titleKey: MessageKey, choices: Choice[], choose: (index: number) => void | Promise<void>, index = 0, options: { title?: string; back?: () => void } = {}) {
+  private picker(titleKey: MessageKey, choices: Choice[], choose: (index: number) => void | Promise<void>, index = 0, options: { title?: string; back?: () => void; searchable?: boolean } = {}) {
     this.pending = { kind: 'picker', choose, ...(options.back ? { back: options.back } : {}) };
     const first = choices.findIndex(choice => !choice.disabled);
     const start = choices[index] && !choices[index]!.disabled ? index : Math.max(0, first);
-    this.update({ prompt: { kind: 'picker', title: options.title ?? this.t(titleKey), choices, index: start, ...(options.back ? { back: true } : {}) } });
+    this.update({ prompt: { kind: 'picker', title: options.title ?? this.t(titleKey), choices, index: start, ...(options.searchable ? { searchable: true } : {}), ...(options.back ? { back: true } : {}) } });
   }
 
   private interaction(request: InteractionRequest, signal?: AbortSignal): Promise<InteractionDecision> {
@@ -1122,11 +1103,14 @@ export class ChatController {
     const command = commandText(name, input);
     if (command) {
       const rows = command.split('\n');
-      return { kind: 'command', rows: rows.slice(0, COMMAND_ROWS), more: Math.max(0, rows.length - COMMAND_ROWS) };
+      return { kind: 'command', rows, more: 0 };
     }
     const detail = toolDetail(name, input, this.deps.readText);
-    if (detail?.kind === 'edit') return { kind: 'diff', rows: detail.rows.slice(0, PREVIEW_DIFF_ROWS), more: Math.max(0, detail.rows.length - PREVIEW_DIFF_ROWS) };
-    if (detail?.kind === 'write') return { kind: 'write', rows: detail.preview.slice(0, DETAIL_ROWS), more: Math.max(0, detail.lines - DETAIL_ROWS) };
+    if (detail?.kind === 'edit') return { kind: 'diff', rows: detail.rows, more: 0 };
+    if (detail?.kind === 'write') {
+      const content = (input as Record<string, unknown>).content as string;
+      return { kind: 'write', rows: content === '' ? [] : content.replace(/\n$/, '').split('\n'), more: 0 };
+    }
     return undefined;
   }
 
@@ -1152,12 +1136,26 @@ export class ChatController {
 
   private async command(text: string): Promise<void> {
     const [head, ...rest] = text.slice(1).split(/\s+/);
-    const name = (head ?? '').toLowerCase() as Command;
+    const command = resolveCommand(head ?? '');
     const arg = rest.join(' ').trim();
-    if (!(COMMANDS as readonly string[]).includes(name)) { this.notice('chat.unknownCommand', { name: `/${head}` }, 'warn'); return; }
-    const busy = this.snapshot.phase !== 'idle' && !['help', 'status', 'cost', 'context', 'exit', 'quit', 'lang', 'theme'].includes(name);
+    if (!command) { this.notice('chat.unknownCommand', { name: `/${head}` }, 'warn'); return; }
+    const busy = !commandAvailable(command, this.snapshot.phase);
     if (busy) { this.notice('chat.busy', undefined, 'warn'); return; }
-    switch (name) {
+    switch (command.action) {
+      case 'trust': {
+        const model = this.snapshot.model;
+        const shareId = model?.shared ? parseShareAgentDeviceId(model.target) : null;
+        if (!model || !shareId) { this.push({ kind: 'notice', text: this.t('trust.notShared'), tone: 'warn' }); return; }
+        if (arg && arg !== 'on' && arg !== 'off') { this.push({ kind: 'notice', text: this.t('trust.usage'), tone: 'warn' }); return; }
+        if (!this.deps.shareTrust) { this.notice('chat.unsupported', { name: '/trust' }, 'warn'); return; }
+        try {
+          const result = await this.deps.shareTrust(shareId, arg ? arg === 'on' : undefined);
+          const values = { provider: model.providerName, name: result.name, state: this.t(result.enabled ? 'trust.enabled' : 'trust.disabled') };
+          this.push({ kind: 'notice', text: this.t(arg ? result.enabled ? 'trust.on' : 'trust.off' : 'trust.status', values), tone: 'info' });
+          this.push({ kind: 'notice', text: this.t('trust.scope'), tone: 'info' });
+        } catch (error) { const failure = shareFailure(error); this.notice(failure.messageKey, failure.vars, 'error'); }
+        return;
+      }
       case 'help': this.push({ kind: 'help', sections: helpSections(this.t) }); return;
       case 'model': return this.modelCommand(arg);
       case 'effort': return this.effortCommand(arg);
@@ -1220,8 +1218,7 @@ export class ChatController {
         return;
       }
       case 'theme': return this.themeCommand(arg);
-      case 'exit':
-      case 'quit': await this.exit(); return;
+      case 'exit': await this.exit(); return;
     }
   }
 
@@ -1251,7 +1248,7 @@ export class ChatController {
       ...unavailable.map(source => ({ label: source.label, detail: this.t('picker.unreachable'), disabled: true })),
     ];
     this.picker('picker.provider', choices, index => this.modelPicker(groups[index]!, () => this.providerPicker(groups, unavailable)),
-      Math.max(0, groups.findIndex(isCurrent)));
+      Math.max(0, groups.findIndex(isCurrent)), { searchable: true });
   }
 
   /** Step 2: models of one provider; Esc returns to step 1 when there is one. */
@@ -1263,7 +1260,7 @@ export class ChatController {
       return detail ? { label: model.modelName, detail } : { label: model.modelName };
     });
     this.picker('picker.model', choices, choice => this.selectModel(group.models[choice]!), Math.max(0, index),
-      { title: this.t('picker.modelOf', { provider: group.label }), ...(back ? { back } : {}) });
+      { searchable: true, title: this.t('picker.modelOf', { provider: group.label }), ...(back ? { back } : {}) });
   }
 
   private async selectModel(model: CatalogModel): Promise<void> {
@@ -1391,7 +1388,7 @@ export class ChatController {
     const records = await this.deps.tasks.list(this.deps.workingDir).catch(() => []);
     if (!records.length) { this.notice('chat.resumeNone'); return; }
     this.picker('picker.resume', records.map(record => ({ label: record.title, detail: new Date(record.updatedAt).toLocaleString(), group: `${record.model} · ${record.targetLabel}` })),
-      async index => { await this.resumeRecord(records[index]!); });
+      async index => { await this.resumeRecord(records[index]!); }, 0, { searchable: true });
   }
 
   /** `cindy -c`: continue the most recent session started in this directory. Print mode does not replay it. */
@@ -1489,9 +1486,10 @@ export function mentionPaths(text: string): string[] {
 
 /** The input's mention completion token: `@` and what follows it up to the cursor, if the cursor is in one. */
 export function mentionAt(value: string, cursor: number): { start: number; query: string } | null {
-  const match = /(?:^|\s)@("?)([^\s"]*)$/.exec(value.slice(0, cursor));
+  const match = /(?:^|\s)@(?:"([^"\n]*)|([^\s"]*))$/.exec(value.slice(0, cursor));
   if (!match) return null;
-  return { start: cursor - match[2]!.length - match[1]!.length - 1, query: match[2]! };
+  const query = match[1] ?? match[2]!;
+  return { start: cursor - query.length - (match[1] !== undefined ? 2 : 1), query };
 }
 
 function subsequence(text: string, needle: string): boolean {

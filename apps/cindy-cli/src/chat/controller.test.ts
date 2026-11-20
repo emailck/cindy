@@ -10,6 +10,7 @@
  *   运行中输入被丢弃或立即发送、打断后队列继续自动发送、插话失败丢消息、多选只取一项、计划修改意见丢失；/model 未先选供应商、同名分享无法区分、连不上的来源可被选中；流式增量与最终全文重复显示；流式回复逐行提交后最终全文再次输出或 -p 输出被拆成多段；Ctrl+C 关闭确认被当成允许；换到另一台电脑的模型仍发到旧任务；
  *   /resume 不带原生会话 id；记录里的模型已不可用时仍把旧的原生会话 id 交给当前另一条路由。
  * - tier：unit（假会话句柄、内存任务记录；无网络）。
+ * - 实测耗时：单文件 vitest run 1.40 秒（2026-11-16，含流式 Markdown 与命令分发回归）。
  */
 import type { AgentEvent, AgentSessionHandle, InteractionDecision, InteractionRequest, InteractionResolver } from '@cindy/maker-core';
 import { describe, expect, it, vi } from 'vitest';
@@ -18,6 +19,8 @@ import type { RemoteTaskRequest } from '../session';
 import type { TaskRecord, TaskStore } from '../store';
 import { ChatController, type ChatDeps } from './controller';
 import { runPrint } from './print';
+import { parseInline, parseMarkdown, tailMarkdownRows } from './markdown';
+import { displayWidth } from './width';
 
 const model = (target: string, id: string): CatalogModel => ({ target, targetLabel: target, shared: false, providerId: 'anthropic', providerName: 'Anthropic',
   agent: 'claude-code', model: id, modelName: id, efforts: ['low', 'high'], defaultEffort: 'low' });
@@ -46,12 +49,12 @@ function fakeHandle(onSend?: (push: (event: AgentEvent) => void) => void) {
   return { handle: handle as unknown as AgentSessionHandle & typeof handle, push, ask: (request: InteractionRequest, signal?: AbortSignal) => resolver!(request, signal) };
 }
 
-function setup(models: CatalogModel[], handles: ReturnType<typeof fakeHandle>[], records: TaskRecord[] = []) {
+function setup(models: CatalogModel[], handles: ReturnType<typeof fakeHandle>[], records: TaskRecord[] = [], overrides: Partial<ChatDeps> = {}) {
   const opened: RemoteTaskRequest[] = [];
   const saved: TaskRecord[] = [];
   const tasks: TaskStore = { list: async () => records, save: async record => { saved.push(record); } };
   const deps: ChatDeps = { workingDir: '/project', language: 'en', permission: 'full', catalog: async () => ({ models, unavailable: [] }),
-    openTask: async request => { opened.push(request); return handles.shift()!.handle; }, tasks, now: () => 1 };
+    openTask: async request => { opened.push(request); return handles.shift()!.handle; }, tasks, now: () => 1, ...overrides };
   return { controller: new ChatController(deps), opened, saved };
 }
 
@@ -92,6 +95,138 @@ describe('ChatController', () => {
     await flush();
     expect(controller.getSnapshot().live).toBe('still typ');
     expect(controller.getSnapshot().lines.at(-1)).toMatchObject({ kind: 'assistant', text: expect.stringMatching(/^row 1\n[^]*\nrow 60$/) });
+  });
+
+  // Stream regression (unit): the renderer's immutable history must never contain an unfinished
+  // structural block. Existing plain-line coverage cannot catch list/code/table chunk boundaries.
+  it.each([
+    ['list', '- first\n  continuation\n- second\n', '\nAfter\n'],
+    ['quote', '> first\n> second\n', '\nAfter\n'],
+    ['code', '````js\nconst literal = "```";\n```\n', '````\nAfter\n'],
+    ['table', 'Name | Value\n--- | ---\nalpha | complete text\n', '\nAfter\n'],
+  ])('keeps an unfinished %s live and commits the complete block once', async (_kind, block, ending) => {
+    const { controller } = setup([model('vps', 'claude-a')], [fakeHandle()]);
+    await controller.init();
+    await controller.submit('show Markdown');
+    for (const char of block) controller.apply({ type: 'text', data: { text: char, isFinal: false } });
+    expect(controller.getSnapshot().lines.filter(line => line.kind === 'assistant')).toHaveLength(0);
+    expect(controller.getSnapshot().live).toBe(block);
+    controller.apply({ type: 'text', data: { text: ending, isFinal: false } });
+    expect(controller.getSnapshot().lines.filter(line => line.kind === 'assistant')).toHaveLength(1);
+    controller.apply({ type: 'text', data: { text: block + ending, isFinal: true } });
+    controller.apply({ type: 'done', data: {} });
+    const replies = controller.getSnapshot().lines.filter(line => line.kind === 'assistant');
+    expect(replies.map(line => line.text).join('\n')).toBe((block + ending).trimEnd());
+    expect(controller.getSnapshot().live).toBe('');
+  });
+
+  // Unit regression: emphasis may close on a later line; committing its first line loses the style.
+  // Existing stream coverage had only literal paragraphs. Exercise transport partitioning via apply.
+  it.each([1, 7, 1000])('preserves multiline emphasis across transport chunks of %i characters', async size => {
+    const { controller } = setup([model('vps', 'claude-a')], [fakeHandle()]);
+    await controller.init(); await controller.submit('format');
+    const first = '**bold\n';
+    for (let index = 0; index < first.length; index += size) controller.apply({ type: 'text', data: { text: first.slice(index, index + size), isFinal: false } });
+    expect(controller.getSnapshot().lines.filter(line => line.kind === 'assistant')).toHaveLength(0);
+    const rest = 'continued**\nAfter';
+    for (let index = 0; index < rest.length; index += size) controller.apply({ type: 'text', data: { text: rest.slice(index, index + size), isFinal: false } });
+    controller.apply({ type: 'text', data: { text: first + rest, isFinal: true } });
+    const replies = controller.getSnapshot().lines.filter(line => line.kind === 'assistant');
+    expect(replies.map(line => line.text).join('\n')).toBe(first + rest);
+    const firstSpans = parseInline(replies[0]!.text);
+    expect(firstSpans).toEqual([{ text: 'bold\ncontinued', bold: true }]);
+    expect(parseMarkdown(replies[0]!.text).map(line => line.spans)).toEqual([[{ text: 'bold', bold: true }], [{ text: 'continued', bold: true }]]);
+    controller.apply({ type: 'done', data: {} });
+  });
+
+  // Parser production entry regressions (unit): old regex parsing split nested/triple emphasis,
+  // and fitting a wide table replaced content with ellipses; the renderer cannot recover that text.
+  it('retains nested inline styles, escaped markers, code literals and balanced link URLs', () => {
+    const spans = parseInline('**bold *nested*** + *italic **strong*** + \\*literal\\* + `**code**` + [**docs**](https://example.test/a_(b))');
+    expect(spans.filter(span => span.bold && span.italic).map(span => span.text)).toEqual(['nested', 'strong']);
+    expect(spans.map(span => span.text).join('')).toBe('bold nested + italic strong + *literal* + **code** + docs (https://example.test/a_(b))');
+    expect(spans.find(span => span.code)).toMatchObject({ text: '**code**' });
+    expect(spans.find(span => span.href)).toMatchObject({ text: 'docs', bold: true, href: 'https://example.test/a_(b)' });
+  });
+
+  it.each([30, 15])('preserves all table cell content at width %i with wrapping or labeled fallback', width => {
+    const lines = parseMarkdown('Name | Detail\n--- | ---\nalpha | **bold** plain text here\nβeta | emoji 👨‍👩‍👧‍👦 and 中字符', false, width);
+    expect(lines.every(line => displayWidth(line.spans.map(span => span.text).join('')) <= width)).toBe(true);
+    const text = lines.flatMap(line => line.spans.filter(span => !span.border).map(span => span.text)).join('');
+    for (const value of ['alpha', 'bold', 'plain', 'text', 'here', 'βeta', 'emoji', '👨‍👩‍👧‍👦', '中字符']) expect(text.replace(/\s/g, '')).toContain(value.replace(/\s/g, ''));
+    expect(lines.flatMap(line => line.spans).find(span => span.text.includes('plain'))?.bold).not.toBe(true);
+  });
+
+  // Unit: malformed table column counts must not silently drop source cells.
+  it.each(['a|b|c\n---|---\nx|y|z', 'a|b\n---|---\nx|y|z'])('retains extra cells in malformed table input %j', source => {
+    const text = parseMarkdown(source).flatMap(line => line.spans.map(span => span.text)).join('');
+    expect(text).toContain('z');
+    if (source.startsWith('a|b|c')) expect(text).toContain('c');
+  });
+
+  // Unit: source-tail clipping discarded the opening fence and changed code into Markdown;
+  // the parsed, wrapped tail must retain its code style and whole emoji graphemes.
+  it('clips parsed physical rows while preserving fenced code styles and quote context', () => {
+    const lines = parseMarkdown('```js\nconst x = 123456789;\n// 👨‍👩‍👧‍👦 tail');
+    const tail = tailMarkdownRows(lines, 2, 8);
+    expect(tail).toHaveLength(2);
+    expect(tail.every(line => line.block === 'code')).toBe(true);
+    expect(tail.flatMap(line => line.spans).filter(span => span.text.trim()).every(span => span.tone === 'comment')).toBe(true);
+    expect(tail.flatMap(line => line.spans).map(span => span.text).join('')).toBe('// 👨‍👩‍👧‍👦 tail');
+    const quote = tailMarkdownRows(parseMarkdown('> **long quote continues**'), 2, 10);
+    expect(quote).toHaveLength(2);
+    expect(quote.every(line => line.prefix === '▎ ' && line.spans.every(span => span.bold))).toBe(true);
+  });
+
+  // Unit: registry dispatch must keep idle-only mutations blocked while help remains usable,
+  // and the advertised /quit alias must actually close a live handle rather than become unknown.
+  it('offers parameter help during a turn, blocks task clearing, and exits through /quit', async () => {
+    const session = fakeHandle();
+    const { controller } = setup([model('vps', 'claude-a')], [session]);
+    await controller.init(); await controller.submit('keep this task');
+    await controller.submit('/help');
+    const help = controller.getSnapshot().lines.find(line => line.kind === 'help');
+    expect(help?.kind === 'help' && help.sections.flatMap(section => section.rows).map(row => row[0])).toContain('/model [model]');
+    await controller.submit('/clear');
+    expect(controller.getSnapshot().lines.some(line => line.kind === 'user' && line.text === 'keep this task')).toBe(true);
+    expect(controller.getSnapshot().lines.at(-1)).toMatchObject({ kind: 'notice', tone: 'warn', text: expect.stringContaining('current turn') });
+    await controller.submit('/quit');
+    expect(controller.getSnapshot().exited).toBe(true);
+    expect(session.handle.close).toHaveBeenCalledOnce();
+  });
+
+  // Unit: /trust must target exactly the selected share and work between operations of a running
+  // task; same-account targets and malformed arguments must never reach membership/network mutation.
+  it('changes only the selected share trust during a running turn and reports current status', async () => {
+    let enabled = false;
+    const trust = vi.fn(async (_shareId: string, value?: boolean) => {
+      if (value !== undefined) enabled = value;
+      return { name: 'Alice', enabled };
+    });
+    const shared = { ...model('share:alice-provider', 'claude-a'), shared: true };
+    const { controller } = setup([shared], [fakeHandle()], [], { shareTrust: trust });
+    await controller.init(); await controller.submit('keep running');
+    await controller.submit('/trust');
+    expect(trust).toHaveBeenLastCalledWith('alice-provider', undefined);
+    expect(enabled).toBe(false);
+    await controller.submit('/trust on');
+    expect(enabled).toBe(true);
+    expect(controller.getSnapshot().phase).toBe('running');
+    expect(controller.getSnapshot().lines.some(line => line.kind === 'notice' && line.text.includes('Alice') && line.text.includes('Anthropic'))).toBe(true);
+    await controller.submit('/trust off');
+    expect(trust).toHaveBeenLastCalledWith('alice-provider', false);
+    expect(enabled).toBe(false);
+    await controller.submit('/trust all');
+    expect(trust).toHaveBeenCalledTimes(3);
+    trust.mockRejectedValueOnce(new Error('EACCES /private/account/trust.json'));
+    await controller.submit('/trust off');
+    expect(controller.getSnapshot().lines.at(-1)).toMatchObject({ kind: 'notice', tone: 'error' });
+    expect(JSON.stringify(controller.getSnapshot().lines)).not.toContain('/private/account');
+    await controller.exit();
+    const local = setup([model('same-account', 'claude-a')], [], [], { shareTrust: trust }).controller;
+    await local.init(); await local.submit('/trust on');
+    expect(trust).toHaveBeenCalledTimes(4);
+    expect(local.getSnapshot().lines.at(-1)).toMatchObject({ kind: 'notice', tone: 'warn' });
   });
 
   it('returns only what the user chose: session approval carries the suggestion, Ctrl+C and aborts deny', async () => {

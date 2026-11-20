@@ -42,15 +42,32 @@ function settled(state: ProviderShareRequestState, preview: ProviderShareLinkPre
 export async function runReceived(args: readonly string[], deps: ReceivedDeps): Promise<number> {
   const { shares, t, output } = deps;
   const [action = 'list', value, ...rest] = args;
-  if (rest.length) throw new CliError('INVALID_ARGUMENT', 'error.unexpectedArgument');
+  if (action !== 'trust' && rest.length) throw new CliError('INVALID_ARGUMENT', 'error.unexpectedArgument');
   try {
+    if (action === 'trust') {
+      const [setting] = rest;
+      if (!value || rest.length > 1 || (setting !== undefined && setting !== 'on' && setting !== 'off')) {
+        output(t('received.trustUsage'));
+        return 1;
+      }
+      // An explicit on/off invocation is the user's decision; the share manager validates current membership.
+      const share = setting === undefined ? (await shares.refresh()).find(share => share.memberId === value)
+        : await shares.setTrusted(value, setting === 'on');
+      if (!share) throw new ShareError('NOT_FOUND');
+      const vars = { provider: share.providerLabel, name: share.owner.displayName,
+        state: t(shares.isTrusted(share.shareId) ? 'trust.enabled' : 'trust.disabled') };
+      output(t(setting === undefined ? 'trust.status' : setting === 'on' ? 'trust.on' : 'trust.off', vars));
+      output(t('trust.scope'));
+      return 0;
+    }
     if (action === 'list' && value === undefined) {
       const list = await shares.refresh();
       if (!list.length) { output(t('received.none')); return 0; }
       for (const share of list) {
         const status = share.status === 'active' ? t('received.statusActive') : t('received.statusPaused');
         output(t('received.row', { provider: share.providerLabel, name: share.owner.displayName, id: share.memberId,
-          status: share.hostOnline || share.status !== 'active' ? status : `${status}, ${t('received.hostOffline')}` }));
+          status: share.hostOnline || share.status !== 'active' ? status : `${status}, ${t('received.hostOffline')}`,
+          trust: t(shares.isTrusted(share.shareId) ? 'trust.enabled' : 'trust.disabled') }));
       }
       return 0;
     }

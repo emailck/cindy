@@ -11,6 +11,7 @@ import { createCliLink, type CliLink } from './link';
 import { CLI_ENDPOINTS, CliError } from './profile';
 import { createRemoteTaskFactory, prepareLocalTools, type RemoteTaskFactory } from './session';
 import { createGuestShares, type GuestShares } from './shares';
+import { createShareTrustStore } from './trust-store';
 import { createHistoryStore, createTaskStore, type TaskStore } from './store';
 
 export interface AccountSummary { displayName?: string; email?: string }
@@ -46,6 +47,7 @@ export async function startClientRuntime(context: CommandContext, signal: AbortS
     if (!scope) throw new CliError('AUTH_REQUIRED', 'error.authRequired');
     let notifyLost!: () => void;
     const accountLost = new Promise<void>(resolve => { notifyLost = resolve; });
+    const trust = await createShareTrustStore(context.dataDir, scope, 'global');
     let shares!: GuestShares;
     link = createCliLink({
       auth, deviceName: context.config.deviceName, appVersion: metadata.version,
@@ -59,14 +61,14 @@ export async function startClientRuntime(context: CommandContext, signal: AbortS
       identityRequest: (path, body) => activeLink.api(path, { method: 'POST', body, service: 'auth' }),
       isCurrent: () => activeLink.isCurrent(),
       deviceLinkApiBaseUrl: CLI_ENDPOINTS.deviceLinkApiBaseUrl,
-    });
+    }, { trust });
     try { await link.start(signal, { relay: options.relay }); }
     catch { throw new CliError('RELAY_UNAVAILABLE', 'error.relayUnavailable'); }
     void shares.refresh().catch(() => undefined);
     const saved = await readSavedLogin(context.dataDir);
     const account = (saved.account && typeof saved.account === 'object' ? saved.account : null) as AccountSummary | null;
     const tools = prepareLocalTools();
-    const factory = createRemoteTaskFactory(link.invoke, { rgPath: tools.rgPath });
+    const factory = createRemoteTaskFactory(link.invoke, { rgPath: tools.rgPath, isShareTrusted: shareId => shares.isTrusted(shareId) });
     return {
       auth, link: activeLink, shares, factory, account, accountLost, searchAvailable: tools.ripgrep, shellAvailable: tools.gitBash, rgPath: tools.rgPath,
       tasks: createTaskStore(context.dataDir, scope),

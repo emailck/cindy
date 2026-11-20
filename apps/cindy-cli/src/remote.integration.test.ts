@@ -116,6 +116,83 @@ function readingEngine(seen: StartSessionOptions[]) {
 }
 
 describe('terminal client against the Node provider host', () => {
+  // Integration: exercise the factory's live trust lookup through the real tunnel + local executor.
+  // Relay membership itself is covered by share tests; map the share identity to this in-process host.
+  // Default/off must deny credential contents; trust must permit next read without weakening normal writes.
+  it('rechecks per-share trust for each credential operation while preserving normal task gates', async () => {
+    const relay = new Relay();
+    let operation = { endpoint: 'fs.read', body: { path: '.env' } as Record<string, unknown> };
+    await startHost(relay, async options => {
+      const hosted = options.deviceHosted!;
+      const queue: AgentEvent[] = [];
+      let wake: (() => void) | undefined;
+      let ended = false;
+      const push = (event: AgentEvent) => { queue.push(event); wake?.(); };
+      return {
+        id: randomUUID(), agentKind: 'claude-code', model: options.model,
+        async send() {
+          const response = await fetch(`${hosted.tunnelUrl}/exec/${operation.endpoint}`, { method: 'POST',
+            headers: { authorization: `Bearer ${hosted.tunnelToken}`, 'content-type': 'application/json' }, body: JSON.stringify(operation.body) });
+          push({ type: 'text', data: { text: await response.text(), isFinal: true } });
+          push({ type: 'done', data: {} });
+        },
+        async setPermissionMode() {},
+        async steer() {}, async abort() {}, async close() { ended = true; wake?.(); },
+        events: () => ({ async *[Symbol.asyncIterator]() {
+          for (;;) {
+            if (queue.length) { yield queue.shift()!; continue; }
+            if (ended) return;
+            await new Promise<void>(resolve => { wake = resolve; });
+          }
+        } }),
+        setInteractionResolver() {}, getUsageSnapshot: () => ({ tokenUsage: 0, contextTokens: 0, contextWindow: 0, costUsd: 0 }),
+      };
+    });
+    const link = createCliLink({ auth, deviceName: 'laptop', appVersion: '0.1.0', deviceLinkApiBaseUrl: HOST_ENDPOINTS.deviceLinkApiBaseUrl,
+      createWebSocket: () => relay.connect('cli-device') });
+    await link.start(new AbortController().signal); cleanup.push(() => link.stop());
+    const workspace = await mkdtemp(path.join(os.tmpdir(), 'cindy-cli-trust-'));
+    cleanup.push(() => rm(workspace, { recursive: true, force: true }));
+    await mkdir(path.join(workspace, 'project'));
+    await writeFile(path.join(workspace, 'project', '.env'), 'INVALID_TEST_CREDENTIAL=not-a-secret');
+    let trusted = false;
+    const factory = createRemoteTaskFactory((_target, channel, args) => link.invoke('host-device', channel, args), {
+      isShareTrusted: shareId => shareId === 'test-share' && trusted,
+    });
+    cleanup.push(() => factory.dispose());
+    const handle = await factory.open({ target: 'share:test-share', agent: 'claude-code', providerId: 'anthropic', model: 'claude-test-1',
+      permission: 'full', workingDir: path.join(workspace, 'project'), sessionId: randomUUID(), credentialNotice: 'test credential consent' });
+    cleanup.push(() => handle.close());
+    let prompts = 0;
+    handle.setInteractionResolver(async () => { prompts++; return { kind: 'permission', behavior: 'deny' }; });
+    const events = handle.events()[Symbol.asyncIterator]();
+    const turn = async () => {
+      await handle.send({ type: 'user', content: 'test local operation' });
+      let result = '';
+      for (;;) {
+        const event = await events.next();
+        if (event.done) throw new Error('Session ended before done');
+        if (event.value.type === 'text') result += String((event.value.data as { text?: string }).text ?? '');
+        if (event.value.type === 'done') return result;
+      }
+    };
+    expect(await turn()).not.toContain(Buffer.from('INVALID_TEST_CREDENTIAL=not-a-secret').toString('base64'));
+    expect(prompts).toBe(1);
+    trusted = true;
+    expect(await turn()).toContain(Buffer.from('INVALID_TEST_CREDENTIAL=not-a-secret').toString('base64'));
+    expect(prompts).toBe(1);
+    trusted = false;
+    expect(await turn()).not.toContain(Buffer.from('INVALID_TEST_CREDENTIAL=not-a-secret').toString('base64'));
+    expect(prompts).toBe(2);
+    trusted = true;
+    await handle.setPermissionMode?.('default');
+    operation = { endpoint: 'fs.write', body: { path: path.join(workspace, 'outside.txt'), data: Buffer.from('must-not-write').toString('base64') } };
+    expect(await turn()).toContain('not confirmed');
+    // Low-level noncredential requests stay denied by the ordinary gate (the Agent must ask separately).
+    expect(prompts).toBe(2);
+    await expect(readFile(path.join(workspace, 'outside.txt'))).rejects.toMatchObject({ code: 'ENOENT' });
+  }, 60_000);
+
   it('lists models, runs a task whose tool executes locally, and is not blocked by a silent computer', async () => {
     const relay = new Relay();
     const seen: StartSessionOptions[] = [];

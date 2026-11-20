@@ -4,6 +4,7 @@ import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { render } from 'ink';
 import type { ChatRequest, CommandContext } from '../cli';
+import { ShareError } from '../shares';
 import { CliError, writeConfig } from '../profile';
 import { startClientRuntime } from '../runtime';
 import type { Translate } from '../i18n';
@@ -12,6 +13,7 @@ import { cacheHitRate, ChatController, type ChatDeps, type ExitSummary } from '.
 import { runPrint } from './print';
 import { listProjectFiles, readClipboardImage, readText, runLocalCommand, statPath } from './local';
 import { colorDepthTheme, colorFgBgTheme, queryBackground, supportsHyperlinks } from './theme';
+import { closeChatSurface } from './lifecycle';
 
 /** Printed after the interactive UI closes: what this task used, and how to pick it up again. */
 export function exitSummaryText(summary: ExitSummary | null, t: Translate, workingDir: string): string | null {
@@ -51,6 +53,14 @@ export async function runChat(request: ChatRequest, context: CommandContext, sig
       catalog: () => runtime.catalog(),
       openTask: task => runtime.factory.open(task),
       tasks: runtime.tasks,
+      shareTrust: async (shareId, enabled) => {
+        // Known mutations enter setTrusted immediately so revocation takes effect even if refresh fails.
+        const known = enabled === undefined ? undefined : runtime.shares.received().find(item => item.shareId === shareId);
+        const share = known ?? (await runtime.shares.refresh()).find(item => item.shareId === shareId);
+        if (!share) throw new ShareError('REMOVED');
+        const latest = enabled === undefined ? share : await runtime.shares.setTrusted(share.memberId, enabled);
+        return { name: latest.owner.displayName, enabled: runtime.shares.isTrusted(latest.shareId) };
+      },
       // Per-run --lang never persists; /lang and /model remember the choice.
       saveLanguage: language => writeConfig(context.dataDir, current => ({ ...current, language })),
       saveModel: choice => writeConfig(context.dataDir, current => ({ ...current, model: choice })),
@@ -70,8 +80,10 @@ export async function runChat(request: ChatRequest, context: CommandContext, sig
     };
     const controller = new ChatController(deps);
     const stop = () => { void controller.exit(); };
+    let listening = true;
     signal.addEventListener('abort', stop, { once: true });
     void runtime.accountLost.then(() => {
+      if (!listening) return;
       context.error(`ACCOUNT_LOST: ${context.t('error.accountLost')}`);
       stop();
     });
@@ -80,16 +92,20 @@ export async function runChat(request: ChatRequest, context: CommandContext, sig
       const header = `${context.t('chat.welcome', { cwd: deps.workingDir })}\n${context.t('chat.hint')}`;
       const hyperlinks = supportsHyperlinks(process.env, process.stdout.isTTY === true);
       const colorDepth = process.stdout.getColorDepth?.() ?? 8;
-      const instance = render(<App controller={controller} header={header} hyperlinks={hyperlinks} colorDepth={colorDepth} />, { exitOnCtrlC: false, incrementalRendering: true });
-      await controller.init();
-      if (context.overrides.continue) await controller.continueLatest();
-      await controller.whenExited();
-      instance.unmount();
-      await instance.waitUntilExit().catch(() => undefined);
+      const surface = (closing = false) => <App controller={controller} header={header} hyperlinks={hyperlinks} colorDepth={colorDepth} closing={closing} />;
+      const instance = render(surface(), { exitOnCtrlC: false, incrementalRendering: true });
+      try {
+        await controller.init();
+        if (context.overrides.continue) await controller.continueLatest();
+        await Promise.race([controller.whenExited(), instance.waitUntilExit()]);
+      } finally {
+        listening = false;
+        await closeChatSurface(instance, surface(true), process.stdout);
+      }
       const summary = exitSummaryText(controller.exitSummary(), context.t, deps.workingDir);
       if (summary) context.output(summary);
       return 0;
-    } finally { signal.removeEventListener('abort', stop); }
+    } finally { listening = false; signal.removeEventListener('abort', stop); }
   } finally {
     if (pasteDir) await rm(pasteDir, { recursive: true, force: true }).catch(() => undefined);
     await runtime.close();

@@ -243,3 +243,65 @@
   `pnpm check:dev-docs`、`git diff --check`。`pnpm check:test-hygiene` 的 21 条失败均在既有 Desktop / Mobile / maker-core 文件，未改基线。
 - 不在本次提交内：工作区里此前就存在、未跟踪的 `docs/cindy-cli-mobile-chat-plan.md`（不是本批产物，保持原样）。
 - 仍待验收：真实终端交互目检、跨账号分享申请/批准/撤销、Linux 真实账号任务、macOS、提供端为 `cindy-host` 的同账号路径。
+
+## TUI 体验升级（2026-11-16）
+
+对应 [计划](cindy-cli-client-plan.md#tui-体验升级2026-11-16用户批准实施)。
+
+| 编号 | 状态 | 责任范围 / 证据 |
+| --- | --- | --- |
+| TUI-0 | 已完成 | 工作区核对；App/controller 基线 28 项通过（总 6.74s，App 测试 5.05s）；既有图片保留 |
+| TUI-1 | 已完成 | width.ts、input/editor.ts；22 项字素/占位符/视觉行测试通过（单独 1.22s）；已纳入主 Agent 完整 CLI 验证 |
+| TUI-2 | 已完成 | markdown.ts、controller 流式方法；独立复查修复异常表格列数丢内容；27 项 controller 测试通过 |
+| TUI-3 | 已完成 | commands.ts 注册表接入 help/补全/实际分发；busy 与 quit 回归通过 |
+| TUI-4 | 已完成 | 动态高度、原生光标、picker 搜索、草稿隔离；所有确认均可 Ctrl+O 查看全文，Esc 返回不作决定；最终44项定向回归通过 |
+| TUI-5 | 已完成 | 本机验证：完整 CLI 8 文件90项通过（33.21s）；收尾44项定向复验通过（10.69s）；类型/构建/版本启动、三模式PTY、文档/术语通过；实机待验项见下 |
+
+当前未验证：真实终端效果、跨平台输入法与 SSH/tmux。无提交、推送或发布操作。
+
+依赖：字符测量显式声明仓内已锁定的 get-east-asian-width 1.6.0。离线更新缺 registry 元数据，复用已有锁定快照补 importer 后，`pnpm --filter @cindy/cli install --lockfile-only --offline --frozen-lockfile` 通过；无版本升级。
+
+中间验证：Linux PTY 使用真实 App + 内存 Agent，Light/Dark/ANSI 三模式输入“中文👍🏽”、退格、输入 X、发送得到“中文X”；80×24 → 40×12 缩放，历史标记各出现一次，无 CSI 2J 清屏。此验证不等于图形终端目检或中文输入法实机验证。
+文档门禁通过；术语门禁通过（既有 proposed 告警）。`pnpm check:test-hygiene` 失败于既有 baseline 相对 origin/main 增长，报告均为未修改的 Desktop/Mobile/maker-core 文件；未调整基线或豁免。
+
+性能记录：App 单独运行 8.06s（原始本机基线两文件6.74s、App执行5.05s），完整 CLI 与类型检查并行时 App执行12.01s；新增真实 Ink 测量/重绘和短窗口场景增加耗时，已复用 fixture、未放宽 timeout 或删减断言，尚未达到单文件5s目标。
+解析范围：保留普通完整文本行立即提交；只有未闭合的行内样式和结构块等待后续片段，避免把长纯文本全部留在活动区。解析后裁剪保留代码/表格上下文；Markdown 为终端常用语法子集，未引入完整 HTML 或引用式链接支持。
+
+### 最终验收范围
+
+- 最终完整详情改动后 `pnpm exec vitest run apps/cindy-cli/src/chat/App.test.tsx apps/cindy-cli/src/chat/controller.test.ts`：44 项通过；CLI typecheck 通过。构建产物 `--version` 输出0.1.0；构建仅有既有 image-resizer direct-eval 警告。
+- 三模式 PTY 最终复验通过。验证脚本初版按进程启动后的固定时刻发按键，并行构建时会在 raw input 就绪前发送；改为观察模型就绪输出后发送，避免测试驱动竞态，产品逻辑未因此修改。
+- 三个本次测试文件用卫生门禁的 `scanTestSource` 检查，resetModules / realWaits / sourceReads 均为0；整仓卫生门禁仍是上述既有失败，未伪报通过。
+- 最终 App 单独测试过程执行8.44s（含 controller 的墙钟10.69s）；5s目标仍未达到，耗时列为后续性能项，不通过减少验收或放宽超时掩盖。
+- 仍需实机验收：macOS、Windows Terminal、SSH/tmux、中文输入法候选窗、图形终端Light/Dark目检。当前证据为 Linux PTY 与内存TTY，不代表这些平台已经验证。
+- 功能边界：普通终端滚动历史、现有Ink7与业务语义保留；全屏/鼠标选择/自维护渲染器未纳入本批。Markdown为常用语法子集，极端混合分隔符（例如三重与双重星号交叉关闭）可能原样显示。
+- 整体diff已复查；无提交、推送、发布，三个原有未跟踪图片保留。
+
+### 用户终端回归（2026-11-16）
+
+| 编号 | 状态 | 责任范围 / 证据 |
+| --- | --- | --- |
+| TUI-6 | 已完成 | Ink7.1.1受维护补丁；旧版原始输入复现失败，补丁后分片焦点/字面/粘贴回归通过；App18项通过，离线frozen安装验证完成 |
+| TUI-7 | 已完成 | 单一退出入口清理活动帧/原生光标，关闭焦点报告后卸载；主Agent生命周期2项、类型/构建/版本验证通过；OS PTY确认退出0、raw恢复、历史仅一次、统计独立行且无迟到帧 |
+
+本轮沿用既有工作区，不覆盖先前实现和用户图片；完成后重新构建CLI。
+
+退出行为依据参考实现 gracefulShutdown 的普通终端路径：保留滚动历史，清理模式/光标后再打印续接提示；全屏路径才恢复原屏。用户已要求按参考代码处理，不新增清空历史偏好。
+
+本轮验证：App18项通过（含原始焦点分片与括号粘贴）；生命周期2项在主Agent复验通过（3.70s）。旧版直接unmount路径的退出回归先失败，新增清理路径通过。冻结锁离线安装只替换Ink包，不升级版本；构建产物已更新，`--version`为0.1.0。文档门禁通过；本轮修改测试的卫生扫描三类计数均为0；既有整仓基线问题不变。
+
+OS PTY退出复核：原生光标先回到底部再清除6行活动区，统计换行后出现shell提示符，无界面文字重放；进程退出尾部仅有cli-cursor注册的显示光标控制码，不移动光标或输出文本。保留既有历史，不发整屏清除。真实图形终端/Windows窗口切换仍需用户实机验证。
+
+## 分享信任持久化（2026-11-16）
+
+| 编号 | 状态 | 责任范围 |
+| --- | --- | --- |
+| TRUST-1 | 已完成 | trust-store与shares：9项存储/撤权/迟到结果回归通过（单独4.47s），独立复查通过 |
+| TRUST-2 | 已完成 | received trust、列表、帮助与双语文案；7项received回归含真实落盘重开通过 |
+| TRUST-3 | 已完成 | runtime/session动态skip与/trust；真实执行器验证默认确认→开启跳过→关闭恢复及普通权限仍拦截；旧代码替换skip=false能复现失败 |
+| TRUST-4 | 已完成 | 主Agent完整CLI10文件106项通过（30.17s），类型/构建/产物help通过，文档和术语门禁通过 |
+
+用户已明确授权增加长期免确认；已说明包括凭证读取，普通权限档不变。不读取或修改用户实际偏好，不替用户选择信任对象。
+
+长期信任交付核对：最终源码时间早于构建产物；未对真实账号自动开启任何信任，用户通过 `/trust on` 或 `received trust MEMBER_ID on`明确选择目标。关闭长期信任不撤销原有独立任务级授权；等待中的确认不会被开关自动回答。
+四个本次修改测试文件的卫生扫描三类计数均为0，既有整仓baseline失败仍未改动。真实跨账号服务与Windows/macOS未运行；集成使用真实本机执行器/隧道及假引擎，不冒称已验证生产分享服务。构建保留既有image-resizer direct-eval告警，无新增构建失败。

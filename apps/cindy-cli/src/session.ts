@@ -4,7 +4,7 @@
  * dependencies Desktop's controller/service.ts supplies, minus Desktop-only features
  * (local Cindy MCP tools, memory, managed Skills, change capture, PDF, group switching,
  * direct shared-executor allocation). Shared tasks keep the shared-provider rules:
- * credential files are not synced and credential operations always need local confirmation
+ * credential files are not synced and credential operations need local confirmation unless this share is explicitly trusted
  * (provider-sharing.md §9 item 7).
  */
 import { randomUUID } from 'node:crypto';
@@ -97,7 +97,7 @@ export interface RemoteTaskFactory {
 }
 
 /** One poller and connection pool per Agent computer, shared by every task on it (Desktop parity). */
-export function createRemoteTaskFactory(invoke: RemoteInvoke, options: { rgPath?: string; log?: { info(message: string, meta?: Record<string, unknown>): void; warn(message: string, meta?: Record<string, unknown>): void } } = {}): RemoteTaskFactory {
+export function createRemoteTaskFactory(invoke: RemoteInvoke, options: { rgPath?: string; /** Per-operation lookup by share id, never same-account device id. */ isShareTrusted?(shareId: string): boolean; log?: { info(message: string, meta?: Record<string, unknown>): void; warn(message: string, meta?: Record<string, unknown>): void } } = {}): RemoteTaskFactory {
   const log = options.log ?? { info() {}, warn() {} };
   const pollers = new Map<string, RemoteAgentPoller>();
   const pools = new Map<string, RemoteConnectionPool>();
@@ -118,7 +118,8 @@ export function createRemoteTaskFactory(invoke: RemoteInvoke, options: { rgPath?
   const rgPath = options.rgPath ?? resolveRipgrep();
   return {
     async open(request, signal) {
-      const shared = parseShareAgentDeviceId(request.target) !== null;
+      const shareId = parseShareAgentDeviceId(request.target);
+      const shared = shareId !== null;
       const collect = { skipCredentials: shared };
       const permission = permissionOptions(request.permission);
       const opts: StartSessionOptions = {
@@ -137,7 +138,7 @@ export function createRemoteTaskFactory(invoke: RemoteInvoke, options: { rgPath?
         poller,
         pool: poolFor(request.target),
         rgPath,
-        ...(shared ? { credentialConsent: { description: request.credentialNotice, grant: credentialGrantFor(request.sessionId, request.target) } } : {}),
+        ...(shared ? { credentialConsent: { description: request.credentialNotice, grant: credentialGrantFor(request.sessionId, request.target), skip: () => shareId !== null && options.isShareTrusted?.(shareId) === true } } : {}),
         prepareMcp: async () => NO_LOCAL_MCP,
         collectProjectFiles: workingDir => collectProjectInstructionFiles(workingDir, collect),
         collectAncestorFiles: workingDir => collectAncestorInstructionFiles(workingDir, collect),

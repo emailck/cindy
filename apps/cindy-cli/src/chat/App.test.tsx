@@ -20,10 +20,11 @@
  *   粘贴的图片路径当成文字发送而不是图片块；
  *   高优先级优化（2026-11-16）：确认框里输入的文字没有作为拒绝理由交回（本机凭证确认却接受了输入）、计划按原文显示 Markdown 标记
  *   或超长计划看不到结尾、Ctrl+R 搜不到上次运行的输入或发送后没有记住。
+ *   终端焦点（2026-11-16）：真实 Ink stdin 把 ESC[I / ESC[O 焦点报告变成输入框中的 [I / [O；必须在解析控制序列时消费，原样键入与括号粘贴里的相同字节不得丢失。
  * - 状态栏依据：用户需求（上下文占用、本轮与本任务平均 tok/s、预计费用、本任务输入／输出／缓存读写与命中率）；
  *   UsageSnapshot 字段语义见 maker-core types/events.ts，命中率公式见 Desktop shared/turnUsageDetails.ts。
  * - tier：unit（ink-testing-library 内存终端，假会话句柄）。
- * - 实测耗时：App.test.tsx 单独运行 vitest Duration 4.5 秒（2026-11-16，15 项；等待由 20 ms 降为 5 ms，只有 Esc 等 Ink 的 20 ms 判定）。
+ * - 实测耗时：App.test.tsx vitest Duration 15.87 秒（2026-11-16，18 项；该次与 CLI 类型检查并行，包含 Light/Dark 真实 TTY + 40×12 resize/长输入/滚动菜单和真实 stdin 解析路径；焦点回归单独执行 3.49 秒，仅 Esc 等 Ink 的 20 ms 判定，不新增 ≥100 ms 等待）。
  */
 import type { AgentEvent, AgentSessionHandle, InteractionDecision, InteractionResolver } from '@cindy/maker-core';
 import { render } from 'ink-testing-library';
@@ -103,6 +104,17 @@ describe('terminal UI', () => {
       expect(output).not.toContain('HISTORY_SENTINEL');
       expect(output).toContain('DRAFT_SENTINEL');
       expect(output).not.toContain('\x1b[2J');
+      // Long composer text and command menus stay bounded at 40×12 too.
+      stdin.write('\u0015'); await tick();
+      stdin.write('界'.repeat(180)); await tick();
+      expect(output).not.toContain('HISTORY_SENTINEL');
+      expect(output).not.toContain('\x1b[2J');
+      stdin.write('\u0015'); await tick();
+      stdin.write('/'); await tick();
+      for (let step = 0; step < 12; step++) { stdin.write('\u001B[B'); await tick(); }
+      expect(output).toContain('/theme');
+      expect(output).not.toContain('\x1b[2J');
+      stdin.write('\u0015'); await tick();
       // Finishing the pending tool must still print the full reply and late result into scrollback.
       output = '';
       controller.apply({ type: 'tool_result_full', data: { toolUseId: 'slow', fullText: 'LATE_RESULT' } });
@@ -118,6 +130,42 @@ describe('terminal UI', () => {
       await controller.exit();
       stdin.destroy();
       stdout.destroy();
+    }
+  });
+
+  // Real Ink stdin parser: focus reports are terminal metadata, while identical literal/pasted bytes
+  // remain user content. ink-testing-library emits input directly and cannot reproduce this boundary.
+  it('ignores complete and fragmented terminal focus reports without changing literal input or paste', async () => {
+    const controller = new ChatController({ workingDir: '/project', language: 'en', permission: 'full',
+      catalog: async () => ({ models: [model('alpha')], unavailable: [] }), openTask: async () => { throw new Error('unused'); },
+      tasks: { list: async () => [], save: async () => {} } });
+    const submit = vi.spyOn(controller, 'submit').mockResolvedValue();
+    const stdout = Object.assign(new PassThrough(), { isTTY: true, columns: 80, rows: 24 });
+    const stdin = Object.assign(new PassThrough(), { isTTY: true, setRawMode() {}, ref() {}, unref() {} });
+    stdout.resume();
+    const ui = renderTerminal(<App controller={controller} header="Cindy" />, {
+      stdout: stdout as unknown as NodeJS.WriteStream, stdin: stdin as unknown as NodeJS.ReadStream,
+      stderr: new PassThrough() as unknown as NodeJS.WriteStream,
+      interactive: true, patchConsole: false, exitOnCtrlC: false, maxFps: 1000,
+    });
+    const type = async (chunk: string) => { stdin.write(chunk); await tick(); };
+    try {
+      await controller.init(); await tick();
+      await type('\u001B[O\u001B[I');
+      await type('a'); await type('\u001B['); await type('I');
+      await type('b\u001B[Oc\u001B[Id');
+      await type('\u001B[D'); await type('X'); await type('\r');
+      expect(submit).toHaveBeenLastCalledWith('abcXd', {});
+      await type('literal [I [O ');
+      await type('\u001B[200~paste \u001B['); await type('I [O \u001B[O\u001B[201'); await type('~');
+      await type('\r');
+      expect(submit).toHaveBeenLastCalledWith('literal [I [O paste \u001B[I [O \u001B[O', {});
+      await type('discard'); await pressEscape(stdin);
+      await type('kept'); await type('\r');
+      expect(submit).toHaveBeenLastCalledWith('kept', {});
+    } finally {
+      ui.unmount(); ui.cleanup();
+      stdin.destroy(); stdout.destroy();
     }
   });
 
@@ -411,6 +459,111 @@ describe('terminal UI', () => {
     await type('\r');
     expect(submit).toHaveBeenLastCalledWith('deploy staging', {});
     expect(add).toHaveBeenLastCalledWith('/project', 'deploy staging');
+    ui.unmount();
+  });
+
+  // Unit regressions through real keyboard dispatch: filtering must preserve original model indices;
+  // Unicode edits must not split a displayed character; prompt responses must never consume a hidden draft.
+  it('filters models by name, keeps a no-match picker open and edits complete graphemes', async () => {
+    const { handle } = streamingHandle();
+    const controller = new ChatController({ workingDir: '/project', language: 'en', permission: 'full',
+      catalog: async () => ({ models: [model('alpha'), model('beta')], unavailable: [] }), openTask: async () => handle,
+      tasks: { list: async () => [], save: async () => {} } });
+    const submit = vi.spyOn(controller, 'submit');
+    const ui = render(<App controller={controller} header="Cindy" />);
+    await controller.init();
+    const type = async (text: string) => { ui.stdin.write(text); await tick(); };
+    await controller.submit('/model'); await tick();
+    await type('absent'); await type('\r');
+    expect(ui.lastFrame()).toContain('No matches');
+    expect(controller.getSnapshot().prompt?.kind).toBe('picker');
+    await pressEscape(ui.stdin); // Clear the search before closing the picker.
+    expect(ui.lastFrame()).toContain('alpha');
+    await type('beta'); await type('\r');
+    expect(controller.getSnapshot().model?.model).toBe('beta');
+    await type('A👨‍👩‍👧‍👦é中B');
+    await type('\u001B[D'); await type('\u007F'); // Remove 中.
+    await type('\u001B[D'); await type('\u001B[3~'); // Remove the combining grapheme é.
+    await type('\r');
+    expect(submit).toHaveBeenLastCalledWith('A👨‍👩‍👧‍👦B', {});
+    ui.unmount();
+  });
+
+  it('keeps a draft separate from permission feedback and blocks hidden steering', async () => {
+    const { handle } = streamingHandle();
+    let resolver: InteractionResolver | undefined;
+    handle.setInteractionResolver = next => { resolver = next; };
+    const controller = new ChatController({ workingDir: '/project', language: 'en', permission: 'full',
+      catalog: async () => ({ models: [model('alpha')], unavailable: [] }), openTask: async () => handle,
+      tasks: { list: async () => [], save: async () => {} } });
+    const steer = vi.spyOn(controller, 'steer');
+    const ui = render(<App controller={controller} header="Cindy" />);
+    Object.defineProperty(ui.stdout, 'columns', { value: 40 });
+    Object.defineProperty(ui.stdout, 'rows', { value: 12 });
+    ui.stdout.emit('resize');
+    await controller.init(); await controller.submit('go'); await tick();
+    ui.stdin.write('DRAFT_ONLY'); await tick();
+    const decision = resolver!({ kind: 'permission', requestId: 'draft', toolName: 'Bash', input: { command: [...Array.from({ length: 30 }, (_, index) => `echo line-${index}`), 'COMMAND_TAIL_SENTINEL'].join('\n') }, description: `${'Review this risk carefully. '.repeat(12)}\nDESCRIPTION_TAIL_SENTINEL` });
+    const settled = vi.fn();
+    void decision.then(settled);
+    await tick();
+    expect(ui.lastFrame()).not.toContain('DRAFT_ONLY');
+    expect(ui.lastFrame()).toContain('Allow Bash?');
+    expect(ui.lastFrame()).toContain('Allow once');
+    expect(ui.lastFrame()).toContain('Deny');
+    expect(ui.lastFrame()).toContain('Ctrl+O');
+    ui.stdin.write('\u000F'); await tick();
+    expect(ui.lastFrame()).toContain('Review this risk carefully.');
+    for (let page = 0; page < 3 && !ui.lastFrame()?.includes('DESCRIPTION_TAIL_SENTINEL'); page++) { ui.stdin.write('\u001B[6~'); await tick(); }
+    expect(ui.lastFrame()).toContain('DESCRIPTION_TAIL_SENTINEL');
+    ui.stdin.write('G'); await tick();
+    expect(ui.lastFrame()).toContain('COMMAND_TAIL_SENTINEL');
+    expect(settled).not.toHaveBeenCalled();
+    await pressEscape(ui.stdin);
+    expect(controller.getSnapshot().prompt?.kind).toBe('permission');
+    expect(settled).not.toHaveBeenCalled();
+    ui.stdin.write('\u0013'); await tick();
+    expect(steer).not.toHaveBeenCalled();
+    ui.stdin.write('use pwd'); await tick(); ui.stdin.write('\r');
+    expect(await decision).toEqual({ kind: 'permission', behavior: 'deny', reason: 'use pwd' });
+    await tick();
+    expect(ui.lastFrame()).toContain('DRAFT_ONLY');
+    // Full source rows survive the old inline Write (12) and Edit (20) preview limits.
+    for (const [toolName, input, sentinel] of [
+      ['Write', { file_path: '/project/new.txt', content: [...Array(30).fill('write row'), 'WRITE_TAIL_SENTINEL'].join('\n') }, 'WRITE_TAIL_SENTINEL'],
+      ['Edit', { file_path: '/project/old.txt', old_string: Array(30).fill('old row').join('\n'), new_string: [...Array(30).fill('new row'), 'DIFF_TAIL_SENTINEL'].join('\n') }, 'DIFF_TAIL_SENTINEL'],
+    ] as const) {
+      const confirmation = resolver!({ kind: 'permission', requestId: toolName, toolName, input });
+      const confirmed = vi.fn();
+      void confirmation.then(confirmed);
+      await tick(); ui.stdin.write('\u000F'); await tick(); ui.stdin.write('G'); await tick();
+      expect(ui.lastFrame()).toContain(sentinel);
+      await pressEscape(ui.stdin);
+      expect(confirmed).not.toHaveBeenCalled();
+      ui.stdin.write('2');
+      expect(await confirmation).toEqual({ kind: 'permission', behavior: 'deny' });
+      await tick();
+    }
+    const question = resolver!({ kind: 'ask_user_question', requestId: 'long-question', questions: [{
+      question: `${'Question context. '.repeat(20)}QUESTION_TAIL_SENTINEL`,
+      options: [{ label: 'Continue', description: `${'Choice explanation. '.repeat(20)}CHOICE_TAIL_SENTINEL` }],
+    }] });
+    const answered = vi.fn();
+    void question.then(answered);
+    await tick();
+    expect(ui.lastFrame()).toContain('Ctrl+O');
+    ui.stdin.write('\u000F'); await tick();
+    // Find the complete question in the first page and the complete option at the end.
+    for (let page = 0; page < 4 && !ui.lastFrame()?.includes('QUESTION_TAIL_SENTINEL'); page++) { ui.stdin.write('\u001B[6~'); await tick(); }
+    expect(ui.lastFrame()).toContain('QUESTION_TAIL_SENTINEL');
+    ui.stdin.write('G'); await tick();
+    expect(ui.lastFrame()).toContain('CHOICE_TAIL_SENTINEL');
+    expect(answered).not.toHaveBeenCalled();
+    await pressEscape(ui.stdin);
+    expect(controller.getSnapshot().prompt?.kind).toBe('question');
+    expect(answered).not.toHaveBeenCalled();
+    ui.stdin.write('1');
+    await question;
     ui.unmount();
   });
 

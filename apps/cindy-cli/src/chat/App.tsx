@@ -2,18 +2,21 @@
  * Ink view over ChatController. Every color comes from the active theme (theme.ts): dark and light use the
  * Desktop token values for the same roles, ansi uses only the terminal's own palette. /theme switches them.
  */
-import { createContext, useContext, useEffect, useRef, useState, useSyncExternalStore, type ReactNode } from 'react';
-import { Box, Static, Text, useApp, useInput, usePaste, useWindowSize } from 'ink';
+import { createContext, memo, useContext, useEffect, useLayoutEffect, useRef, useState, useSyncExternalStore, type ReactNode } from 'react';
+import { Box, Static, Text, useInput, usePaste, useWindowSize, useBoxMetrics, useCursor, measureElement, type DOMElement } from 'ink';
 import {
   cacheHitRate, CHILD_ROWS, commandDescription, commandSuggestions, mentionAt, openGroupIndex,
   type ChatController, type GroupItem, type ImageAttachment, type Line, type Prompt, type UsageView,
 } from './controller';
 import type { Translate } from '../i18n';
-import { parseMarkdown, type MdLine, type Span } from './markdown';
+import { parseMarkdown, tailMarkdownRows, type MdLine, type Span } from './markdown';
 import { countLines, DETAIL_ROWS, OUTPUT_ROWS, toolDisplayName, type DiffRow } from './tools';
 import { THEMES, themeFor, type Theme, type Tone } from './theme';
-import { viewItems, wrapView, type ViewRow } from './viewer';
-import { displayWidth } from './width';
+import { viewItems, wrapView, diffRowsText, type ViewItem, type ViewRow } from './viewer';
+import { displayWidth, truncateWidth } from './width';
+import { resolveCommand } from './commands';
+import { edit, inputViewport, moveVertical, type Editor } from './input/editor';
+export { edit, type Editor } from './input/editor';
 
 export { displayWidth } from './width';
 
@@ -46,9 +49,6 @@ export function tailRows(text: string, rows: number, columns: number): string {
   }
   return kept.join('\n');
 }
-
-/** Rows kept free below the live text for the status, input box, queue preview, footer and the two usage rows. */
-const RESERVED_ROWS = 14;
 
 const WINDOWS = process.platform === 'win32';
 /** Marks the start of a reply or tool call; the Windows console font often lacks ⏺. */
@@ -245,9 +245,11 @@ function MdRow({ line }: { line: MdLine }) {
   );
 }
 
-function Markdown({ text, code, width }: { text: string; code?: boolean; width: number }) {
-  return <>{parseMarkdown(text, code, width).map((line, index) => <MdRow key={index} line={line} />)}</>;
-}
+const Markdown = memo(function Markdown({ text, code, width, maxRows }: { text: string; code?: boolean; width: number; maxRows?: number }) {
+  const parsed = parseMarkdown(text, code, width);
+  const lines = maxRows === undefined ? parsed : tailMarkdownRows(parsed, maxRows, width);
+  return <>{lines.map((line, index) => <MdRow key={index} line={line} />)}</>;
+});
 
 /** Output lines under a tool call: the first few, then how many more (Ctrl+O shows them all). */
 function outputRows(text: string, t: Translate, theme: Theme, error?: boolean): ReactNode[] {
@@ -485,14 +487,19 @@ function TranscriptLine({ line, t, live, width }: { line: Line; t: Translate; /*
   }
 }
 
+function MatchText({ text, query }: { text: string; query: string }) {
+  const index = query ? text.toLowerCase().indexOf(query.toLowerCase()) : -1;
+  return index < 0 ? <Text>{text}</Text> : <Text>{text.slice(0, index)}<Text bold underline>{text.slice(index, index + query.length)}</Text>{text.slice(index + query.length)}</Text>;
+}
+
 /** Long lists (a provider can offer 30+ models) scroll in a fixed window around the selection. */
 export const CHOICE_WINDOW = 10;
 
-function Choices({ prompt, t }: { prompt: Prompt; t: Translate }) {
+function Choices({ prompt, t, limit = CHOICE_WINDOW, query = '' }: { prompt: Prompt; t: Translate; limit?: number; query?: string }) {
   const theme = useTheme();
   const total = prompt.choices.length;
-  const start = total <= CHOICE_WINDOW ? 0 : Math.min(Math.max(0, prompt.index - Math.floor(CHOICE_WINDOW / 2)), total - CHOICE_WINDOW);
-  const end = Math.min(total, start + CHOICE_WINDOW);
+  const start = total <= limit ? 0 : Math.min(Math.max(0, prompt.index - Math.floor(limit / 2)), total - limit);
+  const end = Math.min(total, start + limit);
   let group = start > 0 ? prompt.choices[start - 1]!.group : undefined;
   return (
     <Box flexDirection="column">
@@ -504,10 +511,10 @@ function Choices({ prompt, t }: { prompt: Prompt; t: Translate }) {
         return (
           <Box key={`${index}-${choice.label}`} flexDirection="column">
             {header ? <Text {...theme.faint}>{header}</Text> : null}
-            <Text {...(selected ? theme.info : choice.disabled ? theme.faint : {})}>
+            <Text wrap="truncate-end" {...(selected ? theme.info : choice.disabled ? theme.faint : {})}>
               {selected ? '❯ ' : '  '}{total <= 9 && prompt.kind !== 'picker' ? `${index + 1}. ` : ''}
-              {prompt.kind === 'question' && prompt.question.multiSelect && index < (prompt.question.options?.length ?? 0) ? (prompt.selected.includes(index) ? '[x] ' : '[ ] ') : ''}{choice.label}
-              {choice.detail ? <Text {...theme.faint}>{`  ${choice.detail}`}</Text> : null}
+              {prompt.kind === 'question' && prompt.question.multiSelect && index < (prompt.question.options?.length ?? 0) ? (prompt.selected.includes(index) ? '[x] ' : '[ ] ') : ''}<MatchText text={choice.label} query={query} />
+              {choice.detail ? <Text {...theme.faint}>{'  '}<MatchText text={choice.detail} query={query} /></Text> : null}
             </Text>
           </Box>
         );
@@ -518,8 +525,10 @@ function Choices({ prompt, t }: { prompt: Prompt; t: Translate }) {
 }
 
 /** What the call would do, shown on its confirmation: the diff, the file's first lines, or the whole command. */
-function PermissionPreviewView({ preview, t }: { preview: NonNullable<Extract<Prompt, { kind: 'permission' }>['preview']>; t: Translate }) {
+function PermissionPreviewView({ preview: fullPreview, t }: { preview: NonNullable<Extract<Prompt, { kind: 'permission' }>['preview']>; t: Translate }) {
   const theme = useTheme();
+  const limit = fullPreview.kind === 'diff' ? 20 : DETAIL_ROWS;
+  const preview = { ...fullPreview, rows: fullPreview.rows.slice(0, limit), more: fullPreview.more + Math.max(0, fullPreview.rows.length - limit) } as typeof fullPreview;
   const rows = preview.kind === 'diff' ? diffRows(preview.rows, preview.more, t, theme)
     : preview.kind === 'write' ? numberedRows(preview.rows, preview.more, t, theme)
       : [
@@ -529,106 +538,122 @@ function PermissionPreviewView({ preview, t }: { preview: NonNullable<Extract<Pr
   return <Box flexDirection="column" marginY={1} paddingLeft={preview.kind === 'command' ? 2 : 0}>{rows}</Box>;
 }
 
-function PromptView({ prompt, hint, t, width, planRows }: { prompt: Prompt; hint: string; t: Translate; width: number; /** Rows the plan may take. */ planRows: number }) {
+/** Prompt text stays readable even when its inline card is condensed for a small terminal. */
+function promptDetails(prompt: Prompt, t: Translate): ViewItem {
+  const rows: ViewRow[] = [];
+  const text = (value: string) => rows.push(...value.split('\n').map(text => ({ text })));
+  if (prompt.kind === 'plan') {
+    text(prompt.plan);
+    return { id: 'prompt-plan', title: t('viewer.plan'), rows };
+  }
+  const title = prompt.kind === 'question' ? prompt.question.header ?? prompt.question.question : prompt.title;
+  if (prompt.kind === 'question') {
+    if (prompt.question.header) text(prompt.question.header);
+    text(prompt.question.question);
+    if (prompt.position) text(prompt.position);
+  } else {
+    text(prompt.title);
+    if (prompt.kind === 'permission') {
+      if (prompt.summary) text(prompt.summary);
+      if (prompt.description) text(prompt.description);
+      const preview = prompt.preview;
+      if (preview) {
+        rows.push({ text: '' });
+        if (preview.kind === 'diff') rows.push(...diffRowsText(preview.rows));
+        else preview.rows.forEach((row, index) => text(preview.kind === 'write' ? `${index + 1} ${row}` : row));
+        if (preview.more) text(t('tool.more', { count: preview.more }));
+      }
+    }
+  }
+  rows.push({ text: '' });
+  prompt.choices.forEach((choice, index) => {
+    if (choice.group) text(choice.group);
+    text(`${index + 1}. ${choice.label}`);
+    if (choice.detail) text(choice.detail);
+  });
+  return { id: `prompt-${prompt.kind}`, title, rows };
+}
+
+function PromptTitle({ children, t, tone }: { children: ReactNode; t: Translate; tone?: Tone }) {
+  const theme = useTheme();
+  return <Box>
+    <Box flexGrow={1} flexShrink={1}><Text bold wrap="truncate-end" {...tone}>{children}</Text></Box>
+    <Box flexShrink={0}><Text {...theme.faint}>{` ${t('viewer.promptHint')}`}</Text></Box>
+  </Box>;
+}
+
+function PromptView({ prompt, hint, t, width, planRows, filterQuery, choiceRows, maxRows }: { prompt: Prompt; hint: string; t: Translate; width: number; filterQuery: string; choiceRows: number; maxRows: number; /** Rows the plan may take. */ planRows: number }) {
   const theme = useTheme();
   if (prompt.kind === 'picker') {
     return (
       <Box flexDirection="column" borderStyle="round" borderColor={theme.border} paddingX={1}>
-        <Text bold>{prompt.title}</Text>
-        <Choices prompt={prompt} t={t} />
-        <Text {...theme.faint}>{prompt.back ? t('picker.hintBack') : hint}</Text>
+        <PromptTitle t={t}>{prompt.title}</PromptTitle>
+        {prompt.searchable ? <Text {...theme.faint} wrap="truncate-end">{filterQuery ? `> ${filterQuery}` : t('picker.search')}</Text> : null}
+        {prompt.choices.length ? <Choices prompt={prompt} t={t} limit={choiceRows} query={filterQuery} /> : <Text {...theme.faint}>{t('picker.noMatches')}</Text>}
+        <Text {...theme.faint} wrap="truncate-end">{prompt.searchable ? t('picker.filterHint') : prompt.back ? t('picker.hintBack') : hint}</Text>
       </Box>
     );
   }
   if (prompt.kind === 'permission') {
     return (
       <Box flexDirection="column" borderStyle="round" borderColor={theme.attention} paddingX={1}>
-        <Text bold color={theme.attention}>{prompt.title}</Text>
-        {prompt.summary ? <Text>{prompt.summary}</Text> : null}
-        {prompt.preview ? <PermissionPreviewView preview={prompt.preview} t={t} /> : null}
-        {prompt.description ? <Text {...theme.muted}>{prompt.description}</Text> : null}
-        <Choices prompt={prompt} t={t} />
+        <PromptTitle t={t} tone={{ color: theme.attention }}>{prompt.title}</PromptTitle>
+        {prompt.summary ? <Text wrap="truncate-end">{prompt.summary}</Text> : null}
+        {prompt.preview && maxRows > prompt.choices.length + 5 ? <Box flexDirection="column" maxHeight={maxRows - prompt.choices.length - 5} overflowY="hidden"><PermissionPreviewView preview={prompt.preview} t={t} /></Box> : null}
+        {prompt.description ? <Text wrap="truncate-end" {...theme.muted}>{prompt.description}</Text> : null}
+        <Choices prompt={prompt} t={t} limit={choiceRows} />
       </Box>
     );
   }
   if (prompt.kind === 'question') {
     return (
       <Box flexDirection="column" borderStyle="round" borderColor={theme.info.color ?? theme.border} paddingX={1}>
-        <Text bold>{prompt.question.header ? `${prompt.question.header}: ` : ''}{prompt.question.question}{prompt.position ? <Text {...theme.faint}>{`  ${prompt.position}`}</Text> : null}</Text>
-        <Choices prompt={prompt} t={t} />
+        <PromptTitle t={t}>{prompt.question.header ? `${prompt.question.header}: ` : ''}{prompt.question.question}{prompt.position ? <Text {...theme.faint}>{`  ${prompt.position}`}</Text> : null}</PromptTitle>
+        <Choices prompt={prompt} t={t} limit={choiceRows} />
       </Box>
     );
   }
   // The plan reads like a reply (Markdown). A long one shows its start here; Ctrl+O shows all of it.
   const source = prompt.plan.split('\n');
-  const rows = Math.max(3, planRows);
+  const rows = Math.max(1, Math.min(planRows, maxRows - prompt.choices.length - 6));
   const shown = source.length > rows ? source.slice(0, rows - 1) : source;
   return (
     <Box flexDirection="column" borderStyle="round" borderColor={theme.info.color ?? theme.border} paddingX={1}>
-      <Text bold>{hint}</Text>
+      <PromptTitle t={t}>{hint}</PromptTitle>
       <Box flexDirection="column" marginY={1}><Markdown text={shown.join('\n')} width={width - 4} /></Box>
       {shown.length < source.length ? <Text {...theme.faint}>{t('plan.more', { count: source.length - shown.length })}</Text> : null}
-      <Choices prompt={prompt} t={t} />
-      <Text {...theme.faint}>{t('ask.planHint')}</Text>
+      <Choices prompt={prompt} t={t} limit={choiceRows} />
+      <Text {...theme.faint} wrap="truncate-end">{t('ask.planHint')}</Text>
     </Box>
   );
 }
 
-export interface Editor { value: string; cursor: number }
-
-const WORD = /[\p{L}\p{N}_]/u;
-
-/**
- * Editing moves on the input (cursor is a UTF-16 index). Lines are the input's own lines; a word is a run of
- * letters, digits or underscores, as in shells.
- */
-export const edit = {
-  lineStart: ({ value, cursor }: Editor) => value.lastIndexOf('\n', cursor - 1) + 1,
-  lineEnd: ({ value, cursor }: Editor) => { const end = value.indexOf('\n', cursor); return end < 0 ? value.length : end; },
-  wordLeft({ value, cursor }: Editor): number {
-    let index = cursor;
-    while (index > 0 && !WORD.test(value[index - 1]!)) index--;
-    while (index > 0 && WORD.test(value[index - 1]!)) index--;
-    return index;
-  },
-  wordRight({ value, cursor }: Editor): number {
-    let index = cursor;
-    while (index < value.length && !WORD.test(value[index]!)) index++;
-    while (index < value.length && WORD.test(value[index]!)) index++;
-    return index;
-  },
-  /** Cursor one line up (-1) or down (1) at the same column, or null on the first / last line. */
-  vertical(editor: Editor, delta: -1 | 1): number | null {
-    const start = edit.lineStart(editor);
-    const column = editor.cursor - start;
-    if (delta < 0) {
-      if (start === 0) return null;
-      const previousStart = editor.value.lastIndexOf('\n', start - 2) + 1;
-      return Math.min(previousStart + column, start - 1);
-    }
-    const end = edit.lineEnd(editor);
-    if (end >= editor.value.length) return null;
-    return Math.min(end + 1 + column, edit.lineEnd({ value: editor.value, cursor: end + 1 }));
-  },
-  remove: ({ value }: Editor, from: number, to: number): Editor => ({ value: value.slice(0, from) + value.slice(to), cursor: from }),
-};
-
-/** In local command mode (`!` first) the mark is `!` in its own color and the `!` itself is not repeated. */
-function InputBox({ editor, placeholder, local }: { editor: Editor; placeholder: string; local: boolean }) {
+/** A bounded editor with the terminal's native cursor for IME composition. */
+function InputBox({ editor, placeholder, local, width, maxRows }: { editor: Editor; placeholder: string; local: boolean; width: number; maxRows: number }) {
   const theme = useTheme();
-  const skip = local && editor.cursor > 0 ? 1 : 0;
-  const before = editor.value.slice(skip, editor.cursor);
-  const at = editor.value[editor.cursor] ?? ' ';
-  const after = editor.value.slice(editor.cursor + 1);
-  const shown = editor.value.slice(skip);
+  const ref = useRef<DOMElement>(null);
+  const previousTop = useRef(0);
+  const shownEditor = local ? { value: editor.value.slice(1), cursor: Math.max(0, editor.cursor - 1) } : editor;
+  const viewport = inputViewport(shownEditor, Math.max(1, width - 4), maxRows, previousTop.current);
+  previousTop.current = viewport.top;
+  const [position, setPosition] = useState<{ x: number; y: number }>();
+  const { setCursorPosition } = useCursor();
+  useLayoutEffect(() => {
+    if (!ref.current) return;
+    const measured = measureElement(ref.current);
+    const next = { x: measured.x + 3 + viewport.cursorColumn, y: measured.y + 1 + viewport.cursorRow };
+    setPosition(previous => previous?.x === next.x && previous.y === next.y ? previous : next);
+  });
+  setCursorPosition(position);
   return (
-    <Box borderStyle="round" borderColor={local ? theme.local.color ?? theme.border : theme.border} paddingX={1}>
-      {local ? <Text {...theme.local} bold>{'! '}</Text> : <Text {...theme.muted}>{'> '}</Text>}
-      {shown ? (
-        <Text>{before}<Text inverse>{at === '\n' ? ' ' : at}</Text>{at === '\n' ? '\n' : ''}{after}</Text>
-      ) : (
-        <Text><Text inverse> </Text><Text {...theme.faint}>{placeholder}</Text></Text>
-      )}
+    <Box ref={ref} flexDirection="column" borderStyle="single" borderLeft={false} borderRight={false}
+      borderColor={local ? theme.local.color ?? theme.border : theme.border} paddingX={1}>
+      {viewport.rows.map((row, index) => (
+        <Box key={viewport.top + index}>
+          <Text {...(local ? theme.local : theme.muted)}>{index === 0 ? local ? '! ' : '> ' : '  '}</Text>
+          <Text wrap="truncate-end">{editor.value ? row.text || ' ' : <Text {...theme.faint}>{truncateWidth(placeholder, Math.max(1, width - 4))}</Text>}</Text>
+        </Box>
+      ))}
     </Box>
   );
 }
@@ -685,10 +710,10 @@ const IMAGE_RE = /\[(?:Image|图片) #(\d+)\]/g;
 /** Inputs ↑ and Ctrl+R reach in a run (earlier runs' included). */
 const HISTORY_KEEP = 500;
 
-export function App({ controller, header, hyperlinks = false, colorDepth = 24 }: {
+export function App({ controller, header, hyperlinks = false, colorDepth = 24, closing = false }: {
   controller: ChatController; header: string; hyperlinks?: boolean; /** The terminal's color depth (getColorDepth). */ colorDepth?: number;
+  /** Clear disposable UI while keeping the already-mounted scrollback tree for shutdown. */ closing?: boolean;
 }) {
-  const app = useApp();
   const windowSize = useWindowSize();
   const snapshot = useSyncExternalStore(controller.subscribe, controller.getSnapshot);
   const t = controller.translate();
@@ -706,19 +731,37 @@ export function App({ controller, header, hyperlinks = false, colorDepth = 24 }:
   /** Ctrl+R: the search text and how many older matches were skipped; null when not searching. */
   const [search, setSearch] = useState<{ query: string; skip: number } | null>(null);
   const prompt = snapshot.prompt;
+  const chromeRef = useRef<DOMElement>(null);
+  const chrome = useBoxMetrics(chromeRef);
+  const draft = useRef<Editor | null>(null);
+  const previousPrompt = useRef<Prompt | null>(null);
+  useLayoutEffect(() => {
+    if (prompt && !previousPrompt.current) { draft.current = editor; setEditor({ value: '', cursor: 0 }); }
+    else if (!prompt && previousPrompt.current && draft.current) { setEditor(draft.current); draft.current = null; }
+    previousPrompt.current = prompt;
+  }, [prompt]);
+  const [filter, setFilter] = useState<{ choices: Prompt['choices']; query: string; index: number } | null>(null);
+  const filterQuery = prompt?.kind === 'picker' && prompt.searchable && filter?.choices === prompt.choices ? filter.query : '';
+  const filteredIndices = prompt?.kind === 'picker' && prompt.searchable ? prompt.choices.flatMap((choice, index) =>
+    `${choice.label} ${choice.detail ?? ''} ${choice.group ?? ''}`.toLowerCase().includes(filterQuery.toLowerCase()) ? [index] : []) : [];
+  const filterIndex = Math.min(filter?.index ?? 0, Math.max(0, filteredIndices.length - 1));
+  const shownPrompt = prompt?.kind === 'picker' && filterQuery ? { ...prompt, choices: filteredIndices.map(index => prompt.choices[index]!), index: filterIndex } : prompt;
+  const suggestionRows = Math.max(1, Math.min(5, Math.floor(windowSize.rows / 4)));
+
   // Typing answers a question, revises a plan, or (on an Agent's confirmation) denies the step with a reason.
   const typing = !prompt || prompt.kind === 'question' || prompt.kind === 'plan' || (prompt.kind === 'permission' && prompt.feedback);
   const local = typing && !prompt && editor.value.startsWith('!');
   // Commands and @ completion belong to messages, not to answers.
-  const commands = typing && !prompt ? commandSuggestions(editor.value) : [];
+  const commands = typing && !prompt ? commandSuggestions(editor.value, t) : [];
   const mention = typing && !prompt && !commands.length && !local ? mentionAt(editor.value, editor.cursor) : null;
   const files = mention ? controller.fileSuggestions(mention.query) : [];
   const suggestions: Array<{ kind: 'command' | 'file'; value: string }> = commands.length
     ? commands.map(value => ({ kind: 'command', value })) : files.map(value => ({ kind: 'file', value }));
   const selected = suggestions[Math.min(suggestion, suggestions.length - 1)];
   useEffect(() => { setSuggestion(0); }, [editor.value]);
+  const suggestionStart = Math.max(0, Math.min(suggestion - Math.floor(suggestionRows / 2), suggestions.length - suggestionRows));
+  const shownSuggestions = suggestions.slice(suggestionStart, suggestionStart + suggestionRows);
 
-  useEffect(() => { if (snapshot.exited) app.exit(); }, [snapshot.exited, app]);
   // A confirmation or question needs the screen: close the viewer and any history search.
   useEffect(() => { if (prompt) { setViewer(null); setSearch(null); } }, [prompt]);
   // Earlier runs' inputs in this project directory come before this run's (↑, Ctrl+R).
@@ -728,8 +771,8 @@ export function App({ controller, header, hyperlinks = false, colorDepth = 24 }:
     return () => { live = false; };
   }, [controller]);
 
-  /** Folded items for Ctrl+O; while a plan waits for review, the whole plan is the last one. */
-  const viewable = () => [...viewItems(snapshot.lines, t), ...(prompt?.kind === 'plan' ? [{ id: 'plan', title: t('viewer.plan'), rows: prompt.plan.split('\n').map(text => ({ text })) }] : [])];
+  /** Folded items for Ctrl+O; the current prompt is always the last item, with all of its text. */
+  const viewable = () => [...viewItems(snapshot.lines, t), ...(prompt ? [promptDetails(prompt, t)] : [])];
   const items = viewer ? viewable() : [];
   /** Ctrl+R: newest matching inputs first; the shown one skips `skip` newer matches. */
   const matches = search ? [...history].reverse().filter(item => item.toLowerCase().includes(search.query.toLowerCase())) : [];
@@ -738,7 +781,7 @@ export function App({ controller, header, hyperlinks = false, colorDepth = 24 }:
   const viewItem = viewer ? items[Math.min(viewer.index, items.length - 1)] : undefined;
   const viewRows = viewItem ? wrapView(viewItem.rows, Math.max(10, windowSize.columns - 1)) : [];
 
-  const insert = (text: string) => setEditor(current => ({ value: current.value.slice(0, current.cursor) + text + current.value.slice(current.cursor), cursor: current.cursor + text.length }));
+  const insert = (text: string) => setEditor(current => edit.insert(current, text));
   const attachImage = (image: ImageAttachment) => {
     const id = ++pasteCount.current;
     images.current.set(id, image);
@@ -756,6 +799,8 @@ export function App({ controller, header, hyperlinks = false, colorDepth = 24 }:
   };
 
   usePaste(text => {
+    if (viewer || search) return;
+    if (prompt?.kind === 'picker' && prompt.searchable) { setFilter({ choices: prompt.choices, query: filterQuery + text.replace(/[\r\n]+/g, ' '), index: 0 }); return; }
     if (!typing || viewer || search) return;
     const normalized = text.replace(/\r\n?/g, '\n');
     // A dropped or pasted image file goes with the message as an image.
@@ -792,26 +837,27 @@ export function App({ controller, header, hyperlinks = false, colorDepth = 24 }:
       else if (key.return || key.tab) {
         if (match) { setEditor({ value: match, cursor: match.length }); setHistoryIndex(null); }
         setSearch(null);
-      } else if (key.backspace || key.delete) setSearch({ query: search.query.slice(0, -1), skip: 0 });
+      } else if (key.backspace || key.delete) setSearch({ query: edit.backspace({ value: search.query, cursor: search.query.length }).value, skip: 0 });
       else if (input && !key.ctrl && !key.meta) setSearch({ query: search.query + input, skip: 0 });
       return;
     }
     if (key.ctrl && input === 'c') { controller.ctrlC(); return; }
     if (key.ctrl && input === 'o') {
       const count = viewable().length;
-      if (count && (!prompt || prompt.kind === 'plan')) setViewer({ index: count - 1, offset: 0 });
+      if (count) setViewer({ index: count - 1, offset: 0 });
       return;
     }
     if (key.ctrl && input === 'r' && !prompt) { setSearch({ query: '', skip: 0 }); return; }
     if (key.escape) {
+      if (prompt?.kind === 'picker' && filterQuery) { setFilter(null); return; }
       if (prompt) controller.cancelPrompt();
       else if (controller.stopLocal()) { /* stopped the local command */ }
       else if (snapshot.phase === 'running') controller.interrupt();
       else setEditor({ value: '', cursor: 0 });
       return;
     }
-    if (key.tab && key.shift) { void controller.cyclePermission(); return; }
-    if (key.ctrl && input === 's') {
+    if (!prompt && key.tab && key.shift) { void controller.cyclePermission(); return; }
+    if (!prompt && key.ctrl && input === 's') {
       const { text, extra } = resolve(editor.value);
       setEditor({ value: '', cursor: 0 });
       void controller.steer(text, extra);
@@ -820,6 +866,26 @@ export function App({ controller, header, hyperlinks = false, colorDepth = 24 }:
     // Ctrl+V (Alt+V where the terminal keeps Ctrl+V for its own paste): an image from the clipboard.
     if (typing && ((key.ctrl && input === 'v') || (key.meta && input === 'v'))) {
       void controller.pasteImage().then(image => { if (image) attachImage(image); });
+      return;
+    }
+    if (prompt?.kind === 'picker' && prompt.searchable) {
+      const updateFilter = (query: string) => setFilter({ choices: prompt.choices, query, index: 0 });
+      if (key.upArrow || key.downArrow) {
+        if (!filterQuery) controller.move(key.upArrow ? -1 : 1);
+        else if (filteredIndices.length) {
+          const direction = key.upArrow ? -1 : 1;
+          let next = filterIndex;
+          for (let step = 0; step < filteredIndices.length; step++) {
+            next = (next + direction + filteredIndices.length) % filteredIndices.length;
+            if (!prompt.choices[filteredIndices[next]!]!.disabled) break;
+          }
+          setFilter({ choices: prompt.choices, query: filterQuery, index: next });
+        }
+      } else if (key.return) {
+        const index = filterQuery ? filteredIndices[filterIndex] : prompt.index;
+        if (index !== undefined && !prompt.choices[index]?.disabled) controller.choose(index);
+      } else if (key.backspace || key.delete) updateFilter(edit.backspace({ value: filterQuery, cursor: filterQuery.length }).value);
+      else if (input && !key.ctrl && !key.meta) updateFilter(filterQuery + input);
       return;
     }
     if (prompt && !typing) {
@@ -848,7 +914,8 @@ export function App({ controller, header, hyperlinks = false, colorDepth = 24 }:
     }
     if (selected?.kind === 'file' && mention && (key.tab || key.return)) {
       const value = selected.value;
-      const token = `@${/\s/.test(value) ? `"${value}"` : value} `;
+      const directory = value.endsWith('/');
+      const token = `@${/\s/.test(value) ? `"${value}${directory ? '' : '"'}` : value}${directory ? '' : ' '}`;
       setEditor(current => ({ value: current.value.slice(0, mention.start) + token + current.value.slice(current.cursor), cursor: mention.start + token.length }));
       return;
     }
@@ -878,9 +945,10 @@ export function App({ controller, header, hyperlinks = false, colorDepth = 24 }:
     if (key.tab && selected?.kind === 'command') { const value = `/${selected.value} `; setEditor({ value, cursor: value.length }); return; }
     // In a multi-line input ↑/↓ move between its lines; history only from the first / last line.
     if (key.upArrow || key.downArrow) {
-      const cursor = edit.vertical(editor, key.upArrow ? -1 : 1);
-      if (cursor !== null) { setEditor({ ...editor, cursor }); return; }
-      if (!history.length) return;
+      const projected = local ? { ...editor, value: editor.value.slice(1), cursor: Math.max(0, editor.cursor - 1) } : editor;
+      const moved = moveVertical(projected, key.upArrow ? -1 : 1, Math.max(1, windowSize.columns - 4));
+      if (moved !== null) { setEditor(local ? { ...moved, value: editor.value, cursor: moved.cursor + 1 } : moved); return; }
+      if (prompt || !history.length) return;
       const next = historyIndex === null ? (key.upArrow ? history.length - 1 : null) : historyIndex + (key.upArrow ? -1 : 1);
       if (next === null || next >= history.length) { setHistoryIndex(null); setEditor({ value: '', cursor: 0 }); return; }
       const index = Math.max(0, next);
@@ -888,12 +956,12 @@ export function App({ controller, header, hyperlinks = false, colorDepth = 24 }:
       setEditor({ value: history[index]!, cursor: history[index]!.length });
       return;
     }
-    const move = (cursor: (current: Editor) => number) => setEditor(current => ({ ...current, cursor: cursor(current) }));
+    const move = (cursor: (current: Editor) => number) => setEditor(current => ({ value: current.value, cursor: cursor(current) }));
     // Word moves: Alt+←/→ (macOS Option), Ctrl+←/→ and Alt+B / Alt+F as in shells.
     if ((key.leftArrow && (key.meta || key.ctrl)) || (key.meta && input === 'b')) { move(edit.wordLeft); return; }
     if ((key.rightArrow && (key.meta || key.ctrl)) || (key.meta && input === 'f')) { move(edit.wordRight); return; }
-    if (key.leftArrow) { move(current => Math.max(0, current.cursor - 1)); return; }
-    if (key.rightArrow) { move(current => Math.min(current.value.length, current.cursor + 1)); return; }
+    if (key.leftArrow) { move(edit.left); return; }
+    if (key.rightArrow) { move(edit.right); return; }
     if (key.home || (key.ctrl && input === 'a')) { move(edit.lineStart); return; }
     if (key.end || (key.ctrl && input === 'e')) { move(edit.lineEnd); return; }
     if (key.ctrl && input === 'u') { setEditor({ value: '', cursor: 0 }); return; }
@@ -904,8 +972,8 @@ export function App({ controller, header, hyperlinks = false, colorDepth = 24 }:
       setEditor(current => { const end = edit.lineEnd(current); return edit.remove(current, current.cursor, end === current.cursor ? Math.min(end + 1, current.value.length) : end); });
       return;
     }
-    if (key.backspace) { setEditor(current => (current.cursor === 0 ? current : edit.remove(current, current.cursor - 1, current.cursor))); return; }
-    if (key.delete) { setEditor(current => edit.remove(current, current.cursor, Math.min(current.value.length, current.cursor + 1))); return; }
+    if (key.backspace) { setEditor(edit.backspace); return; }
+    if (key.delete) { setEditor(edit.delete); return; }
     if (input && !key.ctrl && !key.meta) insert(input);
   });
 
@@ -926,7 +994,7 @@ export function App({ controller, header, hyperlinks = false, colorDepth = 24 }:
   const pending = snapshot.lines.slice(committedCount.current);
   const pendingRows = pending.reduce((rows, line) => rows + lineRows(line, t), 0);
   const model = snapshot.model;
-  const status = snapshot.localRunning ? t('chat.localRunning')
+  const status = prompt ? '' : snapshot.localRunning ? t('chat.localRunning')
     : snapshot.phase === 'connecting' ? t('chat.connecting', { where: model?.targetLabel ?? '' })
       : snapshot.phase === 'running' ? (prompt ? t('chat.waitingAnswer') : t(snapshot.thinking ? 'chat.thinking' : 'chat.working')) : '';
   const statusKeys = snapshot.localRunning ? t('chat.localKeys') : snapshot.phase === 'running' && !prompt ? t('chat.workingKeys') : undefined;
@@ -951,63 +1019,69 @@ export function App({ controller, header, hyperlinks = false, colorDepth = 24 }:
           the terminal and replays all static history on every spinner tick. Keep the bottom (input)
           visible and leave one spare terminal row, including on Windows. Clipped history is still
           committed in full above when the pending tools finish. */}
-      <Box flexDirection="column" maxHeight={Math.max(1, windowSize.rows - 1)} overflowY="hidden" justifyContent="flex-end">
+      {closing ? null : <Box flexDirection="column" maxHeight={Math.max(1, windowSize.rows - 1)} overflowY="hidden" justifyContent="flex-end">
         {viewer && viewItem ? (
           <Viewer title={viewItem.title} position={t('viewer.position', { index: Math.min(viewer.index, items.length - 1) + 1, total: items.length })}
             rows={viewRows} offset={viewer.offset} height={viewHeight} t={t} />
         ) : (
         <Box flexDirection="column" flexShrink={0}>
+          <Box flexDirection="column" maxHeight={Math.max(0, windowSize.rows - chrome.height - 2)} overflowY="hidden" justifyContent="flex-end">
           {pending.map(line => <TranscriptLine key={line.id} line={line} t={t} width={width} live />)}
           {snapshot.live ? (
             <Box marginTop={snapshot.liveCont ? 0 : 1}>
               <Gutter mark={snapshot.liveCont ? '' : DOT}>
-                <Markdown text={tailRows(snapshot.live, windowSize.rows - RESERVED_ROWS - pendingRows, width - 2)} code={snapshot.liveCode} width={width - 2} />
+                <Markdown text={snapshot.live} maxRows={Math.max(1, windowSize.rows - chrome.height - 3 - pendingRows)} code={snapshot.liveCode} width={width - 2} />
               </Gutter>
             </Box>
           ) : null}
+          </Box>
+          <Box ref={chromeRef} flexDirection="column">
           {status ? <Status text={status} {...(statusKeys ? { keys: statusKeys } : {})} startedAt={!snapshot.localRunning && snapshot.phase === 'running' ? snapshot.turnStartedAt : null}
             {...(snapshot.localRunning ? { tone: theme.local } : {})} /> : null}
           <Box marginTop={1} flexDirection="column">
-            {prompt ? <PromptView prompt={prompt} t={t} hint={prompt.kind === 'plan' ? t('ask.planTitle') : t('picker.hint')} width={width}
-              planRows={windowSize.rows - RESERVED_ROWS - prompt.choices.length - 2} /> : null}
-            {queue.length ? (
+            {shownPrompt ? <PromptView prompt={shownPrompt} t={t} hint={shownPrompt.kind === 'plan' ? t('ask.planTitle') : t('picker.hint')} width={width}
+              planRows={Math.max(3, Math.floor(windowSize.rows / 3))} filterQuery={filterQuery} maxRows={Math.max(4, windowSize.rows - (typing ? 6 : 3))} choiceRows={Math.max(1, Math.min(CHOICE_WINDOW, windowSize.rows - 10))} /> : null}
+            {!prompt && queue.length ? (
               <Box flexDirection="column" paddingX={2}>
                 <Text {...(snapshot.queuePaused ? theme.warning : theme.muted)}>
                   {snapshot.queuePaused ? t('chat.queuePaused', { count: queue.length }) : t('chat.queued', { count: queue.length })}
                 </Text>
-                {queue.slice(0, 3).map((item, index) => <Text key={item.id} {...theme.faint}>{`  ${index + 1}. ${(item.display ?? item.text).split('\n')[0]!.slice(0, 100)}`}</Text>)}
+                {queue.slice(0, 3).map((item, index) => <Text key={item.id} {...theme.faint} wrap="truncate-end">{`  ${index + 1}. ${(item.display ?? item.text).split('\n')[0]!.slice(0, 100)}`}</Text>)}
                 {queue.length > 3 ? <Text {...theme.faint}>{`  ${t('chat.queueMore', { count: queue.length - 3 })}`}</Text> : null}
                 <Text {...theme.faint}>{`  ${t('chat.queueHint')}`}</Text>
               </Box>
             ) : null}
             {snapshot.localPending && !local ? <Box paddingX={2}><Text {...theme.local}>{t('local.pendingCount', { count: snapshot.localPending })}</Text></Box> : null}
             {search ? <HistorySearch query={search.query} match={match ?? null} t={t} />
-              : typing ? <InputBox editor={editor} local={local} placeholder={prompt?.kind === 'question' ? t(prompt.question.multiSelect ? 'ask.multiHint' : 'ask.questionHint')
+              : typing ? <InputBox editor={editor} local={local} width={windowSize.columns} maxRows={prompt || suggestions.length ? 1 : Math.max(1, Math.min(8, Math.floor(windowSize.rows / 3)))} placeholder={prompt?.kind === 'question' ? t(prompt.question.multiSelect ? 'ask.multiHint' : 'ask.questionHint')
                 : prompt?.kind === 'plan' ? t('ask.planHint') : prompt?.kind === 'permission' ? t('permission.feedbackHint') : t('chat.hint')} /> : null}
             {suggestions.length ? (
               <Box flexDirection="column" paddingX={2}>
-                {suggestions.map(item => {
+                {suggestionStart > 0 ? <Text {...theme.faint}>{t('picker.moreAbove', { count: suggestionStart })}</Text> : null}
+                {shownSuggestions.map(item => {
                   const isSelected = item === selected;
                   return item.kind === 'command' ? (
-                    <Text key={item.value}>
-                      <Text {...(isSelected ? theme.info : theme.muted)} bold={isSelected}>{`/${item.value.padEnd(12)}`}</Text>
-                      <Text {...(isSelected ? theme.info : theme.faint)}>{commandDescription(t, item.value as Parameters<typeof commandDescription>[1])}</Text>
+                    <Text key={item.value} wrap="truncate-end">
+                      <Text {...(isSelected ? theme.info : theme.muted)} bold={isSelected}><MatchText text={`/${item.value}`} query={editor.value.slice(1)} />{' '}<MatchText text={resolveCommand(item.value)?.parameterHint ?? ''} query="" />{'  '}</Text>
+                      <Text {...(isSelected ? theme.info : theme.faint)}><MatchText text={commandDescription(t, item.value as Parameters<typeof commandDescription>[1])} query={editor.value.slice(1)} /></Text>
                     </Text>
                   ) : (
                     <Text key={item.value} wrap="truncate-end" {...(isSelected ? theme.info : theme.muted)} bold={isSelected}>{`${isSelected ? '❯ ' : '  '}@${item.value}`}</Text>
                   );
                 })}
+                {suggestionStart + shownSuggestions.length < suggestions.length ? <Text {...theme.faint}>{t('picker.moreBelow', { count: suggestions.length - suggestionStart - shownSuggestions.length })}</Text> : null}
               </Box>
             ) : null}
-            <Box paddingX={2} justifyContent="space-between">
+            <Box paddingX={2} justifyContent="space-between" height={1} overflow="hidden">
               {mode}
-              <Text {...theme.faint}>{model ? `${model.modelName}${snapshot.effort ? ` (${snapshot.effort})` : ''} · ${model.targetLabel}` : t('chat.noModel')}</Text>
+              <Text {...theme.faint} wrap="truncate-end">{model ? `${model.modelName}${snapshot.effort ? ` (${snapshot.effort})` : ''} · ${model.targetLabel}` : t('chat.noModel')}</Text>
             </Box>
-            {snapshot.usage ? <UsageBar usage={snapshot.usage} t={t} /> : null}
+            {!prompt && snapshot.usage ? <UsageBar usage={snapshot.usage} t={t} /> : null}
+          </Box>
           </Box>
         </Box>
         )}
-      </Box>
+      </Box>}
     </Box>
     </LinkContext.Provider>
     </ThemeContext.Provider>
