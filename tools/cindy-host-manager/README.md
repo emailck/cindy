@@ -75,6 +75,19 @@ only trusted administrators should have access to this page.
    can be paused, resumed, or removed. Links and terminal output are temporary;
    they disappear when the view is closed, changed, or signed out.
 
+**Account test and quota.** Both buttons run the instance's own native CLI inside its
+container: `docker exec` in the running service, or a temporary container on the same
+volumes when stopped (refused while a login is open). The manager never reads
+credential files or calls a provider API itself. **Send hi test** runs `claude -p`
+(no tools, no MCP, no saved session) or `codex exec --ephemeral` with the prompt `hi`,
+and shows the reply, model and duration, or the CLI's error. It sends a real message and
+uses a small amount of quota. **Check plan and quota** sends Claude Code's `get_usage`
+control request, or Codex app-server's `account/rateLimits/read`, and shows the plan,
+quota windows (percent used and reset time), Codex credits and Claude extra-usage state.
+It does not call a model. `get_usage` is an undocumented Claude Code control protocol;
+an unrecognized response is shown as unavailable, not guessed. Each probe has a 24-second
+deadline, and only an allowlisted, length-bounded projection leaves the container.
+
 Opening an instance automatically checks its saved authentication; refresh only
 checks the selected instance. Account details show the safe name/email and native
 login method, with plan/organization only when provided. Missing details are
@@ -119,6 +132,59 @@ transport (`https://`), SOCKS, and forced egress for arbitrary child processes a
 unsupported. A failed Proxy does not silently fall back to a direct connection.
 Real account login, external provider access, and a real Proxy must be checked
 in your deployment; unit tests use synthetic data.
+
+## Networks: shared, forced exit
+
+Proxy variables only ask programs to use a proxy; programs that ignore them (some
+WebSocket clients, commands an agent runs, UDP) connect directly with the host IP.
+A **network** forces the route instead. Several instances can share one network,
+and therefore one exit.
+
+Each network is a dedicated Docker bridge (`172.30.N.0/24`) on which the host takes
+no address. Its gateway container (mihomo) claims the bridge gateway address, so
+every instance packet must pass it. The gateway sends the direct list (default
+`cindy.app`, `cindy.com.cn`, so Cindy keeps its direct connection) directly,
+rejects UDP other than DNS, answers DNS itself, and sends everything else to the
+network's upstream HTTP proxy. Instances get the gateway as their DNS server and
+proxy (`HTTPS_PROXY=http://172.30.N.1:7890`) and need no extra privileges. If the
+gateway stops, those instances lose network access instead of connecting directly;
+they recover without a restart when it returns. Each instance keeps its own network
+namespace, so instances cannot reach each other's loopback services. A service an
+agent binds to `0.0.0.0` is reachable from other instances on the same network.
+
+Setup on each standalone host:
+
+```sh
+scripts/build-gateway-image.sh /path/to/static/mihomo   # also needs a static busybox, default /bin/busybox
+export CINDY_MANAGER_GATEWAY_IMAGE=cindy-egress-gateway:local   # default; empty disables networks
+```
+
+Open **Networks**, create a network (name, upstream HTTP proxy and optional
+authentication, direct domains), and use **Test exit**: a temporary container on the
+network that sets no proxy variables shows the exit it actually uses. Then choose
+**Network (forced proxy)** for a stopped instance and start it. Existing instances
+keep their current proxy setting until you change it. The gateway is the only
+container with `NET_ADMIN` (plus `NET_BIND_SERVICE` for DNS), runs with a read-only
+root filesystem and restarts with Docker. Saving a network, or rebuilding the image,
+replaces the gateway on its next use. A network can only be deleted when no instance
+uses it. Upstream credentials are encrypted like other proxy settings and are never
+returned by the API, but appear in the gateway's container command on the host.
+
+### Observing instance egress
+
+`scripts/egress-capture.sh` temporarily records where managed instances connect, to
+check which traffic bypasses the proxy. It needs root and `tcpdump`, captures only
+managed instance IPs (new connections, DNS, TLS server names and proxy request lines;
+no other payload), samples which in-container process held each connection, and never
+changes firewall, routing, Docker or proxy settings. It follows instance restarts,
+stops after the requested hours or 500 MB, and keeps data in a private directory.
+
+```sh
+sudo scripts/egress-capture.sh start 24   # hours, 1-168
+sudo scripts/egress-capture.sh status
+sudo scripts/egress-capture.sh report     # direct vs proxy vs Cindy, with processes
+sudo scripts/egress-capture.sh stop
+```
 
 ## HTTPS reverse proxy
 

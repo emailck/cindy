@@ -64,6 +64,7 @@ let authenticated = true;
 let savedProxyUrl: string | null = null;
 let proxyTestFails = false;
 let proxyTestGate: Promise<void> | undefined;
+let networkList: unknown[] = [];
 beforeEach(() => {
   calls.length = 0;
   state = "stopped";
@@ -79,6 +80,7 @@ beforeEach(() => {
   savedProxyUrl = null;
   proxyTestFails = false;
   proxyTestGate = undefined;
+  networkList = [];
   terminalEvents.autoExit = null;
   terminalEvents.lastExit = undefined;
   Object.defineProperty(navigator, "language", {
@@ -113,7 +115,25 @@ beforeEach(() => {
         if (method === "DELETE") authenticated = false;
         data = { authenticated, csrfToken: "test-csrf" };
       } else if (path === "/api/settings")
-        data = { image: "test-image", proxyConfigured: !!savedProxyUrl, proxyUrl: savedProxyUrl };
+        data = { image: "test-image", proxyConfigured: !!savedProxyUrl, proxyUrl: savedProxyUrl, gatewayImage: "gateway:test" };
+      else if (path === "/api/networks" && method === "GET")
+        data = { networks: networkList };
+      else if (path === "/api/networks" && method === "POST") {
+        const network = {
+          id: "11111111-1111-4111-8111-111111111111",
+          name: body.name,
+          subnet: "172.30.0.0/24",
+          gateway: "172.30.0.1",
+          proxyUrl: body.proxyUrl,
+          proxyAuthConfigured: !!body.proxyPassword,
+          directDomains: String(body.directDomains).split(/,\s*/),
+          createdAt: "2026-01-01",
+          state: "running",
+          instances: [],
+        };
+        networkList = [network];
+        data = { network };
+      }
       else if (path === "/api/proxy/test") {
         if (proxyTestGate) await proxyTestGate;
         if (proxyTestFails) return { ok: false, status: 502, json: async () => ({ error: { code: "PROXY_TEST_FAILED" } }) };
@@ -175,6 +195,27 @@ beforeEach(() => {
               : {
                   authentication: { cindy: "stored", provider: providerStatus },
                 }),
+            ...(body.action === "hello"
+              ? {
+                  providerTest: {
+                    ok: true,
+                    reply: `Hello from ${instance.id}`,
+                    durationMs: 1500,
+                    checkedAt: "2026-01-01T00:00:00Z",
+                  },
+                }
+              : body.action === "usage"
+                ? {
+                    providerUsage: {
+                      state: "ready",
+                      plan: "plus",
+                      windows: [
+                        { kind: "session", usedPercent: 30, windowMinutes: 300 },
+                      ],
+                      checkedAt: "2026-01-01T00:00:00Z",
+                    },
+                  }
+                : {}),
           },
         };
       } else if (path.endsWith("/share"))
@@ -389,6 +430,65 @@ it("loads saved login on detail open and updates it on explicit/focus refresh", 
   ).toBeNull();
   expect(calls.filter((call) => call.body?.action === "check")).toHaveLength(4);
 });
+// Account test / quota buttons: the page must POST the native probe action for the selected
+// instance only, show its result, and never show one instance's result on another instance.
+it("runs hi test and quota read for the selected instance and keeps results per instance", async () => {
+  includeOther = true;
+  await openInstance();
+  fireEvent.click(screen.getByRole("button", { name: "Send hi test" }));
+  await screen.findByText("Hello from test");
+  expect(screen.getByText("Working")).toBeTruthy();
+  fireEvent.click(screen.getByRole("button", { name: "Check plan and quota" }));
+  await screen.findByText("Plan: plus");
+  expect(screen.getByText("5-hour window")).toBeTruthy();
+  expect(screen.getByText("30% used")).toBeTruthy();
+  expect(
+    calls
+      .filter((call) => ["hello", "usage"].includes(String(call.body?.action)))
+      .map((call) => [call.path, call.body?.action]),
+  ).toEqual([
+    ["/api/instances/test/actions", "hello"],
+    ["/api/instances/test/actions", "usage"],
+  ]);
+  fireEvent.click(screen.getByRole("button", { name: /Other CLI/ }));
+  await waitFor(() => expect(screen.queryByText("Hello from test")).toBeNull());
+  expect(screen.queryByText("Plan: plus")).toBeNull();
+});
+// Networks: the operator creates a shared exit, then puts a new instance on it. Guards the
+// request contract (network body with credentials only on write; instance with
+// proxyMode "network" + networkId) through the real page controls.
+it("creates a network and places a new instance on it", async () => {
+  render(<App />);
+  await screen.findByRole("button", { name: /My CLI/ });
+  fireEvent.click(screen.getByText(/Networks \(0\)/, { selector: "summary" }));
+  fireEvent.click(screen.getByRole("button", { name: "New network" }));
+  const form = screen.getByRole("heading", { name: "New network" }).closest("section")!.querySelector("form")!;
+  fireEvent.change(within(form).getByLabelText("Name"), { target: { value: "HK exit" } });
+  fireEvent.change(within(form).getByLabelText("Upstream HTTP proxy"), { target: { value: "http://172.17.0.1:7890" } });
+  fireEvent.change(within(form).getByLabelText("Proxy password"), { target: { value: "invalid-network-secret" } });
+  fireEvent.click(within(form).getByRole("button", { name: "Save" }));
+  await screen.findByText(/Networks \(1\)/, { selector: "summary" });
+  expect(calls.find((call) => call.path === "/api/networks" && call.method === "POST")?.body).toEqual({
+    name: "HK exit",
+    proxyUrl: "http://172.17.0.1:7890",
+    proxyPassword: "invalid-network-secret",
+    directDomains: "cindy.app, cindy.com.cn",
+  });
+  fireEvent.click(screen.getByText("Create instance", { selector: "summary" }));
+  const create = screen.getByRole("button", { name: "Create instance" }).closest("form")!;
+  fireEvent.change(within(create).getByLabelText("Name"), { target: { value: "Created CLI" } });
+  fireEvent.change(within(create).getByLabelText("HTTP Proxy"), { target: { value: "network" } });
+  expect(within(create).getByLabelText("Networks")).toHaveProperty("value", "11111111-1111-4111-8111-111111111111");
+  fireEvent.click(within(create).getByRole("button", { name: "Create instance" }));
+  await waitFor(() =>
+    expect(calls.find((call) => call.path === "/api/instances" && call.method === "POST")?.body).toMatchObject({
+      name: "Created CLI",
+      proxyMode: "network",
+      networkId: "11111111-1111-4111-8111-111111111111",
+    }),
+  );
+});
+
 it("checks a newly created selected instance even while create is settling", async () => {
   render(<App />);
   await screen.findByRole("button", { name: /My CLI/ });
@@ -742,6 +842,13 @@ function centralFixture() {
             city: "",
           };
         else if (route.endsWith("/login")) data = { loginId: "fake-login" };
+        // Older federated managers have no networks endpoint; the page must keep working.
+        else if (route === "/networks")
+          return {
+            ok: false,
+            status: 404,
+            json: async () => ({ error: { code: "NOT_FOUND", message: "" } }),
+          };
         else throw new Error(`Unexpected scoped route ${route}`);
       }
       return { ok: true, json: async () => data };

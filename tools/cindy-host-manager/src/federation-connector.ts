@@ -147,6 +147,15 @@ export class FederationConnector {
         if (path === '/api/settings' && method === 'GET') return async () => ({ status: 200, body: service.settings() });
         if (path === '/api/settings' && method === 'PUT') return async () => ({ status: 200, body: service.updateSettings(body) });
         if (path === '/api/proxy/test' && method === 'POST') return async () => ({ status: 200, body: await service.testProxy(body) });
+        if (path === '/api/networks' && method === 'GET') return async () => ({ status: 200, body: { networks: await service.listNetworks() } });
+        if (path === '/api/networks' && method === 'POST') return async () => ({ status: 201, body: { network: await service.createNetwork(body) } });
+        const network = path.match(/^\/api\/networks\/([a-f0-9-]{36})(?:\/(test))?$/);
+        if (network) {
+            const id = network[1]!;
+            if (!network[2] && method === 'PATCH') return async () => ({ status: 200, body: { network: await service.updateNetwork(id, body) } });
+            if (!network[2] && method === 'DELETE') return async () => ({ status: 200, body: await service.deleteNetwork(id) });
+            if (network[2] === 'test' && method === 'POST') return async () => ({ status: 200, body: await service.testNetwork(id) });
+        }
         if (path === '/api/instances' && method === 'GET') return async () => ({ status: 200, body: { instances: await service.list() } });
         if (path === '/api/instances' && method === 'POST') return async () => ({ status: 201, body: { instance: await service.create(body) } });
         const match = path.match(/^\/api\/instances\/([a-f0-9-]{36})(?:\/(actions|login|share))?$/);

@@ -40,6 +40,12 @@ class Runtime implements DockerRuntime {
     async stop(i: RuntimeInstance) { this.states.set(i.id, 'stopped'); }
     async check(i: RuntimeInstance) { return this.inspect(i); }
     async share() { return {}; }
+    async probe() { return { ok: true, durationMs: 1, checkedAt: '2026-01-01T00:00:00.000Z' }; }
+    async allocateSubnet() { return '172.30.0.0/24'; }
+    async applyNetwork() {}
+    async inspectNetwork() { return 'running' as const; }
+    async removeNetwork() {}
+    async testNetwork() { return { ip: '192.0.2.9', country: '', region: '', city: '' }; }
     async testProxy() { return { ip: '203.0.113.5', country: '', region: '', city: '' }; }
     async openLogin() { const login = new Login(); this.logins.push(login); return login; }
 }

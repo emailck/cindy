@@ -1,5 +1,6 @@
 import { Federation } from "./Federation";
 import { ProxyFields, proxyFormData } from "./ProxyFields";
+import { NetworksPanel } from "./Networks";
 import { lazy, Suspense, useEffect, useRef, useState } from "react";
 import {
   Api,
@@ -7,7 +8,11 @@ import {
   safeHttps,
   type AccountIdentity,
   type Instance,
+  type Network,
+  type ProviderTest,
+  type ProviderUsage,
   type Settings,
+  type UsageWindow,
 } from "./api";
 import { translator, errorText, type Key, type Locale } from "./i18n";
 
@@ -104,6 +109,8 @@ export function App({
   const instanceSettingsDetailsRef = useRef<HTMLDetailsElement>(null);
   const instance = instances.find((item) => item.id === selected);
   const [settings, setSettings] = useState<Settings>();
+  // undefined: this computer's manager predates networks (e.g. an older federated node).
+  const [networks, setNetworks] = useState<Network[] | undefined>();
   const [loginId, setLoginId] = useState("");
   const [loginChecking, setLoginChecking] = useState(false);
   const generation = useRef(0);
@@ -133,6 +140,11 @@ export function App({
     expiresAt?: string;
   } | null>(null);
   const [usage, setUsage] = useState<unknown>(null);
+  // Latest in-container hi test / quota read per instance; never mixed across instances.
+  const [probes, setProbes] = useState<
+    Record<string, { test?: ProviderTest; usage?: ProviderUsage }>
+  >({});
+  const [probing, setProbing] = useState<"hello" | "usage" | null>(null);
 
   useEffect(() => {
     document.documentElement.dataset.theme = inheritedTheme ?? theme;
@@ -152,6 +164,7 @@ export function App({
       setSelected("");
     }
     loginContext.current = null;
+    if (endSession) setProbes({});
     setLoginChecking(false);
     setLoginId("");
     setShares(null);
@@ -180,11 +193,20 @@ export function App({
   async function refresh() {
     if (!mounted.current) return;
     const epoch = generation.current;
-    const [data, config] = await Promise.all([
+    const [data, config, networkList] = await Promise.all([
       api.request<{ instances: Instance[] }>("/instances"),
       api.request<Settings>("/settings"),
+      api
+        .request<{ networks: Network[] }>("/networks")
+        .then((value) => value.networks)
+        .catch((failure) => {
+          if (failure instanceof ApiError && failure.status === 404)
+            return undefined;
+          throw failure;
+        }),
     ]);
     if (epoch !== generation.current) return;
+    setNetworks(networkList);
     setInstances((previous) =>
       data.instances.map((item) =>
         mergeInstance(
@@ -382,6 +404,40 @@ export function App({
     }
   }
 
+  async function probe(kind: "hello" | "usage") {
+    const id = selectedId.current;
+    const epoch = generation.current;
+    setProbing(kind);
+    try {
+      const { instance: updated } = await api.request<{
+        instance: Instance & {
+          providerTest?: ProviderTest;
+          providerUsage?: ProviderUsage;
+        };
+      }>(`/instances/${encodeURIComponent(id)}/actions`, "POST", {
+        action: kind,
+      });
+      if (epoch !== generation.current) return;
+      const { providerTest, providerUsage, ...view } = updated;
+      setProbes((current) => ({
+        ...current,
+        [id]: {
+          ...current[id],
+          ...(kind === "hello"
+            ? { test: providerTest }
+            : { usage: providerUsage }),
+        },
+      }));
+      setInstances((items) =>
+        items.map((item) =>
+          item.id === view.id ? mergeInstance(item, view) : item,
+        ),
+      );
+    } finally {
+      setProbing(null);
+    }
+  }
+
   async function share(actionName: string, id?: string, code?: string) {
     const { result } = await api.request<{ result: unknown }>(
       `/instances/${selected}/share`,
@@ -398,6 +454,10 @@ export function App({
       setUsage(result);
     else await share("list");
   }
+
+  const networksEnabled = !!settings?.gatewayImage;
+  const pickerNetworks =
+    networks && (networksEnabled || networks.length) ? networks : undefined;
 
   const formData = (form: HTMLFormElement) =>
     Object.fromEntries(new FormData(form));
@@ -664,6 +724,19 @@ export function App({
                 </div>
               </details>
 
+              {/* 网络（强制走 Proxy 的共享出口） */}
+              {networks && (
+                <NetworksPanel
+                  api={api}
+                  t={t}
+                  networks={networks}
+                  enabled={networksEnabled}
+                  disabled={pending}
+                  run={run}
+                  onChanged={refresh}
+                />
+              )}
+
               {/* 创建实例弹窗卡片 */}
               <details className="modal-details" ref={createDetailsRef}>
                 <summary className="btn-summary primary-summary">
@@ -716,6 +789,7 @@ export function App({
                         api={api}
                         t={t}
                         defaultProxyUrl={settings?.proxyUrl}
+                        networks={pickerNetworks}
                         disabled={pending || !!loginId || loginChecking}
                       />
                       <div className="modal-footer">
@@ -805,7 +879,9 @@ export function App({
                       ? t("none")
                       : item.proxyMode === "default"
                         ? t("default")
-                        : t("customProxy");
+                        : item.proxyMode === "network"
+                          ? `${t("networks")}: ${item.networkName ?? "?"}`
+                          : t("customProxy");
                   return (
                     <button
                       className="instance-row-card"
@@ -1004,6 +1080,7 @@ export function App({
                             instance.id +
                             instance.name +
                             instance.proxyMode +
+                            (instance.networkId ?? "") +
                             instance.proxyUrl +
                             instance.proxyAuthConfigured
                           }
@@ -1037,6 +1114,7 @@ export function App({
                             t={t}
                             instance={instance}
                             defaultProxyUrl={settings?.proxyUrl}
+                            networks={pickerNetworks}
                             disabled={
                               instance.state === "running" ||
                               pending ||
@@ -1308,6 +1386,55 @@ export function App({
                     {t("login")}
                   </button>
                 </form>
+              )}
+            </section>
+
+            {/* 账号测试与配额：在实例容器内运行原生 CLI */}
+            <section className="section-block">
+              <div className="section-header">
+                <div>
+                  <h3>
+                    {instance.engine === "codex" ? "Codex" : "Claude Code"} ·{" "}
+                    {t("providerCheck")}
+                  </h3>
+                  <p className="section-sub">{t("providerCheckNote")}</p>
+                </div>
+                <div className="toolbar">
+                  {(["hello", "usage"] as const).map((kind) => (
+                    <button
+                      key={kind}
+                      disabled={
+                        pending ||
+                        !!loginId ||
+                        loginChecking ||
+                        !["running", "stopped"].includes(instance.state)
+                      }
+                      onClick={() => void run(() => probe(kind))}
+                    >
+                      {probing === kind
+                        ? t(kind === "hello" ? "sendingHello" : "readingUsage")
+                        : t(kind === "hello" ? "sendHello" : "readUsage")}
+                    </button>
+                  ))}
+                </div>
+              </div>
+              {(probes[instance.id]?.test || probes[instance.id]?.usage) && (
+                <div className="accounts-grid probe-grid">
+                  {probes[instance.id]?.test && (
+                    <ProviderTestCard
+                      value={probes[instance.id]!.test!}
+                      locale={activeLocale}
+                      t={t}
+                    />
+                  )}
+                  {probes[instance.id]?.usage && (
+                    <ProviderUsageCard
+                      value={probes[instance.id]!.usage!}
+                      locale={activeLocale}
+                      t={t}
+                    />
+                  )}
+                </div>
               )}
             </section>
 
@@ -1586,6 +1713,180 @@ function AccountDetails({
         </>
       )}
     </section>
+  );
+}
+
+function ProviderTestCard({
+  value,
+  locale,
+  t,
+}: {
+  value: ProviderTest;
+  locale: Locale;
+  t: (key: Key) => string;
+}) {
+  const status = value.ok
+    ? "helloOk"
+    : value.timedOut
+      ? "helloTimedOut"
+      : "helloFailed";
+  return (
+    <div className="probe-card" role="status">
+      <div className="account-card-head">
+        <span className="account-card-title">{t("helloTitle")}</span>
+        <span className="badge">
+          <span className={`dot ${value.ok ? "ok" : "err"}`} />
+          {t(status)}
+        </span>
+      </div>
+      {value.reply && (
+        <p className="probe-reply">
+          <span className="probe-label">{t("helloReply")}</span>
+          {value.reply}
+        </p>
+      )}
+      {!value.ok && (
+        <p className="probe-error">
+          {value.error ? (
+            <>
+              <span className="probe-label">{t("helloError")}</span>
+              {value.error}
+            </>
+          ) : (
+            t("helloNoDetail")
+          )}
+        </p>
+      )}
+      <dl className="probe-meta">
+        {value.model && (
+          <>
+            <dt>{t("helloModel")}</dt>
+            <dd>{value.model}</dd>
+          </>
+        )}
+        <dt>{t("helloDuration")}</dt>
+        <dd>{(value.durationMs / 1000).toFixed(1)} s</dd>
+        <dt>{t("checkedAt")}</dt>
+        <dd>{new Date(value.checkedAt).toLocaleString(locale)}</dd>
+      </dl>
+    </div>
+  );
+}
+
+function windowTitle(window: UsageWindow, t: (key: Key) => string): string {
+  if (window.kind === "model" && window.label)
+    return t("usageModelWeek").replace("{label}", window.label);
+  if (window.kind === "week") return t("usageWeek");
+  if (window.kind === "session" && window.windowMinutes)
+    return t("usageSession").replace(
+      "{n}",
+      String(Math.round((window.windowMinutes / 60) * 10) / 10),
+    );
+  return window.label ?? t("usageOther");
+}
+
+function ProviderUsageCard({
+  value,
+  locale,
+  t,
+}: {
+  value: ProviderUsage;
+  locale: Locale;
+  t: (key: Key) => string;
+}) {
+  return (
+    <div className="probe-card" role="status">
+      <div className="account-card-head">
+        <span className="account-card-title">{t("usageTitle")}</span>
+        <span className="toolbar">
+          {value.limitReached && (
+            <span className="badge">
+              <span className="dot err" />
+              {t("usageLimitReached")}
+            </span>
+          )}
+          {value.plan && (
+            <span className="badge subtle">
+              {t("usagePlan")}: {value.plan}
+            </span>
+          )}
+        </span>
+      </div>
+      {value.state === "no-limits" && (
+        <p className="account-empty-box">{t("usageNoLimits")}</p>
+      )}
+      {value.state === "unavailable" && (
+        <p className="account-empty-box">
+          {t(value.timedOut ? "usageTimedOut" : "usageUnavailable")}
+          {value.error && <span className="probe-detail">{value.error}</span>}
+        </p>
+      )}
+      {value.windows.length > 0 && (
+        <ul className="quota-list">
+          {value.windows.map((window, index) => {
+            const used = Math.round(window.usedPercent);
+            return (
+              <li key={index}>
+                <div className="quota-row">
+                  <span>{windowTitle(window, t)}</span>
+                  <span className="quota-value">
+                    {t("usageUsed").replace("{n}", String(used))}
+                  </span>
+                </div>
+                <div
+                  className="quota-meter"
+                  role="meter"
+                  aria-label={windowTitle(window, t)}
+                  aria-valuemin={0}
+                  aria-valuemax={100}
+                  aria-valuenow={used}
+                >
+                  <span
+                    data-level={used >= 90 ? "high" : used >= 70 ? "mid" : "low"}
+                    style={{ width: `${used}%` }}
+                  />
+                </div>
+                {window.resetsAt && (
+                  <span className="quota-reset">
+                    {t("usageResets").replace(
+                      "{time}",
+                      new Date(window.resetsAt).toLocaleString(locale),
+                    )}
+                  </span>
+                )}
+              </li>
+            );
+          })}
+        </ul>
+      )}
+      {(value.credits || value.extraUsage) && (
+        <dl className="probe-meta">
+          {value.credits && (
+            <>
+              <dt>{t("usageCredits")}</dt>
+              <dd>
+                {value.credits.unlimited
+                  ? t("usageCreditsUnlimited")
+                  : (value.credits.balance ?? "—")}
+              </dd>
+            </>
+          )}
+          {value.extraUsage && (
+            <>
+              <dt>{t("usageExtra")}</dt>
+              <dd>
+                {t(value.extraUsage.enabled ? "usageExtraOn" : "usageExtraOff")}
+                {value.extraUsage.usedPercent !== undefined &&
+                  ` · ${t("usageUsed").replace("{n}", String(Math.round(value.extraUsage.usedPercent)))}`}
+              </dd>
+            </>
+          )}
+        </dl>
+      )}
+      <p className="quota-reset">
+        {t("checkedAt")}: {new Date(value.checkedAt).toLocaleString(locale)}
+      </p>
+    </div>
   );
 }
 

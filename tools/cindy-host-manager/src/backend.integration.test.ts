@@ -2,7 +2,7 @@
  * 最小失败输入：匿名写入、跨源 WS、旧登录取消与新登录交错、一次 create 失败。
  * 可观察结果：认证/CSRF/所有权拒绝，秘密不回显，持久化与锁一致。tier: integration。
  * 单文件耗时见交付记录；不使用真实账号、外部网络或 Docker。 */
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import { mkdtempSync, readFileSync, rmSync, writeFileSync, symlinkSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -13,7 +13,7 @@ import { Store } from './store.js';
 import { Auth } from './auth.js';
 import { ManagerService } from './service.js';
 import { createManagerServer } from './server.js';
-import type { DockerRuntime, RuntimeInstance, RuntimeInspection, RuntimeLogin, RuntimeProxy } from './runtime-types.js';
+import type { DockerRuntime, ProbeKind, RuntimeInstance, RuntimeInspection, RuntimeLogin, RuntimeNetwork, RuntimeProxy } from './runtime-types.js';
 class FakeLogin implements RuntimeLogin {
     cancelled = false;
     inputData = '';
@@ -39,11 +39,25 @@ class FakeRuntime implements DockerRuntime {
         throw new Error('RAW_DOCKER_SECRET');
     } this.states.set(instance.id, 'stopped'); this.proxies.push(proxy); }
     async inspect(instance: RuntimeInstance): Promise<RuntimeInspection> { return { state: this.states.get(instance.id) ?? 'missing' }; }
-    async start(instance: RuntimeInstance, proxy?: RuntimeProxy | null) { this.states.set(instance.id, 'running'); this.proxies.push(proxy); }
+    async start(instance: RuntimeInstance, proxy?: RuntimeProxy | null) { this.states.set(instance.id, 'running'); this.proxies.push(proxy); this.targets.push(instance); }
     async stop(instance: RuntimeInstance) {if(this.failStop){this.failStop=false;throw Object.assign(new Error('raw error'),{code:'STOP_TIMEOUT'});} this.states.set(instance.id, 'stopped'); }
     async check(instance: RuntimeInstance) { return { ...await this.inspect(instance), authentication: { cindy: 'stored' as const, provider: 'authenticated' as const } }; }
     async share() { return { shares: { requests: [], members: [] }, usage: {} }; }
+    probes: { kind: ProbeKind; proxy?: RuntimeProxy | null }[] = [];
+    probeGate?: Promise<void>;
+    async probe(_instance: RuntimeInstance, kind: ProbeKind, proxy?: RuntimeProxy | null) {
+        this.probes.push({ kind, proxy }); await this.probeGate;
+        return kind === 'hello' ? { ok: true, reply: 'Hi there', durationMs: 5, checkedAt: '2026-01-01T00:00:00.000Z' }
+            : { state: 'ready' as const, plan: 'pro', windows: [{ kind: 'session' as const, usedPercent: 12 }], checkedAt: '2026-01-01T00:00:00.000Z' };
+    }
     async openLogin() { const login = new FakeLogin(); this.logins.push(login); return login; }
+    networks = new Map<string, RuntimeNetwork>();
+    targets: RuntimeInstance[] = [];
+    async allocateSubnet(used: string[]) { for (let i = 0; ; i++) if (!used.includes(`172.30.${i}.0/24`)) return `172.30.${i}.0/24`; }
+    async applyNetwork(network: RuntimeNetwork) { this.networks.set(network.id, network); }
+    async inspectNetwork(network: RuntimeNetwork) { return this.networks.has(network.id) ? 'running' as const : 'missing' as const; }
+    async removeNetwork(network: RuntimeNetwork) { this.networks.delete(network.id); }
+    async testNetwork() { return { ip: '198.51.100.9', country: 'Fixture', region: '', city: '' }; }
 }
 const cleanups: (() => Promise<void>)[] = [];
 afterEach(async () => { for (const cleanup of cleanups.splice(0).reverse())
@@ -102,7 +116,7 @@ describe('host manager production HTTP and login security', () => {
     it('encrypts proxy credentials, persists records and applies proxy overrides on next start', async () => {
         const f = await fixture(), h = await f.signIn(), id = await f.create(h);
         const proxy = { proxyUrl: 'http://proxy.test:8080', proxyUsername: 'invalid-user', proxyPassword: 'invalid-proxy-secret' };
-        expect((await f.call('PUT', '/api/settings', proxy, h)).body).toEqual({ image: 'test:local', proxyConfigured: true, proxyUrl: 'http://proxy.test:8080' });
+        expect((await f.call('PUT', '/api/settings', proxy, h)).body).toEqual({ image: 'test:local', proxyConfigured: true, proxyUrl: 'http://proxy.test:8080', gatewayImage: null });
         expect(readFileSync(join(f.directory, 'manager.sqlite')).includes(Buffer.from(proxy.proxyPassword))).toBe(false);
         for (const proxyUrl of ['http://user:secret@proxy.test:8080', 'https://proxy.test:8080'])
             expect((await f.call('PUT', '/api/settings', { proxyUrl }, h)).status).toBe(400);
@@ -329,6 +343,58 @@ describe('host manager production HTTP and login security', () => {
         const view=(await f.call('GET',`/api/instances/${id}`,undefined,h)).body.instance;
         expect(view.state).toBe('running');expect(view.error).toBeDefined();
         expect((await f.call('POST',`/api/instances/${id}/actions`,{action:'stop'},h)).body.instance.state).toBe('stopped');
+    });
+    // Provider test / quota buttons: the POST action is the production entry. Guards that results
+    // come back on the instance, the instance lock blocks concurrent start/stop, and the instance's
+    // proxy reaches the in-container probe (no proxy bypass).
+    it('runs provider hello and usage probes under the instance lock with its proxy', async () => {
+        const f = await fixture(), h = await f.signIn(), id = await f.create(h);
+        await f.call('PUT', '/api/settings', { proxyUrl: 'http://proxy.test:8080' }, h);
+        await f.call('PATCH', `/api/instances/${id}`, { proxyMode: 'default' }, h);
+        let release!: () => void; f.runtime.probeGate = new Promise(done => { release = done; });
+        const hello = f.call('POST', `/api/instances/${id}/actions`, { action: 'hello' }, h);
+        await vi.waitFor(() => expect(f.runtime.probes).toHaveLength(1));
+        expect((await f.call('POST', `/api/instances/${id}/actions`, { action: 'start' }, h)).body.error.code).toBe('INSTANCE_BUSY');
+        release();
+        expect((await hello).body.instance).toMatchObject({ id, state: 'stopped', providerTest: { ok: true, reply: 'Hi there' } });
+        expect((await f.call('POST', `/api/instances/${id}/actions`, { action: 'usage' }, h)).body.instance.providerUsage).toMatchObject({ state: 'ready', plan: 'pro' });
+        expect(f.runtime.probes.map(probe => [probe.kind, probe.proxy?.url])).toEqual([['hello', 'http://proxy.test:8080'], ['usage', 'http://proxy.test:8080']]);
+        f.runtime.states.delete(id);
+        expect((await f.call('POST', `/api/instances/${id}/actions`, { action: 'usage' }, h)).body.error.code).toBe('INSTANCE_MISSING');
+    });
+    // Forced-egress networks through the production HTTP API. Guards: upstream credentials are
+    // encrypted and never returned; instances on a network reach the runtime with that network
+    // (and no proxy variables of their own); a network in use cannot be deleted; switching
+    // networks requires a stopped instance.
+    it('manages shared networks and runs instances through their gateway', async () => {
+        const f = await fixture(), h = await f.signIn();
+        const created = await f.call('POST', '/api/networks', { name: 'HK exit', proxyUrl: 'http://proxy.test:7890', proxyUsername: 'net-user', proxyPassword: 'invalid-network-secret', directDomains: 'cindy.app, *.cindy.com.cn' }, h);
+        expect(created.status).toBe(201);
+        const network = created.body.network;
+        expect(network).toMatchObject({ name: 'HK exit', subnet: '172.30.0.0/24', gateway: '172.30.0.1', proxyUrl: 'http://proxy.test:7890', proxyAuthConfigured: true, directDomains: ['cindy.app', 'cindy.com.cn'], state: 'running', instances: [] });
+        expect(JSON.stringify((await f.call('GET', '/api/networks', undefined, h)).body)).not.toContain('invalid-network-secret');
+        expect(readFileSync(join(f.directory, 'manager.sqlite')).includes(Buffer.from('invalid-network-secret'))).toBe(false);
+        expect((await f.call('POST', '/api/networks', { name: 'Bad', proxyUrl: 'http://proxy.test:7890', directDomains: 'not a domain' }, h)).status).toBe(400);
+        expect((await f.call('POST', '/api/instances', { name: 'Nowhere', engine: 'codex', proxyMode: 'network', networkId: '00000000-0000-4000-8000-000000000000' }, h)).status).toBe(404);
+        const a = (await f.call('POST', '/api/instances', { name: 'A', engine: 'claude-code', proxyMode: 'network', networkId: network.id }, h)).body.instance;
+        const b = (await f.call('POST', '/api/instances', { name: 'B', engine: 'codex', proxyMode: 'network', networkId: network.id }, h)).body.instance;
+        expect(a).toMatchObject({ proxyMode: 'network', networkId: network.id, networkName: 'HK exit' });
+        await f.call('POST', `/api/instances/${a.id}/actions`, { action: 'start' }, h);
+        expect(f.runtime.proxies.at(-1)).toBeNull();
+        expect(f.runtime.targets.at(-1)?.network).toEqual({ id: network.id, subnet: '172.30.0.0/24', proxy: { url: 'http://proxy.test:7890', username: 'net-user', password: 'invalid-network-secret' }, directDomains: ['cindy.app', 'cindy.com.cn'] });
+        expect((await f.call('GET', '/api/networks', undefined, h)).body.networks[0].instances.map((item: { name: string }) => item.name)).toEqual(['A', 'B']);
+        expect((await f.call('DELETE', `/api/networks/${network.id}`, undefined, h)).body.error.code).toBe('NETWORK_IN_USE');
+        expect((await f.call('PATCH', `/api/instances/${a.id}`, { proxyMode: 'none' }, h)).body.error.code).toBe('STOP_REQUIRED');
+        // Editing the network keeps saved credentials when the address is unchanged.
+        await f.call('PATCH', `/api/networks/${network.id}`, { name: 'HK exit 2', proxyUrl: 'http://proxy.test:7890', directDomains: 'cindy.app' }, h);
+        expect(f.runtime.networks.get(network.id)).toMatchObject({ proxy: { password: 'invalid-network-secret' }, directDomains: ['cindy.app'] });
+        await f.call('POST', `/api/instances/${a.id}/actions`, { action: 'stop' }, h);
+        await f.call('PATCH', `/api/instances/${a.id}`, { proxyMode: 'none' }, h);
+        await f.call('PATCH', `/api/instances/${b.id}`, { proxyMode: 'none' }, h);
+        expect((await f.call('GET', `/api/instances/${a.id}`, undefined, h)).body.instance.networkId).toBeUndefined();
+        expect((await f.call('DELETE', `/api/networks/${network.id}`, undefined, h)).body).toEqual({ deleted: true });
+        expect(f.runtime.networks.size).toBe(0);
+        expect((await f.call('GET', '/api/networks', undefined, h)).body.networks).toEqual([]);
     });
     it('contains static paths and sets security headers', async () => {
         const f = await fixture(), html = await f.call('GET', '/');

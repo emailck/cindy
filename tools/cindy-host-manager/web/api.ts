@@ -9,7 +9,9 @@ export interface Instance {
   id: string;
   name: string;
   engine: "codex" | "claude-code";
-  proxyMode: "none" | "default" | "custom";
+  proxyMode: "none" | "default" | "custom" | "network";
+  networkId?: string;
+  networkName?: string;
   proxyUrl?: string;
   proxyAuthConfigured?: boolean;
   createdAt: string;
@@ -24,10 +26,54 @@ export interface Instance {
     provider: "authenticated" | "missing" | "unknown";
   };
 }
+/** Result of the in-container "hi" test. */
+export interface ProviderTest {
+  ok: boolean;
+  reply?: string;
+  error?: string;
+  model?: string;
+  timedOut?: boolean;
+  durationMs: number;
+  checkedAt: string;
+}
+export interface UsageWindow {
+  kind: "session" | "week" | "model" | "other";
+  label?: string;
+  usedPercent: number;
+  resetsAt?: string;
+  windowMinutes?: number;
+}
+/** Subscription plan and quota windows read by the in-container CLI. */
+export interface ProviderUsage {
+  state: "ready" | "no-limits" | "unavailable";
+  plan?: string;
+  windows: UsageWindow[];
+  limitReached?: boolean;
+  credits?: { hasCredits: boolean; unlimited: boolean; balance?: string };
+  extraUsage?: { enabled: boolean; usedPercent?: number };
+  error?: string;
+  timedOut?: boolean;
+  checkedAt: string;
+}
 export interface Settings {
   image: string;
   proxyConfigured: boolean;
   proxyUrl: string | null;
+  /** Gateway image for networks; null when networks are disabled on this computer. */
+  gatewayImage?: string | null;
+}
+/** Forced-egress network shared by instances; the gateway is its only way out. */
+export interface Network {
+  id: string;
+  name: string;
+  subnet: string;
+  gateway: string;
+  proxyUrl: string;
+  proxyAuthConfigured: boolean;
+  directDomains: string[];
+  createdAt: string;
+  state: "running" | "stopped" | "missing" | "busy" | "error";
+  instances: { id: string; name: string }[];
 }
 export class ApiError extends Error {
   constructor(

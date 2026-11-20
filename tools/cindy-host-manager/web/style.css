@@ -988,6 +988,156 @@ label {
   margin: 0;
 }
 
+/* ==================== Networks ==================== */
+.modal-panel.modal-panel-wide {
+  max-width: 640px;
+}
+
+.network-list {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  margin: 12px 0;
+}
+
+.network-card {
+  border: 1px solid var(--border-default);
+  border-radius: 12px;
+  padding: 14px 16px;
+  background: var(--surface);
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.network-card .network-meta {
+  margin-top: 0;
+}
+
+.network-actions {
+  margin-top: 12px;
+  flex-wrap: wrap;
+}
+
+.network-form {
+  margin-top: 12px;
+  padding-top: 4px;
+  border-top: 1px solid var(--border-default);
+}
+
+/* ==================== Account test & quota ==================== */
+.probe-card {
+  background: var(--surface-elevated);
+  border: 1px solid var(--border-default);
+  border-radius: 16px;
+  padding: 18px 20px;
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.probe-card .account-card-head .toolbar {
+  gap: 6px;
+}
+
+.probe-label {
+  display: block;
+  font-size: 12px;
+  color: var(--text-secondary);
+  margin-bottom: 2px;
+}
+
+.probe-reply,
+.probe-error {
+  margin: 0 0 10px;
+  font-size: 13px;
+  color: var(--text-primary);
+}
+
+.probe-error {
+  color: var(--error-fg);
+}
+
+.probe-detail {
+  display: block;
+  margin-top: 6px;
+  color: var(--text-tertiary);
+}
+
+.probe-meta {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  gap: 6px 16px;
+  margin: 10px 0 0;
+  padding-top: 10px;
+  border-top: 1px solid var(--border-default);
+  font-size: 12px;
+}
+
+.probe-meta dt {
+  color: var(--text-secondary);
+}
+
+.probe-meta dd {
+  margin: 0;
+  color: var(--text-primary);
+  font-weight: 500;
+}
+
+.quota-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.quota-row {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  font-size: 13px;
+  color: var(--text-primary);
+}
+
+.quota-value {
+  font-variant-numeric: tabular-nums;
+  color: var(--text-secondary);
+}
+
+.quota-meter {
+  height: 6px;
+  margin: 6px 0 4px;
+  border-radius: 9999px;
+  background: var(--surface-chip);
+  overflow: hidden;
+}
+
+.quota-meter > span {
+  display: block;
+  height: 100%;
+  border-radius: inherit;
+  background: var(--status-success);
+}
+
+.quota-meter > span[data-level="mid"] {
+  background: var(--warning-fg);
+}
+
+.quota-meter > span[data-level="high"] {
+  background: var(--error-fg);
+}
+
+.quota-reset {
+  display: block;
+  margin: 0;
+  font-size: 12px;
+  color: var(--text-secondary);
+}
+
+.probe-card > .quota-reset:last-child {
+  margin-top: 12px;
+}
+
 /* ==================== Provider Sharing & Usage ==================== */
 .empty-state-banner {
   padding: 24px;

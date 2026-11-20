@@ -108,9 +108,11 @@ async function main() {
     if (!loopback && (!process.env.CINDY_MANAGER_ORIGIN || publicUrl.protocol !== 'https:'))
         throw new StartupError('Public binding requires an explicit trusted HTTPS origin behind a TLS reverse proxy.');
     const image = process.env.CINDY_MANAGER_IMAGE ?? 'cindy-host:local';
+    // Forced-egress networks; build the image with scripts/build-gateway-image.sh. Empty disables networks.
+    const gatewayImage = process.env.CINDY_MANAGER_GATEWAY_IMAGE ?? 'cindy-egress-gateway:local';
     // Central mode never initializes a Docker adapter or exposes local instance routes.
     const service = mode === 'standalone'
-        ? new ManagerService(store, new DockerRuntimeAdapter({ image, socketPath: process.env.CINDY_MANAGER_DOCKER_SOCKET }), image)
+        ? new ManagerService(store, new DockerRuntimeAdapter({ image, gatewayImage, socketPath: process.env.CINDY_MANAGER_DOCKER_SOCKET }), image, undefined, gatewayImage || undefined)
         : undefined;
     const hub = mode === 'central' ? new FederationHub(store) : undefined;
     const connector = service ? new FederationConnector({ service, store }) : undefined;

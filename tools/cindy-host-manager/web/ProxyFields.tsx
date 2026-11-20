@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from "react";
-import { ApiError, type Api, type Instance } from "./api";
+import { ApiError, type Api, type Instance, type Network } from "./api";
 import { errorText, type Key } from "./i18n";
 
 export function proxyFormData(form: HTMLFormElement): Record<string, unknown> {
@@ -9,18 +9,22 @@ export function proxyFormData(form: HTMLFormElement): Record<string, unknown> {
   return data;
 }
 
-export function ProxyFields({ api, t, instance, defaultSettings = false, initialUrl = "", defaultProxyUrl = null, disabled = false }: {
+export function ProxyFields({ api, t, instance, defaultSettings = false, initialUrl = "", defaultProxyUrl = null, disabled = false, networks }: {
   api: Api; t: (key: Key) => string; instance?: Instance; defaultSettings?: boolean;
   initialUrl?: string; defaultProxyUrl?: string | null; disabled?: boolean;
+  /** Forced-egress networks; undefined hides the option (networks disabled or unsupported). */
+  networks?: Network[];
 }) {
   const root = useRef<HTMLDivElement>(null);
   const generation = useRef(0);
   const [mode, setMode] = useState(instance?.proxyMode ?? "none");
+  const [networkId, setNetworkId] = useState(instance?.networkId ?? networks?.[0]?.id ?? "");
+  const selectedNetwork = networks?.find(item => item.id === networkId) ?? networks?.[0];
   const [testing, setTesting] = useState(false);
   const [result, setResult] = useState("");
   const [error, setError] = useState("");
   useEffect(() => {
-    const reset = () => { generation.current++; setMode(instance?.proxyMode ?? "none"); setResult(""); setError(""); };
+    const reset = () => { generation.current++; setMode(instance?.proxyMode ?? "none"); setNetworkId(instance?.networkId ?? networks?.[0]?.id ?? ""); setResult(""); setError(""); };
     const form = root.current?.closest("form");
     form?.addEventListener("reset", reset);
     return () => { generation.current++; form?.removeEventListener("reset", reset); };
@@ -30,6 +34,18 @@ export function ProxyFields({ api, t, instance, defaultSettings = false, initial
     if (!form) return;
     if (!defaultSettings && mode === "default" && !defaultProxyUrl) {
       setResult(""); setError(t("proxyNotConfigured")); return;
+    }
+    if (!defaultSettings && mode === "network") {
+      if (!selectedNetwork) { setResult(""); setError(t("noNetworks")); return; }
+      const token = ++generation.current;
+      setTesting(true); setResult(""); setError("");
+      try {
+        const value = await api.request<{ ip: string; country: string; region: string; city: string }>(`/networks/${encodeURIComponent(selectedNetwork.id)}/test`, "POST", {});
+        if (token === generation.current) setResult(`${value.ip} · ${[value.country, value.region, value.city].filter(Boolean).join(" / ") || t("locationUnknown")}`);
+      } catch (error) {
+        if (token === generation.current) setError(errorText(error instanceof ApiError ? error.code : "PROXY_TEST_FAILED", t));
+      } finally { setTesting(false); }
+      return;
     }
     const data = proxyFormData(form);
     const body: Record<string, unknown> = { proxyMode: defaultSettings ? "default" : mode,
@@ -50,7 +66,16 @@ export function ProxyFields({ api, t, instance, defaultSettings = false, initial
       onChange={event => setMode(event.target.value as Instance["proxyMode"])}>
       <option value="none">{t("none")}</option><option value="default">{t("default")}</option>
       <option value="custom">{t("customProxy")}</option>
+      {(networks || mode === "network") && <option value="network">{t("networkMode")}</option>}
     </select></label>}
+    {!defaultSettings && mode === "network" && (networks?.length ? <>
+      <label>{t("networks")}<select name="networkId" value={selectedNetwork?.id ?? ""} disabled={disabled}
+        onChange={event => setNetworkId(event.target.value)}>
+        {networks.map(item => <option key={item.id} value={item.id}>{item.name}</option>)}
+      </select></label>
+      <p>{t("networkModeNote")}</p>
+      {selectedNetwork && <p>{t("networkProxyUrl")}: {selectedNetwork.proxyUrl}</p>}
+    </> : <p role="alert">{t("noNetworks")}</p>)}
     {!defaultSettings && mode === "default" && <p>{defaultProxyUrl
       ? `${t("proxyUrl")}: ${defaultProxyUrl}` : t("defaultProxyMissing")}</p>}
     {(defaultSettings || mode === "custom") && <>
@@ -62,8 +87,8 @@ export function ProxyFields({ api, t, instance, defaultSettings = false, initial
       <label className="checkbox-label"><input name="proxyClearAuth" type="checkbox" disabled={disabled} />{t("proxyClearAuth")}</label>
     </>}
     {(defaultSettings || mode !== "none") && <>
-      <button type="button" disabled={testing || disabled} onClick={() => void test()}>{t(testing ? "testingProxy" : "testProxy")}</button>
-      <p>{t("proxyTestNote")}</p>
+      <button type="button" disabled={testing || disabled} onClick={() => void test()}>{t(testing ? "testingProxy" : !defaultSettings && mode === "network" ? "networkTest" : "testProxy")}</button>
+      <p>{t(!defaultSettings && mode === "network" ? "networkTestNote" : "proxyTestNote")}</p>
       {testing && <p role="status">{t("proxyTestProgress")}</p>}
       {result && <p role="status">{t("proxyExit")}: {result}</p>}
       {error && <p role="alert">{error}</p>}

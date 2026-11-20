@@ -28,6 +28,11 @@ const runtimeErrors: Record<string, [
     INVALID_SHARE: [400, 'Invalid share member, pairing code or setting.'],
     INVALID_LOGIN: [400, 'Invalid native login options.'],
     NATIVE_DIRECTORY_UNAVAILABLE: [409, 'The native configuration directory is unavailable. Check its ownership and permissions. Saved files are retained.'],
+    GATEWAY_UNAVAILABLE: [409, 'Networks are not enabled on this computer. Set CINDY_MANAGER_GATEWAY_IMAGE.'],
+    GATEWAY_IMAGE_MISSING: [409, 'The network gateway image is missing. Build it with scripts/build-gateway-image.sh.'],
+    NETWORK_IN_USE: [409, 'Containers are still attached to this network.'],
+    INVALID_NETWORK: [400, 'Invalid network configuration.'],
+    NO_FREE_SUBNET: [409, 'No free network subnet is available.'],
     COMMAND_TIMEOUT: [504, 'The native command timed out.'],
     COMMAND_FAILED: [502, 'The native command failed. Check login and service availability.'],
     DOCKER_FAILED: [503, 'Docker is unavailable or the managed image could not run.'],
@@ -157,6 +162,21 @@ export function createManagerServer({ service, auth, origin, webDirectory, mode 
             if (path === '/api/settings' && method === 'PUT') {
                 json(res, 200, service.updateSettings(await body(req)));
                 return;
+            }
+            if (path === '/api/networks' && method === 'GET') {
+                json(res, 200, { networks: await service.listNetworks() });
+                return;
+            }
+            if (path === '/api/networks' && method === 'POST') {
+                json(res, 201, { network: await service.createNetwork(await body(req)) });
+                return;
+            }
+            const networkMatch = path.match(/^\/api\/networks\/([a-f0-9-]{36})(?:\/(test))?$/);
+            if (networkMatch) {
+                const id = networkMatch[1]!;
+                if (!networkMatch[2] && method === 'PATCH') { json(res, 200, { network: await service.updateNetwork(id, await body(req)) }); return; }
+                if (!networkMatch[2] && method === 'DELETE') { json(res, 200, await service.deleteNetwork(id)); return; }
+                if (networkMatch[2] === 'test' && method === 'POST') { json(res, 200, await service.testNetwork(id)); return; }
             }
             if (path === '/api/instances' && method === 'GET') {
                 json(res, 200, { instances: await service.list() });

@@ -7,6 +7,7 @@ import { EventEmitter } from 'node:events';
 import { runInNewContext } from 'node:vm';
 import path from 'node:path';
 import { CODEX_ACCOUNT_PROBE } from './account-identity.js';
+import { helloProbe, usageProbe, helloResult, claudeUsageResult, codexUsageResult, PROBE_DEADLINE_MS } from './native-probes.js';
 import type Docker from 'dockerode';
 import { DockerRuntimeAdapter, runtimeEnvironment } from './docker-runtime.js';
 import type { RuntimeInstance } from './runtime-types.js';
@@ -19,14 +20,32 @@ class FakeDocker {
   getVolume(name: string) { return { inspect: async () => { if (!this.volumes.has(name)) throw { statusCode: 404 }; return this.volumes.get(name)!; } }; }
   async createVolume(options: {Name: string; Labels: Record<string,string>}) { this.volumes.set(options.Name, options); }
   getContainer(name: string) { return this.containers.get(name) ?? { inspect: async () => { throw { statusCode: 404 }; } }; }
-  async listContainers(options: {filters: string}) { const filters = JSON.parse(options.filters).label as string[]; return [...this.containers.values()].filter(c=>filters.every(filter=>{const [key,value]=filter.split('=');return c.options.Labels?.[key!]===value;})).map(c => ({ Id: c.options.name, Labels: c.options.Labels, State: c.running ? 'running' : 'exited' })); }
+  async listContainers(options: {filters: string}) { const parsed = JSON.parse(options.filters); const filters = (parsed.label ?? []) as string[]; const network = parsed.network?.[0] as string | undefined;
+    return [...this.containers.values()].filter(c=>filters.every(filter=>{const [key,value]=filter.split('=');return c.options.Labels?.[key!]===value;}))
+      .filter(c=>!network||c.options.HostConfig?.NetworkMode===network||this.networks.get(network)?.connected.includes(c.options.name!))
+      .map(c => ({ Id: c.options.name, Names: [`/${c.options.name}`], Labels: c.options.Labels, State: c.running ? 'running' : 'exited' })); }
+  images = new Set(['cindy-egress-gateway:test']);
+  networks = new Map<string, { Name: string; IPAM: { Config: { Subnet: string; Gateway: string }[] }; Options: Record<string,string>; Labels: Record<string,string>; connected: string[]; ips: Record<string,string> }>([
+    ['bridge', { Name: 'bridge', IPAM: { Config: [{ Subnet: '172.17.0.0/16', Gateway: '172.17.0.1' }] }, Options: {}, Labels: {}, connected: [], ips: {} }]]);
+  getImage(name: string) { return { inspect: async () => { if (!this.images.has(name)) throw { statusCode: 404 }; return {}; } }; }
+  async listNetworks() { return [...this.networks.values()]; }
+  async createNetwork(options: { Name: string; IPAM: { Config: { Subnet: string; Gateway: string }[] }; Options: Record<string,string>; Labels: Record<string,string> }) { this.networks.set(options.Name, { ...options, connected: [], ips: {} }); }
+  getNetwork(name: string) { return {
+    inspect: async () => { const network = this.networks.get(name); if (!network) throw { statusCode: 404 }; return network; },
+    connect: async (options: { Container: string; EndpointConfig: { IPAMConfig: { IPv4Address: string } } }) => { const network = this.networks.get(name)!; network.connected.push(options.Container); network.ips[options.Container] = options.EndpointConfig.IPAMConfig.IPv4Address; },
+    disconnect: async (options: { Container: string }) => { const container = this.containers.get(options.Container); if (container?.options.HostConfig?.NetworkMode === name) container.options.HostConfig.NetworkMode = 'none'; this.disconnected.push(options.Container); },
+    remove: async () => { this.networks.delete(name); } }; }
+  disconnected: string[] = [];
   async createContainer(options: Docker.ContainerCreateOptions) { this.created.push(options); const c = new FakeContainer(this, options); this.containers.set(options.name!, c); return c; }
+  removed: string[] = [];
 }
 class FakeContainer {
   running = false; stream = new PassThrough(); code = 0; resolveWait!: (value: {StatusCode: number}) => void;
   completion = new Promise<{StatusCode: number}>(resolve => { this.resolveWait = resolve; });
   constructor(readonly docker: FakeDocker, readonly options: Docker.ContainerCreateOptions) {}
-  async inspect() { return { Config: this.options, HostConfig: this.options.HostConfig, State: { Running: this.running, ExitCode: this.code }, Mounts: this.options.HostConfig!.Mounts!.map(m => ({ Type: m.Type, Name: m.Source, Destination: m.Target })) }; }
+  get id() { return this.options.name!; }
+  async stop() { this.finish(); }
+  async inspect() { return { Config: this.options, HostConfig: this.options.HostConfig, State: { Running: this.running, ExitCode: this.code }, Mounts: (this.options.HostConfig!.Mounts ?? []).map(m => ({ Type: m.Type, Name: m.Source, Destination: m.Target })) }; }
   async attach() { if (this.docker.attachFails) throw new Error('secret daemon response'); return this.stream; }
   finish(code = 0, output = '') { this.code = code; this.running = false; this.stream.end(output); this.resolveWait({StatusCode: code}); }
   async start() {
@@ -34,8 +53,8 @@ class FakeContainer {
     const argv = [...this.options.Entrypoint as string[], ...this.options.Cmd as string[]];
     if (this.options.Labels?.['io.cindy.host-manager.role'] === 'native-setup' && this.docker.nativeInitFails) { queueMicrotask(()=>this.finish(1)); return; }
     if (this.options.Labels?.['io.cindy.host-manager.role'] === 'proxy-test') { queueMicrotask(()=>this.finish(this.docker.proxyProbeCode,this.docker.proxyProbeOutput)); return; }
-    if (argv.includes('serve') || argv.includes('--device-auth') || argv.includes('--claudeai') || argv.includes('--social')) return;
-    if (argv[0] === 'node' && this.options.Labels?.['io.cindy.host-manager.role'] === 'check') { queueMicrotask(()=>this.finish(0,this.docker.accountProbeOutput)); return; }
+    if (argv.includes('serve') || argv.includes('--device-auth') || argv.includes('--claudeai') || argv.includes('--social') || argv[0] === '/bin/busybox') return;
+    if (argv[0] === 'node' && ['check', 'hello', 'usage'].includes(this.options.Labels?.['io.cindy.host-manager.role'] ?? '')) { queueMicrotask(()=>this.finish(0,this.docker.accountProbeOutput)); return; }
     if (argv.includes('status')) queueMicrotask(() => {
       const refresh=argv.includes('--refresh-account');
       if(refresh&&(this.docker.refreshStoredRuntime||this.docker.refreshCode===0)) this.docker.statusRuntime=this.docker.refreshStoredRuntime??this.docker.refreshedRuntime??this.docker.statusRuntime;
@@ -46,7 +65,7 @@ class FakeContainer {
   }
   async wait() { return this.completion; }
   async kill(options: {signal: string}) { this.docker.killed.push(options.signal); if (!this.docker.sticky) this.finish(); }
-  async remove() { if (this.running) throw new Error('cannot remove running'); this.docker.containers.delete(this.options.name!); }
+  async remove() { if (this.running) throw new Error('cannot remove running'); this.docker.containers.delete(this.options.name!); this.docker.removed.push(this.options.name!); }
   async resize() { throw { statusCode: 404 }; }
   async exec(options: {Cmd: string[]}) {
     this.docker.nativeExecCommands.push(options.Cmd);
@@ -287,6 +306,140 @@ describe('managed Docker runtime', () => {
     expect(output.endsWith('\n')).toBe(true);
     expect(output).not.toContain('never-return-secret');expect(output).not.toContain('internal');
     expect(signals).toEqual(['SIGTERM','SIGKILL']);
+  });
+  // Unit: account test / quota buttons. The probe must run *inside* the instance (exec in the
+  // running service, or a one-shot container on the same volumes when stopped), never while a
+  // login owns the profile, and always clean up its temporary container.
+  it('runs provider probes in the running service or a disposable same-volume container', async () => {
+    const {docker,runtime}=fixture();const claude={...instance,engine:'claude-code' as const};
+    await expect(runtime.probe(claude,'hello')).rejects.toMatchObject({code:'INSTANCE_MISSING'});
+    await runtime.create(claude);
+    docker.accountProbeOutput=JSON.stringify({plan:'max',rateLimits:{five_hour:{utilization:20}}});
+    expect(await runtime.probe(claude,'usage')).toMatchObject({state:'ready',plan:'max',windows:[{kind:'session',usedPercent:20}]});
+    const oneShot=docker.created.at(-1)!;
+    expect(oneShot.Labels?.['io.cindy.host-manager.role']).toBe('usage');
+    expect(oneShot.Entrypoint).toEqual(['node']);
+    expect(oneShot.HostConfig?.Mounts?.map(mount=>mount.Source)).toEqual([`cindy-managed-${claude.id}-profile`,`cindy-managed-${claude.id}-native`]);
+    expect([...docker.containers.keys()]).toEqual([`cindy-managed-${claude.id}`]);
+    await runtime.start(claude);const created=docker.created.length;
+    docker.accountProbeOutput=JSON.stringify({ok:true,reply:'Hi!'});
+    expect(await runtime.probe(claude,'hello')).toMatchObject({ok:true,reply:'Hi!'});
+    expect(docker.created.length).toBe(created);
+    expect(docker.nativeExecCommands.at(-1)?.slice(0,2)).toEqual(['node','-e']);
+    await runtime.stop(claude);await runtime.openLogin(claude,{target:'provider'});
+    await expect(runtime.probe(claude,'usage')).rejects.toMatchObject({code:'INSTANCE_RUNNING'});
+  });
+  // Execute the production in-container probes against an in-memory child process. Proves the
+  // native argv/stdin, JSONL framing, deadline handling and the manager's allowlisted projection
+  // (no raw native fields such as tokens cross). Unit tier: no real CLI, network or timers.
+  it.each([
+    {name:'claude hello ok',engine:'claude-code' as const,kind:'hello' as const,
+      rows:[{type:'result',subtype:'success',is_error:false,result:'Hi! How can I help?',modelUsage:{'claude-sonnet-5-5':{}},session_id:'never-return-secret'}],
+      expected:{ok:true,reply:'Hi! How can I help?',model:'claude-sonnet-5-5'}},
+    {name:'claude hello not logged in',engine:'claude-code' as const,kind:'hello' as const,
+      rows:[{type:'result',subtype:'success',is_error:true,result:'Not logged in · Please run /login',modelUsage:{}}],
+      expected:{ok:false,error:'Not logged in · Please run /login'}},
+    {name:'claude hello deadline',engine:'claude-code' as const,kind:'hello' as const,rows:[],deadline:true,
+      expected:{ok:false,timedOut:true}},
+    {name:'codex hello ok',engine:'codex' as const,kind:'hello' as const,
+      rows:[{type:'thread.started',thread_id:'never-return-secret'},{type:'error',message:'Reconnecting... 1/5'},{type:'item.completed',item:{type:'agent_message',text:'Hello!\u001b[31m'}},{type:'turn.completed',usage:{}}],
+      expected:{ok:true,reply:'Hello!'}},
+    {name:'codex hello failed',engine:'codex' as const,kind:'hello' as const,
+      rows:[{type:'error',message:'Reconnecting... 5/5'},{type:'turn.failed',error:{message:'unexpected status 401 Unauthorized'}}],
+      expected:{ok:false,error:'unexpected status 401 Unauthorized'}},
+    {name:'claude usage',engine:'claude-code' as const,kind:'usage' as const,
+      rows:[{type:'control_response',response:{request_id:'cindy-usage',subtype:'success',response:{subscription_type:'max',access_token:'never-return-secret',rate_limits:{
+        limits:[{kind:'session',percent:25,resets_at:'2030-01-01T05:00:00Z'},{kind:'weekly_all',percent:40.4},{kind:'weekly_scoped',percent:150,scope:{model:{display_name:'Opus',id:'internal'}}}],
+        extra_usage:{is_enabled:true,utilization:3,used_credits:120}}}}}],
+      expected:{state:'ready',plan:'max',windows:[{kind:'session',usedPercent:25,resetsAt:'2030-01-01T05:00:00.000Z',windowMinutes:300},{kind:'week',usedPercent:40.4,windowMinutes:10080},{kind:'model',label:'Opus',usedPercent:100,windowMinutes:10080}],extraUsage:{enabled:true,usedPercent:3}}},
+    {name:'claude usage without plan limits',engine:'claude-code' as const,kind:'usage' as const,
+      rows:[{type:'control_response',response:{request_id:'cindy-usage',subtype:'success',response:{rate_limits_available:false}}}],
+      expected:{state:'no-limits',windows:[]}},
+    {name:'codex usage',engine:'codex' as const,kind:'usage' as const,
+      rows:[{id:1,result:{}},{id:2,result:{rateLimits:{limitId:'codex',planType:'plus',primary:{usedPercent:30,windowDurationMins:300,resetsAt:1893474000},secondary:{usedPercent:60,windowDurationMins:10080},credits:{hasCredits:true,unlimited:false,balance:'12'}},
+        rateLimitsByLimitId:{codex:{limitId:'codex',primary:{usedPercent:30}},'gpt-x':{limitName:'GPT-X',primary:{usedPercent:100,windowDurationMins:10080},rateLimitReachedType:'primary'}},rateLimitResetCredits:{availableCount:1,credits:[{id:'never-return-secret'}]}}}],
+      expected:{state:'ready',plan:'plus',windows:[{kind:'session',usedPercent:30,windowMinutes:300,resetsAt:'2030-01-01T05:00:00.000Z'},{kind:'week',usedPercent:60,windowMinutes:10080},{kind:'model',label:'GPT-X',usedPercent:100,windowMinutes:10080}],credits:{hasCredits:true,unlimited:false,balance:'12'},limitReached:true}},
+    {name:'codex usage api error',engine:'codex' as const,kind:'usage' as const,
+      rows:[{id:1,result:{}},{id:2,error:{message:'codex account authentication required'}}],
+      expected:{state:'unavailable',windows:[],error:'codex account authentication required'}},
+  ])('runs the in-container $name probe and projects only safe fields', ({engine,kind,rows,expected,deadline}) => {
+    const child=new EventEmitter() as EventEmitter & {stdout:EventEmitter&{setEncoding():void};stdin:EventEmitter&{write(data:string):void;end(data?:string):void};pid:number};
+    child.stdout=Object.assign(new EventEmitter(),{setEncoding(){}});
+    const sent:string[]=[];child.stdin=Object.assign(new EventEmitter(),{write(data:string){sent.push(data);},end(data?:string){if(data)sent.push(data);}});child.pid=123;
+    let output='';let argv:string[]=[];const scheduled=new Map<number,{callback:()=>void;delay:number}>();let timerId=0;
+    runInNewContext(kind==='hello'?helloProbe(engine):usageProbe(engine),{Buffer,require(name:string){
+      if(name==='node:child_process')return {spawn:(_binary:string,args:string[])=>{argv=args;return child;}};
+      if(name==='node:fs')return {mkdtempSync:()=>'/synthetic-private-probe',writeFileSync(){},rmSync(){}};
+      if(name==='node:os')return {tmpdir:()=>'/synthetic'};
+      if(name==='node:path')return path;
+      throw new Error('Unexpected dependency');
+    },process:{env:{},once(){},exit(){},kill(){},stdout:{write(data:string,done?:()=>void){output+=data;done?.();}}},setTimeout(callback:()=>void,delay:number){scheduled.set(++timerId,{callback,delay});return timerId;},clearTimeout(id:number){scheduled.delete(id);}});
+    if(kind==='hello'&&engine==='claude-code'){expect(argv).toContain('--no-session-persistence');expect(sent).toEqual(['hi']);}
+    if(kind==='hello'&&engine==='codex')expect(argv).toEqual(['exec','--ephemeral','--skip-git-repo-check','--json','-s','read-only','--','hi']);
+    if(kind==='usage'&&engine==='claude-code')expect(sent.map(line=>JSON.parse(line).request.subtype)).toEqual(['initialize','get_usage']);
+    for(const row of rows)child.stdout.emit('data',JSON.stringify(row)+'\n');
+    if(kind==='usage'&&engine==='codex')expect(sent.map(line=>JSON.parse(line).method)).toEqual(['initialize','initialized','account/rateLimits/read']);
+    if(deadline)[...scheduled.values()].find(timer=>timer.delay===PROBE_DEADLINE_MS)!.callback();
+    else child.emit('close',0);
+    for(const timer of [...scheduled.values()])if(timer.delay===500)timer.callback();
+    expect(output.endsWith('\n')).toBe(true);
+    const now=new Date('2026-01-01T00:00:00Z');
+    const result=kind==='hello'?helloResult(output,1200,now):engine==='codex'?codexUsageResult(output,now):claudeUsageResult(output,now);
+    expect(result).toEqual({...expected,...(kind==='hello'?{durationMs:1200}:{}),checkedAt:now.toISOString()});
+    expect(JSON.stringify(result)).not.toMatch(/never-return-secret|internal/);
+  });
+  // Unit: forced-egress network. The gateway must be owned, unprivileged except NET_ADMIN/
+  // NET_BIND_SERVICE, carry upstream credentials only in its private command (not labels), be
+  // reused while the config is unchanged and replaced when it changes. Every instance container
+  // must join only that network and use the gateway as DNS and proxy. A network with attached
+  // containers is never removed.
+  it('routes network instances only through an owned, hardened gateway', async () => {
+    const docker = new FakeDocker();
+    const runtime = new DockerRuntimeAdapter({ image: 'cindy-host:test', gatewayImage: 'cindy-egress-gateway:test', docker: docker as unknown as Docker, stopTimeoutMs: 0 });
+    expect(await runtime.allocateSubnet(['172.30.0.0/24'])).toBe('172.30.1.0/24');
+    const network = { id: '42345678-1234-4234-8234-123456789abc', subnet: await runtime.allocateSubnet([]), proxy: { url: 'http://172.17.0.1:7890', username: 'gw-user', password: 'invalid-gateway-secret' }, directDomains: ['cindy.app'] };
+    expect(network.subnet).toBe('172.30.0.0/24');
+    await runtime.applyNetwork(network);
+    const bridge = docker.networks.get(`cindy-net-${network.id}`)!;
+    expect(bridge.Options['com.docker.network.bridge.inhibit_ipv4']).toBe('true');
+    expect(bridge.IPAM.Config[0]).toEqual({ Subnet: '172.30.0.0/24', Gateway: '172.30.0.1' });
+    const gateway = docker.created.find(options => options.Labels?.['io.cindy.host-manager.role'] === 'gateway')!;
+    expect(gateway.HostConfig).toMatchObject({ NetworkMode: 'bridge', CapDrop: ['ALL'], CapAdd: ['NET_ADMIN', 'NET_BIND_SERVICE'], ReadonlyRootfs: true, RestartPolicy: { Name: 'unless-stopped' } });
+    expect(gateway.HostConfig?.Privileged).toBeUndefined();
+    expect(bridge.ips[gateway.name!]).toBe('172.30.0.2');
+    const config = JSON.parse(Buffer.from((gateway.Cmd as string[])[4]!, 'base64').toString());
+    expect(config.rules).toEqual(['DOMAIN-SUFFIX,cindy.app,DIRECT', 'NETWORK,UDP,REJECT', 'MATCH,upstream']);
+    expect(config.proxies).toEqual([{ name: 'upstream', type: 'http', server: '172.17.0.1', port: 7890, username: 'gw-user', password: 'invalid-gateway-secret' }]);
+    expect(config.dns.listen).toBe('172.30.0.1:53');
+    expect(JSON.stringify(gateway.Labels)).not.toContain('invalid-gateway-secret');
+    const count = docker.created.length;
+    await runtime.applyNetwork(network);
+    expect(docker.created.length).toBe(count);
+    await runtime.applyNetwork({ ...network, directDomains: ['cindy.app', 'example.org'] });
+    expect(docker.created.length).toBe(count + 1);
+    expect(docker.removed).toContain(`cindy-gateway-${network.id}`);
+    expect(await runtime.inspectNetwork(network)).toBe('running');
+    const member = { ...instance, engine: 'claude-code' as const, network };
+    await runtime.create(member);
+    const own = docker.created.filter(options => options.Labels?.['io.cindy.host-manager.instance'] === member.id);
+    expect(own.length).toBeGreaterThan(1);
+    for (const options of own) {
+      expect(options.HostConfig).toMatchObject({ NetworkMode: `cindy-net-${network.id}`, Dns: ['172.30.0.1'] });
+      expect(options.Env).toContain('HTTPS_PROXY=http://172.30.0.1:7890/');
+      expect(options.Env?.join('\n')).not.toContain('invalid-gateway-secret');
+    }
+    await runtime.start(member);
+    await expect(runtime.removeNetwork(network)).rejects.toMatchObject({ code: 'NETWORK_IN_USE' });
+    expect(docker.networks.has(`cindy-net-${network.id}`)).toBe(true);
+    docker.images.clear();
+    await expect(runtime.applyNetwork({ ...network, directDomains: [] })).rejects.toMatchObject({ code: 'GATEWAY_IMAGE_MISSING' });
+    // Real Docker smoke: an instance moved off the network keeps a stale reference in its
+    // stopped container; deletion must detach it instead of failing with NETWORK_IN_USE.
+    await runtime.stop(member);
+    await runtime.removeNetwork(network);
+    expect(docker.disconnected).toEqual([`cindy-managed-${member.id}`]);
+    expect(docker.networks.has(`cindy-net-${network.id}`)).toBe(false);
+    expect(docker.containers.has(`cindy-gateway-${network.id}`)).toBe(false);
   });
   it('cleans up failed login attach and rejects unsupported proxies before contacting Docker', async () => {
     const {docker,runtime}=fixture(); await runtime.create(instance); docker.attachFails=true;

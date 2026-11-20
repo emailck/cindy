@@ -4,7 +4,9 @@ import { PassThrough } from 'node:stream';
 import { isIP } from 'node:net';
 import { PROXY_PROBE } from './proxy-probe.js';
 import { sanitizeAccount, CODEX_ACCOUNT_PROBE } from './account-identity.js';
-import type { AccountIdentity, DockerRuntime, RuntimeInstance, RuntimeProxy, RuntimeInspection, RuntimeLogin, LoginRequest, ShareRequest } from './runtime-types.js';
+import { helloProbe, usageProbe, helloResult, claudeUsageResult, codexUsageResult } from './native-probes.js';
+import { gatewayAddress, gatewayCommand, gatewayContainerAddress, gatewayFingerprint, gatewayProxyUrl, normalizeDirectDomains, subnetFor, subnetIndex } from './egress-gateway.js';
+import type { AccountIdentity, DockerRuntime, NetworkState, ProbeKind, ProviderTest, ProviderUsage, RuntimeInstance, RuntimeNetwork, RuntimeProxy, RuntimeInspection, RuntimeLogin, LoginRequest, ShareRequest } from './runtime-types.js';
 
 const OWNER = 'io.cindy.host-manager';
 const CODEX = '/opt/cindy-host/codex/bin/codex';
@@ -26,6 +28,31 @@ function assertLabels(actual: Record<string, string> | null | undefined, instanc
   }
 }
 function absent(error: unknown) { return (error as { statusCode?: number })?.statusCode === 404; }
+const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+const networkName = (network: RuntimeNetwork) => `cindy-net-${network.id}`;
+const gatewayName = (network: RuntimeNetwork) => `cindy-gateway-${network.id}`;
+function networkLabels(network: RuntimeNetwork, role: 'network' | 'gateway' | 'proxy-test') {
+  return { [OWNER]: '1', [`${OWNER}.network`]: network.id, [`${OWNER}.role`]: role };
+}
+function assertNetworkLabels(actual: Record<string, string> | null | undefined, network: RuntimeNetwork, role: 'network' | 'gateway') {
+  for (const [key, value] of Object.entries(networkLabels(network, role)))
+    if (actual?.[key] !== value) throw new RuntimeError('RESOURCE_NOT_OWNED', 'Resource ownership does not match this network.');
+}
+function validNetwork(network: RuntimeNetwork) {
+  let url: URL | undefined;
+  try { url = new URL(network.proxy.url); } catch { /* invalid below */ }
+  if (!UUID.test(network.id) || subnetIndex(network.subnet) === null || url?.protocol !== 'http:' || !url.hostname
+    || normalizeDirectDomains(network.directDomains)?.length !== network.directDomains.length) throw new RuntimeError('INVALID_NETWORK', 'Invalid network configuration.');
+}
+function ipv4Range(cidr: string): [number, number] | null {
+  const [address, bits] = cidr.split('/'); const parts = address?.split('.').map(Number);
+  const length = Number(bits);
+  if (!parts || parts.length !== 4 || parts.some(part => !Number.isInteger(part) || part < 0 || part > 255) || !Number.isInteger(length) || length < 0 || length > 32) return null;
+  const start = (((parts[0]! << 24) >>> 0) + (parts[1]! << 16) + (parts[2]! << 8) + parts[3]!) >>> 0;
+  const size = 2 ** (32 - length);
+  const base = start - (start % size);
+  return [base, base + size - 1];
+}
 export function runtimeEnvironment(instance: RuntimeInstance, proxy?: RuntimeProxy | null): string[] {
   identity(instance);
   const values: Record<string, string> = { HOME: NATIVE, CODEX_HOME: `${NATIVE}/.codex`, CINDY_HOST_DATA_DIR: PROFILE,
@@ -49,22 +76,28 @@ export class DockerRuntimeAdapter implements DockerRuntime {
   private readonly docker: Docker;
   private readonly image: string;
   private readonly stopTimeoutMs: number;
-  constructor(options: { image: string; socketPath?: string; docker?: Docker; stopTimeoutMs?: number }) {
-    if (!options.image || options.image.startsWith('-')) throw new RuntimeError('INVALID_IMAGE');
+  private readonly gatewayImage?: string;
+  private readonly networkQueue = new Map<string, Promise<unknown>>();
+  constructor(options: { image: string; gatewayImage?: string; socketPath?: string; docker?: Docker; stopTimeoutMs?: number }) {
+    if (!options.image || options.image.startsWith('-') || options.gatewayImage?.startsWith('-')) throw new RuntimeError('INVALID_IMAGE');
     this.image = options.image;
+    this.gatewayImage = options.gatewayImage || undefined;
     this.docker = options.docker ?? new Docker({ socketPath: options.socketPath ?? '/var/run/docker.sock' });
     this.stopTimeoutMs = options.stopTimeoutMs ?? 30_000;
   }
   async testProxy(proxy: RuntimeProxy) {
     const env = runtimeEnvironment({ id: randomUUID(), engine: 'claude-code' }, proxy)
       .filter(value => /^(HTTPS_PROXY|https_proxy)=/.test(value));
+    return this.probeExit({
+      name: `cindy-proxy-test-${randomUUID()}`, Image: this.image, User: '1000:1000',
+      Entrypoint: ['node'], Cmd: ['-e', PROXY_PROBE], Env: env,
+      Labels: { [OWNER]: '1', [`${OWNER}.role`]: 'proxy-test' },
+      HostConfig: { NetworkMode: 'bridge', Mounts: [], LogConfig: { Type: 'none', Config: {} } },
+    });
+  }
+  private async probeExit(options: Docker.ContainerCreateOptions) {
     try {
-      const result = await this.oneShot({
-        name: `cindy-proxy-test-${randomUUID()}`, Image: this.image, User: '1000:1000',
-        Entrypoint: ['node'], Cmd: ['-e', PROXY_PROBE], Env: env,
-        Labels: { [OWNER]: '1', [`${OWNER}.role`]: 'proxy-test' },
-        HostConfig: { NetworkMode: 'bridge', Mounts: [], LogConfig: { Type: 'none', Config: {} } },
-      }, true);
+      const result = await this.oneShot(options, true);
       if (result.code !== 0) throw new Error();
       const value = JSON.parse(result.output);
       if (typeof value.ip !== 'string' || !isIP(value.ip)) throw new Error();
@@ -74,6 +107,128 @@ export class DockerRuntimeAdapter implements DockerRuntime {
     } catch {
       throw new RuntimeError('PROXY_TEST_FAILED', 'Proxy test failed. Check the address, authentication and connectivity.');
     }
+  }
+  /** Network operations for one network never interleave (two instances may start at once). */
+  private serialize<T>(id: string, action: () => Promise<T>): Promise<T> {
+    const previous = this.networkQueue.get(id) ?? Promise.resolve();
+    const next = previous.catch(() => {}).then(action);
+    const settled = next.catch(() => {});
+    this.networkQueue.set(id, settled);
+    void settled.then(() => { if (this.networkQueue.get(id) === settled) this.networkQueue.delete(id); });
+    return next;
+  }
+  private async egress(instance: RuntimeInstance) {
+    if (instance.network) await this.ensureNetwork(instance.network);
+  }
+  async allocateSubnet(used: string[]): Promise<string> {
+    return this.safe(async () => {
+      const taken = (await this.docker.listNetworks()).flatMap(item => (item.IPAM?.Config ?? []).map(config => config.Subnet ?? ''))
+        .concat(used).map(ipv4Range).filter((range): range is [number, number] => !!range);
+      for (let index = 0; index <= 255; index++) {
+        const [start, end] = ipv4Range(subnetFor(index))!;
+        if (!taken.some(([from, to]) => start <= to && from <= end)) return subnetFor(index);
+      }
+      throw new RuntimeError('NO_FREE_SUBNET', 'No free 172.30.N.0/24 subnet is available.');
+    });
+  }
+  async applyNetwork(network: RuntimeNetwork): Promise<void> {
+    return this.safe(() => this.ensureNetwork(network));
+  }
+  private ensureNetwork(network: RuntimeNetwork): Promise<void> {
+    validNetwork(network);
+    return this.serialize(network.id, async () => {
+      const image = this.gatewayImage;
+      if (!image) throw new RuntimeError('GATEWAY_UNAVAILABLE', 'Set CINDY_MANAGER_GATEWAY_IMAGE to use networks.');
+      let imageId: string;
+      try { imageId = String((await this.docker.getImage(image).inspect()).Id ?? ''); }
+      catch (error) { if (absent(error)) throw new RuntimeError('GATEWAY_IMAGE_MISSING', 'Build the gateway image first (scripts/build-gateway-image.sh).'); throw error; }
+      const dockerNetwork = this.docker.getNetwork(networkName(network));
+      let info: Docker.NetworkInspectInfo;
+      try { info = await dockerNetwork.inspect(); }
+      catch (error) {
+        if (!absent(error)) throw error;
+        await this.docker.createNetwork({ Name: networkName(network), Driver: 'bridge', CheckDuplicate: true, EnableIPv6: false,
+          IPAM: { Driver: 'default', Config: [{ Subnet: network.subnet, Gateway: gatewayAddress(network.subnet) }] },
+          // The host takes no address on this bridge: instances can only route through the gateway.
+          Options: { 'com.docker.network.bridge.inhibit_ipv4': 'true', 'com.docker.network.bridge.name': `cnet-${network.id.slice(0, 8)}` },
+          Labels: networkLabels(network, 'network') });
+        info = await dockerNetwork.inspect();
+      }
+      assertNetworkLabels(info.Labels, network, 'network');
+      if (info.IPAM?.Config?.[0]?.Subnet !== network.subnet || info.Options?.['com.docker.network.bridge.inhibit_ipv4'] !== 'true')
+        throw new RuntimeError('RESOURCE_NOT_OWNED', 'Docker network does not match this network.');
+      const bridgeGateway = (await this.docker.getNetwork('bridge').inspect()).IPAM?.Config?.[0]?.Gateway;
+      if (!bridgeGateway) throw new RuntimeError('DOCKER_FAILED');
+      const command = gatewayCommand(network, bridgeGateway);
+      // The image ID is part of the fingerprint: rebuilding the image (mihomo upgrade) replaces the gateway on next apply.
+      const fingerprint = gatewayFingerprint(`${image}@${imageId}`, command);
+      const container = this.docker.getContainer(gatewayName(network));
+      let current: Docker.ContainerInspectInfo | undefined;
+      try { current = await container.inspect(); } catch (error) { if (!absent(error)) throw error; }
+      if (current) {
+        assertNetworkLabels(current.Config.Labels, network, 'gateway');
+        if (current.Config.Labels?.[`${OWNER}.config`] === fingerprint && current.Config.Image === image && !current.HostConfig.Privileged) {
+          if (!current.State.Running) await container.start();
+          return;
+        }
+        // Configuration changed: replace the gateway. Attached instances lose their route briefly, never fall back to direct.
+        // The gateway is stateless; a restart-policy container must be stopped (not killed) to stay down.
+        if (current.State.Running) await container.stop({ t: 5 });
+        await container.remove();
+      }
+      const created = await this.docker.createContainer({ name: gatewayName(network), Image: image, User: '0:0',
+        Entrypoint: ['/bin/busybox'], Cmd: command, Labels: { ...networkLabels(network, 'gateway'), [`${OWNER}.config`]: fingerprint },
+        HostConfig: { NetworkMode: 'bridge', RestartPolicy: { Name: 'unless-stopped' }, LogConfig: { Type: 'none', Config: {} },
+          CapDrop: ['ALL'], CapAdd: ['NET_ADMIN', 'NET_BIND_SERVICE'], SecurityOpt: ['no-new-privileges'], ReadonlyRootfs: true,
+          Devices: [{ PathOnHost: '/dev/net/tun', PathInContainer: '/dev/net/tun', CgroupPermissions: 'rwm' }],
+          Sysctls: { 'net.ipv4.ip_forward': '1', 'net.ipv4.conf.all.rp_filter': '0' },
+          Tmpfs: { '/data': 'size=16m' }, Memory: 128 * 1024 * 1024 } });
+      await dockerNetwork.connect({ Container: created.id, EndpointConfig: { IPAMConfig: { IPv4Address: gatewayContainerAddress(network.subnet) } } });
+      await created.start();
+    });
+  }
+  async inspectNetwork(network: RuntimeNetwork): Promise<NetworkState> {
+    return this.safe(async () => {
+      validNetwork(network);
+      try { assertNetworkLabels((await this.docker.getNetwork(networkName(network)).inspect()).Labels, network, 'network'); }
+      catch (error) { if (absent(error)) return 'missing'; throw error; }
+      try {
+        const info = await this.docker.getContainer(gatewayName(network)).inspect();
+        assertNetworkLabels(info.Config.Labels, network, 'gateway');
+        return info.State.Running ? 'running' : 'stopped';
+      } catch (error) { if (absent(error)) return 'missing'; throw error; }
+    });
+  }
+  async removeNetwork(network: RuntimeNetwork): Promise<void> {
+    return this.safe(() => { validNetwork(network); return this.serialize(network.id, async () => {
+      const dockerNetwork = this.docker.getNetwork(networkName(network));
+      let info: Docker.NetworkInspectInfo | undefined;
+      try { info = await dockerNetwork.inspect(); assertNetworkLabels(info.Labels, network, 'network'); }
+      catch (error) { if (!absent(error)) throw error; }
+      // The service has already verified no instance is assigned here. A running container still
+      // depends on the route; a stopped one only holds a stale reference (instances are recreated
+      // from current settings on start), so it is detached instead of blocking deletion.
+      const attached = (await this.docker.listContainers({ all: true, filters: JSON.stringify({ network: [networkName(network)] }) }))
+        .filter(item => !item.Names?.includes(`/${gatewayName(network)}`));
+      if (attached.some(item => item.State === 'running' || item.State === 'restarting' || item.State === 'paused'))
+        throw new RuntimeError('NETWORK_IN_USE', 'Containers are still attached to this network.');
+      for (const item of attached) await dockerNetwork.disconnect({ Container: item.Id, Force: true });
+      const gateway = this.docker.getContainer(gatewayName(network));
+      try {
+        const current = await gateway.inspect();
+        assertNetworkLabels(current.Config.Labels, network, 'gateway');
+        if (current.State.Running) await gateway.stop({ t: 5 });
+        await gateway.remove();
+      } catch (error) { if (!absent(error)) throw error; }
+      if (info) await dockerNetwork.remove();
+    }); });
+  }
+  async testNetwork(network: RuntimeNetwork) {
+    await this.applyNetwork(network);
+    return this.probeExit({ name: `cindy-network-test-${randomUUID()}`, Image: this.image, User: '1000:1000',
+      Entrypoint: ['node'], Cmd: ['-e', PROXY_PROBE], Env: [],
+      Labels: networkLabels(network, 'proxy-test'),
+      HostConfig: { NetworkMode: networkName(network), Dns: [gatewayAddress(network.subnet)], Mounts: [], LogConfig: { Type: 'none', Config: {} } } });
   }
   private async safe<T>(action: () => Promise<T>): Promise<T> {
     try { return await action(); } catch (error) { if (error instanceof RuntimeError) throw error; throw new RuntimeError('DOCKER_FAILED'); }
@@ -90,11 +245,15 @@ export class DockerRuntimeAdapter implements DockerRuntime {
   }
   private options(instance: RuntimeInstance, role: string, command: string[], proxy?: RuntimeProxy | null, tty = false): Docker.ContainerCreateOptions {
     const name = identity(instance);
+    const network = instance.network;
+    // On a forced-egress network the gateway is the only proxy, DNS server and route.
+    const env = runtimeEnvironment(instance, network ? { url: gatewayProxyUrl(network.subnet) } : proxy);
     return { name: role === 'service' ? name : `${name}-${role}-${randomUUID()}`, Image: this.image,
-      Entrypoint: [command[0]!], Cmd: command.slice(1), Env: runtimeEnvironment(instance, proxy),
+      Entrypoint: [command[0]!], Cmd: command.slice(1), Env: env,
       User: '1000:1000', WorkingDir: NATIVE, Labels: labels(instance, role),
       Tty: tty, OpenStdin: tty, StdinOnce: false, AttachStdin: tty, AttachStdout: true, AttachStderr: true,
       HostConfig: { Init: true, RestartPolicy: { Name: 'no' }, LogConfig: { Type: 'none', Config: {} },
+        ...(network ? { NetworkMode: networkName(network), Dns: [gatewayAddress(network.subnet)] } : {}),
         Mounts: [{ Type: 'volume', Source: `${name}-profile`, Target: PROFILE, VolumeOptions: { NoCopy: true, Labels: {}, DriverConfig: { Name: 'local', Options: {} } } }, { Type: 'volume', Source: `${name}-native`, Target: NATIVE, VolumeOptions: { NoCopy: true, Labels: {}, DriverConfig: { Name: 'local', Options: {} } } }] } };
   }
   private async containers(instance: RuntimeInstance) {
@@ -143,6 +302,7 @@ export class DockerRuntimeAdapter implements DockerRuntime {
     return this.safe(async () => {
       runtimeEnvironment(instance, proxy);
       await this.idle(instance);
+      await this.egress(instance);
       await this.volume(instance, 'profile'); await this.volume(instance, 'native');
       // New named volumes are root-owned; only their two roots are initialized, never recursive user data.
       const setup = this.options(instance, 'setup', ['node', '-e', `const fs=require('node:fs');for(const p of ['${PROFILE}','${NATIVE}']){fs.chownSync(p,1000,1000);fs.chmodSync(p,0o700)}`], proxy);
@@ -160,6 +320,7 @@ export class DockerRuntimeAdapter implements DockerRuntime {
       await this.idle(instance);
       const old = await this.service(instance);
       if (!old) throw new RuntimeError('INSTANCE_MISSING');
+      await this.egress(instance);
       await this.prepareNative(instance, proxy);
       await this.oneShot(this.options(instance, 'config', ['cindy-host', 'config', 'set', 'remoteAccessEnabled', 'true'], proxy));
       // Recreate only the proven-stopped service so changed proxy settings are actually applied. Volumes stay.
@@ -225,15 +386,36 @@ export class DockerRuntimeAdapter implements DockerRuntime {
     if (result.ExitCode !== 0 && !allowFailure) throw new RuntimeError('COMMAND_FAILED', 'The native command failed. Check login and service availability.');
     return { output, code: result.ExitCode ?? -1 };
   }
+  /**
+   * Native commands for a non-missing instance: exec in the running service, or a one-shot
+   * container on the same volumes once the instance is proven idle (no login or service).
+   */
+  private async nativeRunner(instance: RuntimeInstance, proxy: RuntimeProxy | null | undefined, role: string) {
+    const view = await this.inspect(instance);
+    if (view.state === 'missing') return { view, run: undefined };
+    const service = (await this.service(instance))!;
+    if (view.state !== 'running') await this.idle(instance);
+    await this.egress(instance);
+    await this.prepareNative(instance, proxy, view.state === 'running' ? service.container : undefined);
+    const run = async (command: string[]) => view.state === 'running' ? await this.exec(service.container, command, true)
+      : (await this.idle(instance), await this.oneShot(this.options(instance, role, command, proxy), true));
+    return { view, run };
+  }
+  async probe(instance: RuntimeInstance, kind: ProbeKind, proxy?: RuntimeProxy | null): Promise<ProviderTest | ProviderUsage> {
+    return this.safe(async () => {
+      if (kind !== 'hello' && kind !== 'usage') throw new RuntimeError('INVALID_PROBE');
+      const { run } = await this.nativeRunner(instance, proxy, kind === 'hello' ? 'hello' : 'usage');
+      if (!run) throw new RuntimeError('INSTANCE_MISSING');
+      const started = Date.now();
+      const { output } = await run(['node', '-e', kind === 'hello' ? helloProbe(instance.engine) : usageProbe(instance.engine)]);
+      if (kind === 'hello') return helloResult(output, Date.now() - started);
+      return instance.engine === 'codex' ? codexUsageResult(output) : claudeUsageResult(output);
+    });
+  }
   async check(instance: RuntimeInstance, proxy?: RuntimeProxy | null): Promise<RuntimeInspection> {
     return this.safe(async () => {
-      const view = await this.inspect(instance);
-      if (view.state === 'missing') return { ...view, accounts: { cindy: null, provider: null } };
-      const service = (await this.service(instance))!;
-      if (view.state !== 'running') await this.idle(instance);
-      await this.prepareNative(instance, proxy, view.state === 'running' ? service.container : undefined);
-      const run = async (command: string[]) => view.state === 'running' ? await this.exec(service.container, command, true)
-        : (await this.idle(instance), await this.oneShot(this.options(instance, 'check', command, proxy), true));
+      const { view, run } = await this.nativeRunner(instance, proxy, 'check');
+      if (!run) return { ...view, accounts: { cindy: null, provider: null } };
       const readStatus = (output: string) => {
         try {
           const runtime = JSON.parse(output)?.runtime;
@@ -298,6 +480,7 @@ export class DockerRuntimeAdapter implements DockerRuntime {
     return this.safe(async () => {
       await this.idle(instance);
       if (!await this.service(instance)) throw new RuntimeError('INSTANCE_MISSING');
+      await this.egress(instance);
       await this.prepareNative(instance, proxy);
       let command: string[];
       if (request.target === 'provider') command = instance.engine === 'codex' ? [CODEX, 'login', '--device-auth'] : [CLAUDE, 'auth', 'login', '--claudeai'];

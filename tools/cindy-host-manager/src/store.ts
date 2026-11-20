@@ -5,7 +5,8 @@ import { dirname, isAbsolute, join } from 'node:path';
 import type { RuntimeInstance, RuntimeProxy } from './runtime-types.js';
 export interface InstanceRecord extends RuntimeInstance {
     name: string;
-    proxyMode: 'none' | 'default' | 'custom';
+    /** 'network': forced egress through a network gateway; the network id is stored as `instance-network:<id>`. */
+    proxyMode: 'none' | 'default' | 'custom' | 'network';
     createdAt: string;
 }
 export function privateDirectory(path: string): string {
@@ -61,6 +62,10 @@ export class Store {
     } | undefined)?.value; }
     set(key: string, value: string) { this.db.prepare('INSERT INTO metadata(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value').run(key, value); }
     delete(key: string) { this.db.prepare('DELETE FROM metadata WHERE key=?').run(key); }
+    keys(prefix: string): string[] {
+        const pattern = prefix.replace(/[\\%_]/g, character => `\\${character}`) + '%';
+        return (this.db.prepare("SELECT key FROM metadata WHERE key LIKE ? ESCAPE '\\' ORDER BY key").all(pattern) as { key: string }[]).map(row => row.key);
+    }
     secret<T>(key: string): T | undefined {
         const encrypted = this.get(key);
         if (!encrypted) return undefined;
