@@ -1,0 +1,18 @@
+diff --git a/build/input-parser.js b/build/input-parser.js
+index 27446479b370b0f47f7c5d9a0d0b9014f26985fd..a876ddc787e0f8e279ea087897d86eaea4a4094f 100644
+--- a/build/input-parser.js
++++ b/build/input-parser.js
+@@ -155,6 +155,13 @@ const parseKeypresses = (input) => {
+             index = endIndex + pasteEnd.length;
+             continue;
+         }
++        // Terminal focus-in/out reports are metadata, not keyboard input. Consume only
++        // complete CSI I/O sequences here, after bracketed paste has preserved its bytes.
++        if (parsedEscapeSequence.sequence === '\u001B[I' ||
++            parsedEscapeSequence.sequence === '\u001B[O') {
++            index = parsedEscapeSequence.nextIndex;
++            continue;
++        }
+         events.push(parsedEscapeSequence.sequence);
+         index = parsedEscapeSequence.nextIndex;
+     }

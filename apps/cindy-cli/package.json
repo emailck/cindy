@@ -25,6 +25,7 @@
     "@cindy/model-providers": "workspace:*",
     "@cindy/remote-agent-host": "workspace:*",
     "@napi-rs/keyring": "2.1.2",
+    "get-east-asian-width": "1.6.0",
     "ink": "7.1.1",
     "react": "19.2.3",
     "undici": "^8.3.0",

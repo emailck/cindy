@@ -37,6 +37,9 @@ patchedDependencies:
   harmonyos-sans-sc-webfont-splitted:
     hash: 272e3ded46880ee2f9eaff39327b8465de6df4072271de03caf73950e6e57822
     path: dependency-patches/harmonyos-sans-sc-webfont-splitted.patch
+  ink@7.1.1:
+    hash: f2ebfd4998794c85506ca3fdfefcc0b66afda83a16d9db8fa3c6baf1ae2453f7
+    path: dependency-patches/ink@7.1.1.patch
   react-native-gesture-handler@2.32.0:
     hash: a96d1b54b92694aef8a0b6b70c61978aac2cb4e6fc5c9c32dddb48d669877666
     path: dependency-patches/react-native-gesture-handler@2.32.0.patch
@@ -106,9 +109,12 @@ importers:
       '@napi-rs/keyring':
         specifier: 2.1.2
         version: 2.1.2
+      get-east-asian-width:
+        specifier: 1.6.0
+        version: 1.6.0
       ink:
         specifier: 7.1.1
-        version: 7.1.1(@types/react@19.2.17)(react-devtools-core@6.1.5)(react@19.2.3)
+        version: 7.1.1(patch_hash=f2ebfd4998794c85506ca3fdfefcc0b66afda83a16d9db8fa3c6baf1ae2453f7)(@types/react@19.2.17)(react-devtools-core@6.1.5)(react@19.2.3)
       react:
         specifier: 19.2.3
         version: 19.2.3
@@ -19626,7 +19632,7 @@ snapshots:
     optionalDependencies:
       '@types/react': 19.2.17
 
-  ink@7.1.1(@types/react@19.2.17)(react-devtools-core@6.1.5)(react@19.2.3):
+  ink@7.1.1(patch_hash=f2ebfd4998794c85506ca3fdfefcc0b66afda83a16d9db8fa3c6baf1ae2453f7)(@types/react@19.2.17)(react-devtools-core@6.1.5)(react@19.2.3):
     dependencies:
       '@alcalzone/ansi-tokenize': 0.3.1
       ansi-escapes: 7.3.0

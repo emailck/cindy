@@ -70,7 +70,8 @@
       "react-native-screens@4.26.2": "dependency-patches/react-native-screens@4.26.2.patch",
       "expo-router@57.0.17": "dependency-patches/expo-router@57.0.17.patch",
       "react-native-gesture-handler@2.32.0": "dependency-patches/react-native-gesture-handler@2.32.0.patch",
-      "expo-modules-core@57.0.18": "dependency-patches/expo-modules-core@57.0.18.patch"
+      "expo-modules-core@57.0.18": "dependency-patches/expo-modules-core@57.0.18.patch",
+      "ink@7.1.1": "dependency-patches/ink@7.1.1.patch"
     },
     "allowUnusedPatches": true
   },
